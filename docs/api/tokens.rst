@@ -1,0 +1,163 @@
+pygrindvakt.tokens
+==================
+
+.. py:module:: pygrindvakt.tokens
+
+The stateless token codec and its sealed payloads: authorization codes,
+access tokens and refresh tokens.
+
+grindvakt's OP keeps no token table. Each artefact is a JWE (``dir`` +
+``A256GCM``) sealed under a key derived from the OP secret with HKDF, with a
+type tag so a code cannot be presented as an access token. One-time use is
+enforced separately by the provider's token-use store, which records a hash
+of each consumed code / refresh token (see :doc:`provider`).
+
+An application normally never touches these directly: the
+:class:`pygrindvakt.provider.Provider` seals and opens them. They are exposed
+for resource servers that validate access tokens locally, for tests, and for
+custom grant handling.
+
+Codec
+-----
+
+.. py:class:: TokenCodec(secret: str, previous_secrets: list[str] | None = None)
+
+   Seals and opens authorization codes, access tokens and refresh tokens.
+
+   ``previous_secrets`` are tried on open (after ``secret``) so tokens sealed
+   under an old secret keep validating during key rotation: deploy with the
+   new secret first and the old one in ``previous_secrets``, then drop the
+   old one after the longest token lifetime has passed.
+
+   .. warning::
+
+      Secrets are Python ``str`` values and cannot be zeroized after use.
+      Use a long random value (32 bytes or more of entropy) from a secret
+      store; ``repr()`` never shows it.
+
+   .. py:method:: seal_code(payload: AuthCodePayload) -> str
+   .. py:method:: open_code(token: str) -> AuthCodePayload
+
+      Open an authorization code (checks the type tag and expiry). Raises
+      :class:`pygrindvakt.GrindvaktError` subclasses on a tampered, foreign
+      or expired token.
+
+   .. py:method:: seal_access_token(payload: AccessTokenPayload) -> str
+   .. py:method:: open_access_token(token: str) -> AccessTokenPayload
+   .. py:method:: seal_refresh_token(payload: RefreshTokenPayload) -> str
+   .. py:method:: open_refresh_token(token: str) -> RefreshTokenPayload
+
+   .. code-block:: python
+
+      from pygrindvakt import tokens, util
+
+      codec = tokens.TokenCodec(os.environ["OP_SECRET"], previous_secrets=[os.environ.get("OP_SECRET_OLD", "")] or None)
+
+      # A resource server validating an access token issued by this OP:
+      payload = codec.open_access_token(bearer)
+      payload.sub, payload.scope.split(), payload.exp > util.now_secs()
+
+Payloads
+--------
+
+All three payload classes are immutable, constructed with keyword-only
+arguments, and round-trip through ``to_dict`` / ``from_dict``. Times are Unix
+seconds. ``claims`` holds the resolved user claims (already flattened by
+:func:`pygrindvakt.provider.flatten_claims`) that end up in the id_token and
+userinfo response.
+
+.. py:class:: AuthCodePayload(*, client_id: str, redirect_uri: str, scope: str, sub: str, auth_time: int, exp: int, nonce: str | None = None, code_challenge: str | None = None, code_challenge_method: str | None = None, claims: dict[str, Any] | None = None, acr: str | None = None)
+
+   Payload sealed into an authorization code. Carries everything the token
+   endpoint needs to check the exchange (``redirect_uri``, the PKCE
+   challenge) and to mint the tokens (``sub``, ``scope``, ``nonce``,
+   ``claims``, ``acr``, ``auth_time``).
+
+   .. py:staticmethod:: from_dict(d: dict[str, Any]) -> AuthCodePayload
+   .. py:method:: to_dict() -> dict[str, Any]
+
+   .. py:property:: client_id
+      :type: str
+   .. py:property:: redirect_uri
+      :type: str
+   .. py:property:: scope
+      :type: str
+   .. py:property:: sub
+      :type: str
+   .. py:property:: nonce
+      :type: str | None
+   .. py:property:: code_challenge
+      :type: str | None
+   .. py:property:: code_challenge_method
+      :type: str | None
+   .. py:property:: claims
+      :type: dict[str, Any]
+   .. py:property:: auth_time
+      :type: int
+   .. py:property:: exp
+      :type: int
+   .. py:property:: acr
+      :type: str | None
+
+.. py:class:: AccessTokenPayload(*, client_id: str, sub: str, scope: str, exp: int, claims: dict[str, Any] | None = None, cnf_jkt: str | None = None)
+
+   Payload sealed into an access token.
+
+   .. py:staticmethod:: from_dict(d: dict[str, Any]) -> AccessTokenPayload
+   .. py:method:: to_dict() -> dict[str, Any]
+
+   .. py:property:: client_id
+      :type: str
+   .. py:property:: sub
+      :type: str
+   .. py:property:: scope
+      :type: str
+   .. py:property:: claims
+      :type: dict[str, Any]
+   .. py:property:: exp
+      :type: int
+   .. py:property:: cnf_jkt
+      :type: str | None
+
+      The DPoP key thumbprint the token is bound to (``cnf.jkt``), if any. A
+      resource server must refuse a token with ``cnf_jkt`` set unless the
+      request carries a valid DPoP proof from the same key; see
+      :doc:`../guides/dpop`.
+
+.. py:class:: RefreshTokenPayload(*, client_id: str, sub: str, scope: str, auth_time: int, exp: int, nonce: str | None = None, claims: dict[str, Any] | None = None, acr: str | None = None, cnf_jkt: str | None = None)
+
+   Payload sealed into a refresh token. Refresh tokens are rotated on use:
+   each ``refresh_token`` grant returns a new one and records the old one as
+   consumed.
+
+   .. py:staticmethod:: from_dict(d: dict[str, Any]) -> RefreshTokenPayload
+   .. py:method:: to_dict() -> dict[str, Any]
+
+   .. py:property:: client_id
+      :type: str
+   .. py:property:: sub
+      :type: str
+   .. py:property:: scope
+      :type: str
+   .. py:property:: nonce
+      :type: str | None
+   .. py:property:: claims
+      :type: dict[str, Any]
+   .. py:property:: auth_time
+      :type: int
+   .. py:property:: exp
+      :type: int
+   .. py:property:: acr
+      :type: str | None
+   .. py:property:: cnf_jkt
+      :type: str | None
+
+.. code-block:: python
+
+   now = util.now_secs()
+   at = tokens.AccessTokenPayload(client_id="demo", sub="alice", scope="openid", exp=now + 600,
+                                  claims={"email": "alice@example.com"})
+   sealed = codec.seal_access_token(at)
+   assert codec.open_access_token(sealed).sub == "alice"
+   with pytest.raises(pygrindvakt.GrindvaktError):
+       codec.open_code(sealed)              # wrong type tag

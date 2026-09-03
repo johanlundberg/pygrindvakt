@@ -1,0 +1,277 @@
+pygrindvakt.federation
+======================
+
+.. py:module:: pygrindvakt.federation
+
+OpenID Federation 1.1 support: entity statements (build and verify),
+trust-chain resolution by delegating to a trust anchor's
+``federation_resolve_endpoint``, signed-JWKS fetching, the collection
+(listing) endpoint used for OP discovery pages, and the metadata-policy
+operators. :doc:`../guides/federation` puts them together, including OP-side
+automatic client registration.
+
+JSON-shaped values (claims, JWKS, metadata, policies) cross the boundary as
+native Python dicts and lists. Networked functions take an ``http`` client as
+their first positional argument (``None`` selects the built-in client) and
+block the calling thread with the GIL released.
+
+Constants
+---------
+
+The ``typ`` header values the federation JWTs must carry.
+
+.. py:data:: ENTITY_STATEMENT_TYP
+   :type: str
+   :value: "entity-statement+jwt"
+
+.. py:data:: RESOLVE_RESPONSE_TYP
+   :type: str
+   :value: "resolve-response+jwt"
+
+.. py:data:: JWK_SET_TYP
+   :type: str
+   :value: "jwk-set+jwt"
+
+Classes
+-------
+
+.. py:class:: EntityStatement
+
+   The decoded claims of an entity statement: an entity configuration, a
+   subordinate statement or a resolve response. Immutable. Returned by the
+   ``verify*`` functions and by :func:`decode_unverified`.
+
+   .. py:property:: claims
+      :type: dict[str, Any]
+
+      All claims of the statement as a dict.
+
+   .. py:method:: iss() -> str | None
+
+      The ``iss`` claim, if present.
+
+   .. py:method:: sub() -> str | None
+
+      The ``sub`` claim, if present.
+
+   .. py:method:: jwks() -> dict[str, Any]
+
+      The ``jwks`` carried in the statement (the subject's federation keys)
+      as a ``{"keys": [...]}`` dict. Raises
+      :class:`pygrindvakt.BadRequestError` if absent.
+
+   .. py:method:: metadata(kind: str) -> dict[str, Any] | None
+
+      A metadata sub-document, e.g. ``metadata("openid_provider")``, or
+      ``None``.
+
+   .. py:method:: authority_hints() -> list[str]
+
+      The ``authority_hints`` list (empty if absent).
+
+.. py:class:: ResolvedEntity
+
+   A successful resolve response, bound to a configured trust anchor.
+   Immutable. Returned by :func:`resolve_via_trust_anchors`.
+
+   .. py:property:: issuer
+      :type: str
+
+      The trust anchor that issued the resolve response.
+
+   .. py:property:: subject
+      :type: str
+
+      The resolved entity id.
+
+   .. py:property:: metadata
+      :type: dict[str, Any]
+
+      The resolved (policy-applied) ``metadata`` object as a dict, keyed by
+      entity type (``openid_relying_party``, ``openid_provider``,
+      ``federation_entity``, ...).
+
+   .. py:property:: subject_jwks
+      :type: dict[str, Any]
+
+      The subject's federation signing keys from the entity configuration
+      at the start of the returned trust chain, as a ``{"keys": [...]}``
+      dict.
+
+   .. py:property:: exp
+      :type: int | None
+
+      The resolve response's ``exp`` (seconds since epoch): how long the
+      trust anchor vouches for the metadata. Use it to bound caching.
+
+.. py:class:: CollectionEntity(*, entity_id: str, display_name: str, logo_uri: str | None = None)
+
+   One entity returned by a trust anchor's collection (listing) endpoint,
+   with its UI presentation flattened for a discovery page. Immutable and
+   comparable with ``==``.
+
+   .. py:property:: entity_id
+      :type: str
+
+      The entity identifier (the OP to authenticate against).
+
+   .. py:property:: display_name
+      :type: str
+
+      A human-friendly name: the entity-type display name, else the
+      ``federation_entity`` display name, else the entity id. Treat it as
+      untrusted text and HTML-escape it when rendering.
+
+   .. py:property:: logo_uri
+      :type: str | None
+
+      An optional logo URL for the discovery page. Not scheme-checked;
+      allow only ``https`` before emitting it as an ``<img src>``.
+
+Entity statements: build, decode, verify
+----------------------------------------
+
+.. py:function:: build_entity_configuration(key: SigningKey, entity_id: str, public_jwks: dict[str, Any], authority_hints: list[str], metadata: dict[str, Any], trust_marks: list[dict[str, Any]] | None = None, lifetime: int = 3600) -> str
+
+   Build and sign a self-issued Entity Configuration JWT
+   (``iss == sub == entity_id``, ``typ = entity-statement+jwt``, ``iat`` /
+   ``exp`` set from ``lifetime`` seconds).
+
+   ``public_jwks`` is the ``{"keys": [...]}`` dict to publish (normally
+   ``key.to_public_jwks()``), ``metadata`` the per-entity-type metadata
+   object, ``trust_marks`` an optional list of trust mark objects. Serve the
+   result at ``<entity_id>/.well-known/openid-federation`` with content type
+   ``application/entity-statement+jwt``.
+
+   .. code-block:: python
+
+      ec = federation.build_entity_configuration(
+          fed_key, "https://rp.example.com", fed_key.to_public_jwks(), ["https://ta.example.org"],
+          {"openid_relying_party": {"client_name": "RP", "redirect_uris": ["https://rp.example.com/cb"],
+                                    "jwks": client_key.to_public_jwks(),
+                                    "token_endpoint_auth_method": "private_key_jwt"}},
+          lifetime=86400,
+      )
+
+.. py:function:: decode_unverified(token: str) -> EntityStatement
+
+   Decode an entity statement **without** verifying its signature.
+
+   .. warning::
+
+      Inspection only, for example reading ``authority_hints`` to learn
+      whom to ask. Never trust these claims.
+
+.. py:function:: verify(token: str, jwks: dict[str, Any]) -> EntityStatement
+
+   Verify an entity statement's signature against a JWKS dict and require
+   ``typ = entity-statement+jwt`` and a present ``exp``. Use it for
+   subordinate statements, with the issuer's federation keys.
+
+.. py:function:: verify_typed(token: str, jwks: dict[str, Any], typ: str) -> EntityStatement
+
+   Verify a trust-anchor-signed JWT against a JWKS dict, requiring the given
+   ``typ`` header (e.g. :data:`RESOLVE_RESPONSE_TYP`) and a present ``exp``.
+   A statement with the wrong ``typ`` is rejected even if the signature is
+   valid.
+
+.. py:function:: verify_self_signed(token: str) -> EntityStatement
+
+   Verify a self-issued Entity Configuration using the keys it carries:
+   ``iss`` must equal ``sub`` and the signature must validate against the
+   embedded ``jwks``. A statement issued by someone else, or without
+   ``jwks``, is rejected.
+
+Networked: fetch, resolve, keys, collection
+-------------------------------------------
+
+.. py:function:: fetch_entity_configuration(http: HttpClientProtocol | None, entity_id: str) -> str
+
+   Fetch an entity's configuration JWT from
+   ``<entity_id>/.well-known/openid-federation`` (a trailing slash on the
+   entity id is handled). Returns the raw compact JWS, unverified; pass it
+   to :func:`verify_self_signed`. A non-200 raises
+   :class:`pygrindvakt.InternalError`.
+
+.. py:function:: resolve_via_trust_anchors(http: HttpClientProtocol | None, sub: str, trust_anchors: dict[str, dict[str, Any]]) -> ResolvedEntity
+
+   Resolve ``sub``'s metadata by delegating to each configured trust
+   anchor's ``federation_resolve_endpoint`` (OpenID Federation section 10).
+
+   ``trust_anchors`` maps trust anchor entity id to its trusted JWKS dict
+   (``{"keys": [...]}``, pinned in configuration; a non-JWKS value raises).
+   For each anchor, the anchor's own entity configuration is fetched and
+   verified against those keys, then
+   ``<federation_resolve_endpoint>?sub=...&trust_anchor=...`` is called; the
+   resolve response (``typ = resolve-response+jwt``, signed by the anchor)
+   and the ``trust_chain`` it carries are fully validated: the chain starts
+   with ``sub``'s entity configuration, ends at the anchor, every
+   subordinate statement is signed by the entity above it, and the response
+   ``sub`` matches. The first anchor that succeeds wins; otherwise the last
+   error is raised (:class:`pygrindvakt.AuthnError` for a chain that does
+   not validate, :class:`pygrindvakt.InternalError` for transport failures,
+   :class:`pygrindvakt.ConfigError` when ``trust_anchors`` is empty).
+
+   .. code-block:: python
+
+      TRUST_ANCHORS = {"https://ta.example.org": json.load(open("ta.jwks.json"))}
+      entity = federation.resolve_via_trust_anchors(None, "https://op.example.edu", TRUST_ANCHORS)
+      op_meta = entity.metadata["openid_provider"]
+      cache_for = entity.exp - util.now_secs()
+
+.. py:function:: entity_metadata_jwks(http: HttpClientProtocol | None, metadata: dict[str, Any], subject_entity_id: str, subject_fed_jwks: dict[str, Any]) -> dict[str, Any]
+
+   Resolve an entity type's key set from its metadata (OpenID Federation
+   1.1 section 5.2.1): inline ``jwks``, else ``signed_jwks_uri`` (fetched
+   and verified against ``subject_fed_jwks`` with :func:`fetch_signed_jwks`),
+   else plain ``jwks_uri``. A malformed inline ``jwks`` is an error, not a
+   fallback. Returns a ``{"keys": [...]}`` dict. ``metadata`` is one entity
+   type's object, e.g. ``entity.metadata["openid_provider"]``.
+
+.. py:function:: fetch_signed_jwks(http: HttpClientProtocol | None, signed_jwks_uri: str, subject_entity_id: str, subject_fed_jwks: dict[str, Any]) -> dict[str, Any]
+
+   Fetch and verify a signed JWK Set document (``typ = jwk-set+jwt``) from
+   ``signed_jwks_uri``. The signature must validate against
+   ``subject_fed_jwks`` and the ``sub`` must equal ``subject_entity_id``.
+   Returns a ``{"keys": [...]}`` dict.
+
+.. py:function:: fetch_collection(http: HttpClientProtocol | None, collection_endpoint: str, entity_type: str) -> list[CollectionEntity]
+
+   Fetch the entities of ``entity_type`` (e.g. ``"openid_provider"``) from a
+   trust anchor's collection endpoint (``<endpoint>?entity_type=...``) and
+   flatten their UI info for a discovery page.
+
+.. py:function:: parse_collection(body: dict[str, Any], entity_type: str) -> list[CollectionEntity]
+
+   Parse a collection-endpoint response body
+   (``{"entities": [{"entity_id": ..., "entity_types": [...], "ui_infos": {...}}]}``)
+   into :class:`CollectionEntity` objects. Entries without an ``entity_id``,
+   or that do not advertise ``entity_type`` in ``entity_types``, are
+   skipped. The display name is taken from the entity type's ``ui_infos``,
+   falling back to ``federation_entity`` and then to the entity id.
+
+   .. code-block:: python
+
+      ops = federation.fetch_collection(None, "https://ta.example.org/collection", "openid_provider")
+      choices = [(e.entity_id, e.display_name, e.logo_uri) for e in ops]
+
+Metadata policy
+---------------
+
+.. py:function:: apply_policy(metadata: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]
+
+   Apply a metadata policy (OpenID Federation section 6) to a metadata
+   object and return the resulting dict; the input is not modified.
+
+   Supports the ``value``, ``default``, ``add``, ``one_of``, ``subset_of``,
+   ``superset_of`` and ``essential`` operators. Raises
+   :class:`pygrindvakt.AuthnError` when the metadata violates a constraint
+   and :class:`pygrindvakt.BadRequestError` for a malformed policy.
+
+   .. code-block:: python
+
+      out = federation.apply_policy(
+          {"scope": ["openid", "email", "profile"]},
+          {"scope": {"subset_of": ["openid", "email"]}, "response_types": {"default": ["code"]}},
+      )
+      # {"scope": ["openid", "email"], "response_types": ["code"]}

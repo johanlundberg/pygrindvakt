@@ -1,0 +1,56 @@
+[build-system]
+requires = ["maturin==1.14.1"]
+build-backend = "maturin"
+
+[project]
+name = "pygrindvakt"
+version = "0.1.0"
+description = "Python bindings for the grindvakt OAuth 2.0 / OpenID Connect / OpenID Federation library"
+requires-python = ">=3.10"
+license = "BSD-2-Clause"
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Session",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration :: Authentication/Directory",
+]
+
+[project.urls]
+Repository = "https://github.com/kushaldas/pygrindvakt"
+Documentation = "https://pygrindvakt.readthedocs.io/en/latest/"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "cryptography",
+    "flask",
+    "django",
+    "fastapi",
+    "httpx",
+]
+docs = [
+    # Sphinx 9.1 needs Python >= 3.12 (what Read the Docs uses); older
+    # interpreters fall back to the 8.x line so `uv lock` resolves for the
+    # whole requires-python range.
+    "sphinx==9.1.0; python_version >= '3.12'",
+    "sphinx>=8.0,<9; python_version < '3.12'",
+    "furo",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "pygrindvakt._native"
+
+[tool.pytest.ini_options]
+markers = [
+    "pkcs11: tests requiring a SoftHSM2 token (auto-skip if unavailable)",
+    "redis: tests requiring a live Redis at REDIS_URL (auto-skip if unset)",
+]
