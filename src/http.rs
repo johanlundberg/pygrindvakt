@@ -32,7 +32,9 @@ use grindvakt::http as gh;
 use grindvakt::http::{HttpClient, HttpFetchResponse as RsFetch};
 use grindvakt::Error as RsError;
 
-use crate::convert::{from_py, log_unraisable, new_submodule, require_methods, to_py};
+use crate::convert::{
+    from_py, log_unraisable, new_submodule, parameter_pairs, require_methods, to_py,
+};
 use crate::errors::{err, internal_err};
 
 // ---------------------------------------------------------------------------
@@ -42,11 +44,15 @@ use crate::errors::{err, internal_err};
 /// A parsed inbound HTTP request, normalized for grindvakt.
 ///
 /// Build one from your framework's request object. `headers` keys must be
-/// lower-cased; `form` is the parsed `application/x-www-form-urlencoded` body.
+/// lower-cased. Pass query/form pair lists from the framework so duplicate
+/// OAuth parameters remain available to the protocol parser; the convenience
+/// map properties retain the last value only for non-protocol application use.
 #[pyclass(module = "pygrindvakt.http", name = "HttpRequestData", from_py_object)]
 #[derive(Clone)]
 pub struct HttpRequestData {
     pub inner: gh::HttpRequestData,
+    query_pairs: Vec<(String, String)>,
+    form_pairs: Vec<(String, String)>,
 }
 
 #[pymethods]
@@ -59,29 +65,41 @@ impl HttpRequestData {
         path: &str,
         method: &str,
         uri: &str,
-        query: Option<BTreeMap<String, String>>,
-        form: Option<BTreeMap<String, String>>,
+        query: Option<&Bound<'_, PyAny>>,
+        form: Option<&Bound<'_, PyAny>>,
         body: Option<&[u8]>,
         headers: Option<BTreeMap<String, String>>,
         cookies: Option<BTreeMap<String, String>>,
-    ) -> Self {
+    ) -> PyResult<Self> {
+        let query_pairs = query
+            .map(|value| parameter_pairs(value, "query"))
+            .transpose()?
+            .unwrap_or_default();
+        let form_pairs = form
+            .map(|value| parameter_pairs(value, "form"))
+            .transpose()?
+            .unwrap_or_default();
         let headers = headers
             .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v))
             .collect();
-        Self {
+        Ok(Self {
             inner: gh::HttpRequestData {
                 path: path.trim_start_matches('/').to_string(),
                 method: method.to_ascii_uppercase(),
                 uri: uri.to_string(),
-                query: query.unwrap_or_default(),
-                form: form.unwrap_or_default(),
+                query_pairs: query_pairs.clone(),
+                query: query_pairs.iter().cloned().collect(),
+                form_pairs: form_pairs.clone(),
+                form: form_pairs.iter().cloned().collect(),
                 body: body.map(|b| b.to_vec()).unwrap_or_default(),
                 headers,
                 cookies: cookies.unwrap_or_default(),
             },
-        }
+            query_pairs,
+            form_pairs,
+        })
     }
 
     #[getter]
@@ -114,7 +132,13 @@ impl HttpRequestData {
     }
     #[setter]
     fn set_query(&mut self, v: BTreeMap<String, String>) {
+        self.query_pairs = v.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         self.inner.query = v;
+    }
+    /// Ordered query parameters, retaining duplicates for protocol validation.
+    #[getter]
+    fn query_pairs(&self) -> Vec<(String, String)> {
+        self.query_pairs.clone()
     }
     #[getter]
     fn form(&self) -> BTreeMap<String, String> {
@@ -122,7 +146,13 @@ impl HttpRequestData {
     }
     #[setter]
     fn set_form(&mut self, v: BTreeMap<String, String>) {
+        self.form_pairs = v.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         self.inner.form = v;
+    }
+    /// Ordered form parameters, retaining duplicates for protocol validation.
+    #[getter]
+    fn form_pairs(&self) -> Vec<(String, String)> {
+        self.form_pairs.clone()
     }
     #[getter]
     fn body<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {

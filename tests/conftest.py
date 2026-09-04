@@ -136,7 +136,7 @@ class FakeHttpClient:
         hdrs = {k.lower(): v for k, v in headers}
         if url == TOKEN_URL:
             try:
-                tr = self.op.handle_token_request(dict(form), TOKEN_URL, auth_header=hdrs.get("authorization"))
+                tr = self.op.handle_token_request(list(form), TOKEN_URL, auth_header=hdrs.get("authorization"))
             except OAuthError as e:
                 r = e.to_response()
                 return r.status, r.body, "application/json"

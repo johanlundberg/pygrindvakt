@@ -9,15 +9,15 @@ Parsed OIDC authorization requests.
 
    A parsed OIDC authorization request. Immutable.
 
-   Build one with :meth:`from_params` from the query-string dict (or the
-   merged parameters of a request object). It is JSON round-trippable
+   Build one with :meth:`from_params` from ordered query-string pairs. It is JSON round-trippable
    (:meth:`to_dict` / :meth:`from_dict`) so an application can stash it in a
    session between showing the login page and redirecting back to the
    client.
 
-   .. py:staticmethod:: from_params(params: dict[str, str]) -> AuthorizationRequest
+   .. py:staticmethod:: from_params(params: list[tuple[str, str]]) -> AuthorizationRequest
 
-      Parse from a flat parameter dict. Raises
+      Parse ordered ``(name, value)`` pairs. Mappings are rejected because they
+      may already have erased duplicate protocol fields. Raises
       :class:`pygrindvakt.OAuthError` with code ``invalid_request`` when
       ``client_id``, ``response_type`` or ``redirect_uri`` is missing, or
       when the ``claims`` parameter is not valid JSON. The raised error
@@ -28,8 +28,9 @@ Parsed OIDC authorization requests.
 
    .. py:staticmethod:: from_dict(d: dict[str, Any]) -> AuthorizationRequest
 
-      Rebuild from a :meth:`to_dict` result (``ValueError`` on a malformed
-      dict).
+      Rebuild trusted application state from a :meth:`to_dict` result
+      (``ValueError`` on a malformed dict). Never use this method to parse an
+      HTTP request.
 
    .. py:method:: to_dict() -> dict[str, Any]
 
@@ -68,6 +69,14 @@ Parsed OIDC authorization requests.
       The raw ``request`` parameter (an RFC 9101 request object JWT), if
       present. It is carried verbatim; unpacking and verifying it is the
       application's job (see :doc:`../guides/federation`).
+
+   .. py:property:: resources
+      :type: list[str]
+
+      RFC 8707 resource indicators, preserving repeated values in request
+      order. Other protocol fields remain single-valued and reject duplicates.
+      This is lossless parsing, not automatic RFC 8707 audience restriction;
+      validate and enforce application resource policy before minting.
 
    .. py:property:: extra
       :type: dict[str, str]
@@ -113,7 +122,7 @@ Parsed OIDC authorization requests.
       from pygrindvakt.request import AuthorizationRequest
 
       try:
-          req = AuthorizationRequest.from_params(flask.request.args.to_dict())
+          req = AuthorizationRequest.from_params(list(flask.request.args.items(multi=True)))
       except OAuthError as e:
           return to_flask(e.to_response())     # redirect_uri is not trusted yet
 

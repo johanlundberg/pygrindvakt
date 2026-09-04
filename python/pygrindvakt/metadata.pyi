@@ -9,7 +9,8 @@ class ProviderMetadata:
     ``ProviderMetadata(issuer, base)`` fills in the standard endpoints under
     ``base`` (``/authorization``, ``/token``, ``/userinfo``, ``/jwks``) and
     sensible defaults; every field is settable. Unknown / extension fields
-    live in ``extra``.
+    live in ``extra``. Protocol-owned fields and unimplemented logout metadata
+    are rejected when supplied through ``extra``.
     """
 
     def __init__(self, issuer: str, base: str | None = ...) -> None: ...
@@ -92,8 +93,8 @@ class ProviderMetadata:
     def request_parameter_supported(self, value: bool) -> None: ...
     @property
     def extra(self) -> dict[str, Any]:
-        """Extension fields (anything not modelled above) as a dict."""
+        """Non-protocol extension fields as a dict."""
     @extra.setter
     def extra(self, value: dict[str, Any]) -> None: ...
     def set_extra_field(self, key: str, value: Any) -> None:
-        """Set one extension field."""
+        """Set one non-protocol extension field."""

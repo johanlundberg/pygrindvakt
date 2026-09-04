@@ -27,6 +27,16 @@ def test_request_data_defaults():
     assert r.method == "GET" and r.query == {} and r.body == b""
 
 
+def test_request_data_preserves_duplicate_parameter_pairs():
+    """Adapters retain multiplicity until an OAuth parser can reject it."""
+    r = http.HttpRequestData(
+        query=[("client_id", "first"), ("client_id", "second")],
+        form=[("grant_type", "authorization_code"), ("grant_type", "refresh_token")],
+    )
+    assert r.query_pairs == [("client_id", "first"), ("client_id", "second")]
+    assert r.form_pairs == [("grant_type", "authorization_code"), ("grant_type", "refresh_token")]
+
+
 def test_response_builders():
     r = http.Response.redirect("https://x")
     assert r.status == 302 and r.header("Location") == "https://x"

@@ -7,10 +7,6 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
-[options]
-exclude-newer = "2026-08-31T09:18:46.403399029Z"
-exclude-newer-span = "P3D"
-
 [[package]]
 name = "accessible-pygments"
 version = "0.0.5"

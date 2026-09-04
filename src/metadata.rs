@@ -8,6 +8,42 @@ use grindvakt::metadata as gm;
 
 use crate::convert::{from_py, new_submodule, to_py};
 
+const RESERVED_METADATA_FIELDS: &[&str] = &[
+    "issuer",
+    "authorization_endpoint",
+    "token_endpoint",
+    "userinfo_endpoint",
+    "jwks_uri",
+    "registration_endpoint",
+    "scopes_supported",
+    "response_types_supported",
+    "response_modes_supported",
+    "grant_types_supported",
+    "subject_types_supported",
+    "id_token_signing_alg_values_supported",
+    "token_endpoint_auth_methods_supported",
+    "claims_supported",
+    "code_challenge_methods_supported",
+    "claims_parameter_supported",
+    "request_parameter_supported",
+    "dpop_signing_alg_values_supported",
+    // Logout is not implemented by this library, so it must not be advertised
+    // as though Provider supplied and validated it.
+    "end_session_endpoint",
+];
+
+fn validate_extra_keys(extra: &serde_json::Map<String, serde_json::Value>) -> PyResult<()> {
+    if let Some(key) = extra
+        .keys()
+        .find(|key| RESERVED_METADATA_FIELDS.contains(&key.as_str()))
+    {
+        return Err(PyValueError::new_err(format!(
+            "metadata extra field {key:?} is reserved or unsupported"
+        )));
+    }
+    Ok(())
+}
+
 /// OpenID Provider metadata (the `/.well-known/openid-configuration` document).
 ///
 /// `ProviderMetadata(issuer, base)` fills in the standard endpoints under
@@ -46,6 +82,7 @@ impl ProviderMetadata {
     fn from_dict(d: &Bound<'_, PyAny>) -> PyResult<Self> {
         let inner: gm::ProviderMetadata = from_py(d)
             .map_err(|e| PyValueError::new_err(format!("invalid ProviderMetadata: {e}")))?;
+        validate_extra_keys(&inner.extra)?;
         Ok(Self { inner })
     }
 
@@ -208,11 +245,18 @@ impl ProviderMetadata {
     }
     #[setter]
     fn set_extra(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.inner.extra = from_py(v)?;
+        let extra = from_py(v)?;
+        validate_extra_keys(&extra)?;
+        self.inner.extra = extra;
         Ok(())
     }
     /// Set one extension field.
     fn set_extra_field(&mut self, key: String, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if RESERVED_METADATA_FIELDS.contains(&key.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "metadata extra field {key:?} is reserved or unsupported"
+            )));
+        }
         let v: serde_json::Value = from_py(value)?;
         self.inner.extra.insert(key, v);
         Ok(())

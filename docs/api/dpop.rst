@@ -9,8 +9,7 @@ A DPoP proof is a short-lived JWT signed by a key the client holds, bound to
 the HTTP method and URL of the request (``htm`` / ``htu``) and, at a resource
 server, to the access token (``ath``). Validating one is stateless except for
 ``jti`` replay protection, which is delegated to a replay store: the built-in
-:class:`InMemoryReplayStore`, :class:`NoReplayStore` (only safe with
-``require_nonce=True``), or any Python object satisfying
+:class:`InMemoryReplayStore` or any Python object satisfying
 :class:`ReplayStoreProtocol`. :doc:`../guides/dpop` walks through the token
 endpoint and userinfo integration.
 
@@ -49,12 +48,14 @@ Configuration
 
       cfg = dpop.DpopConfig(require_nonce=True, nonce_secret=os.environ["DPOP_NONCE_SECRET"])
 
-.. py:class:: DpopProof(jkt: str)
+.. py:class:: DpopProof
 
    A validated DPoP proof: the SHA-256 JWK thumbprint (RFC 7638) of the key
    that signed it. Pass it to
    :meth:`pygrindvakt.provider.Provider.handle_token_request` to issue tokens
    bound to that key, or compare its ``jkt`` with a token's ``cnf.jkt``.
+   Applications cannot construct this class directly; only
+   :func:`validate_proof` and :func:`validate_resource_proof` return one.
 
    .. py:property:: jkt
       :type: str
@@ -105,18 +106,16 @@ Replay stores
 
 .. py:class:: NoReplayStore()
 
-   A replay store that records nothing.
-
-   Only safe together with ``DpopConfig(require_nonce=True)``, where the
-   short-lived server nonce bounds the replay window to
-   ``nonce_lifetime_secs``. Used with ``require_nonce=False`` it leaves
-   proofs replayable for ``proof_max_age_secs``, so the binding emits a
-   ``UserWarning`` at validation time in that combination.
+   Deprecated compatibility name. Construction raises ``ValueError`` and
+   validation fails closed if an instance from an older serialized context
+   reaches the binding. A nonce narrows a proof's validity window but does
+   not make a repeated ``jti`` unique, so a real atomic replay store is
+   always required.
 
 Functions
 ---------
 
-.. py:function:: validate_proof(store: InMemoryReplayStore | NoReplayStore | ReplayStoreProtocol, config: DpopConfig, proof: str, htm: str, htu: str) -> DpopProof
+.. py:function:: validate_proof(store: InMemoryReplayStore | ReplayStoreProtocol, config: DpopConfig, proof: str, htm: str, htu: str) -> DpopProof
 
    Validate a ``DPoP`` header value for a **token-endpoint** request.
 
@@ -137,7 +136,7 @@ Functions
    ``use_dpop_nonce`` and a fresh :func:`issue_nonce`) or
    :class:`pygrindvakt.DpopServerError`.
 
-.. py:function:: validate_resource_proof(store: InMemoryReplayStore | NoReplayStore | ReplayStoreProtocol, config: DpopConfig, proof: str, htm: str, htu: str, access_token: str) -> DpopProof
+.. py:function:: validate_resource_proof(store: InMemoryReplayStore | ReplayStoreProtocol, config: DpopConfig, proof: str, htm: str, htu: str, access_token: str) -> DpopProof
 
    Validate a ``DPoP`` header value for a **resource** request (for example
    userinfo), additionally binding it to ``access_token`` through the ``ath``
@@ -170,7 +169,7 @@ Functions
            except DpopError:
                return OAuthError("invalid_dpop_proof").to_response()
        try:
-           return op.handle_token_request(form, TOKEN_URL, auth_header=headers.get("authorization"),
+           return op.handle_token_request(form_pairs, TOKEN_URL, auth_header=headers.get("authorization"),
                                           dpop=proof).to_response()
        except OAuthError as e:
            return e.to_response()

@@ -19,24 +19,20 @@ Read this before wiring pygrindvakt into an authentication flow.
 Fail-closed hardening added by the binding
 ------------------------------------------
 
-Reviewing tunnelbana, the reference Rust consumer of grindvakt, showed several
-guards that every caller had to re-implement around sharp edges of the
-library. Rather than have every Flask and Django user rediscover them, the
-binding bakes them in (ADR 0003). Each guard is stricter than grindvakt, and
-each is escapable only through an explicit, warning-emitting ``unsafe_*``
-argument or by dropping to a lower-level primitive.
+The binding bakes fail-closed policy into the Python boundary (ADR 0003), so
+framework integrations cannot accidentally omit deployment-critical choices.
 
 .. list-table::
    :header-rows: 1
    :widths: 34 40 26
 
    * - Guard
-     - What grindvakt does
+     - Security property
      - Escape hatch
    * - :func:`pygrindvakt.rp.verify_id_token` refuses ``expected_nonce=None``
        with :class:`pygrindvakt.AuthnError`.
-     - Silently skips the nonce check when the nonce is ``None``, which
-       allows id_token replay in the code flow.
+     - Binds the ID token to the authorization request and prevents replay
+       across login sessions.
      - ``unsafe_skip_nonce_check=True`` disables the check and emits a
        ``UserWarning``. Only for flows that genuinely carry no nonce.
    * - :class:`pygrindvakt.client.InMemoryClientStore` raises ``ValueError``
@@ -68,11 +64,12 @@ argument or by dropping to a lower-level primitive.
        307 / 308 and read unbounded responses.
      - Inject your own ``HttpClient``; then these become **your**
        responsibilities.
-   * - :class:`pygrindvakt.dpop.NoReplayStore` used with
-       ``DpopConfig(require_nonce=False)`` emits a ``UserWarning``.
-     - Documents the combination as unsafe but accepts it silently.
-     - Set ``require_nonce=True`` (with a ``nonce_secret``) or use a real
-       replay store.
+   * - DPoP validation requires an atomic replay store; the deprecated
+       :class:`pygrindvakt.dpop.NoReplayStore` cannot be constructed.
+     - A valid server nonce is replayed along with a captured proof and is
+       therefore not a substitute for unique ``jti`` tracking.
+     - None; use an in-memory store for one process or a shared store across
+       workers.
    * - ``token_url`` / ``htu`` are explicit, documented as "from
        configuration, never from ``Host``".
      - Same requirement, but easy to miss.
@@ -112,8 +109,8 @@ from the same setting that produced
    ISSUER = os.environ["OP_ISSUER"]            # configuration
    TOKEN_URL = f"{ISSUER}/token"               # what clients are told in discovery
 
-   op.handle_token_request(form, TOKEN_URL, auth_header=auth)      # correct
-   op.handle_token_request(form, request.url, auth_header=auth)    # WRONG
+   op.handle_token_request(form_pairs, TOKEN_URL, auth_header=auth)      # correct
+   op.handle_token_request(form_pairs, request.url, auth_header=auth)    # WRONG
 
 The examples under ``examples/`` all follow this rule; the Flask, Django and
 FastAPI guides call it out at the token endpoint.
@@ -140,7 +137,7 @@ Everything else should become a generic ``server_error``:
 .. code-block:: python
 
    try:
-       tr = op.handle_token_request(form, TOKEN_URL, auth_header=auth)
+       tr = op.handle_token_request(form_pairs, TOKEN_URL, auth_header=auth)
    except OAuthError as e:
        return to_flask(e.to_response())
    except GrindvaktError:
@@ -169,14 +166,15 @@ open redirector and a phishing tool.
 .. code-block:: python
 
    try:
-       req = AuthorizationRequest.from_params(query)
+       req = AuthorizationRequest.from_params(query_pairs)
        op.validate_authorization_request(req)
    except OAuthError as e:
        return e.to_response()                  # NOT to_redirect: redirect_uri is untrusted
    session["authz"] = req.to_dict()
    # ... later, after login ...
    except OAuthError as e:
-       return e.to_redirect(req.redirect_uri)  # safe: validated above
+       mode = "fragment" if req.use_fragment() else "query"
+       return e.to_redirect(req.redirect_uri, mode)  # safe: validated above
 
 Matching is exact, with no prefix or wildcard support, and there is no
 ``localhost`` exception.
@@ -263,10 +261,6 @@ Each is named so it stands out in a code review.
    id_token without ever having sent a nonce. In the standard code flow it
    allows id_token replay. See :doc:`rp`.
 
-:class:`pygrindvakt.dpop.NoReplayStore`
-   Records nothing. Acceptable only with ``require_nonce=True``, where the
-   server nonce bounds the replay window; otherwise warns. See :doc:`dpop`.
-
 :func:`pygrindvakt.jwt.peek_claims_unverified` and :func:`pygrindvakt.federation.decode_unverified`
    Return claims without checking any signature. For inspection only (which
    key set to fetch, which authority to ask). Never make a decision on their
@@ -302,8 +296,8 @@ Checklist for a production OP
    clients; log everything else.
 #. Keep the signing key on a PKCS#11 token where you can; otherwise load it
    from a file with restrictive permissions, never from source.
-#. If you enable DPoP, use a shared replay store or ``require_nonce=True``
-   with a high-entropy ``nonce_secret``.
+#. If you enable DPoP, use an atomic shared replay store across workers.
+   A nonce is defense in depth, not a replacement for replay tracking.
 #. Do not set any ``unsafe_*`` argument.
 
 Checklist for a production RP
@@ -314,6 +308,9 @@ Checklist for a production RP
    doing anything else.
 #. Always pass the stored nonce to ``verify_id_token``; never
    ``unsafe_skip_nonce_check``.
+#. Pass a non-empty allowlist of ID-token signing algorithms derived from
+   trusted provider configuration, and opt in explicitly to any additional
+   audience you trust.
 #. Prefer ``private_key_jwt`` over shared secrets; the OP then holds only
    your public key.
 #. Keep the built-in HTTP client, or make sure your own never follows

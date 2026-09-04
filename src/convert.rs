@@ -3,7 +3,7 @@
 
 use pyo3::exceptions::{PyTypeError, PyUserWarning};
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyDict, PyModule};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -47,6 +47,43 @@ pub fn to_py<'py, T: Serialize + ?Sized>(
 /// Deserialize native Python objects into any `serde::Deserialize` type.
 pub fn from_py<T: DeserializeOwned>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
     pythonize::depythonize(obj).map_err(PyErr::from)
+}
+
+/// Convert convenience request data into ordered form/query pairs.
+///
+/// Mappings remain accepted here for the non-protocol convenience fields on
+/// `HttpRequestData`. Security-sensitive parser entry points must instead use
+/// [`protocol_parameter_pairs`], which rejects mappings.
+pub fn parameter_pairs(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<(String, String)>> {
+    if let Ok(mapping) = obj.cast::<PyDict>() {
+        return mapping
+            .iter()
+            .map(|(key, value)| Ok((key.extract()?, value.extract()?)))
+            .collect();
+    }
+    obj.extract::<Vec<(String, String)>>().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "{name} must be a dict[str, str] or an iterable of (str, str) pairs"
+        ))
+    })
+}
+
+/// Extract ordered protocol parameters without permitting a mapping to erase
+/// duplicate names before the Rust validation boundary sees them.
+pub fn protocol_parameter_pairs(
+    obj: &Bound<'_, PyAny>,
+    name: &str,
+) -> PyResult<Vec<(String, String)>> {
+    if obj.cast::<PyDict>().is_ok() {
+        return Err(PyTypeError::new_err(format!(
+            "{name} must be an ordered sequence of (str, str) pairs; mappings discard duplicate parameters"
+        )));
+    }
+    obj.extract::<Vec<(String, String)>>().map_err(|_| {
+        PyTypeError::new_err(format!(
+            "{name} must be an ordered sequence of (str, str) pairs"
+        ))
+    })
 }
 
 /// Log a Python exception raised inside a protocol adapter without propagating

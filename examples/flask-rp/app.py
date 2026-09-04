@@ -69,9 +69,15 @@ def create_app() -> Flask:
         try:
             prov = provider_info()
             tokens = rp.exchange_code(HTTP_CLIENT, prov, CLIENT, code, pending["verifier"])
-            jwks = rp.fetch_jwks(HTTP_CLIENT, prov.jwks_uri)
-            id_claims = rp.verify_id_token(jwks, tokens.id_token, prov.issuer, CLIENT.client_id, pending["nonce"])
-            userinfo = rp.fetch_userinfo(HTTP_CLIENT, prov.userinfo_endpoint, tokens.access_token)
+            jwks = rp.fetch_jwks(HTTP_CLIENT, prov.jwks_uri, prov.issuer)
+            id_claims = rp.verify_id_token(
+                jwks, tokens.id_token, prov.issuer, CLIENT.client_id,
+                pending["nonce"], ["ES256"],
+            )
+            userinfo = rp.fetch_userinfo(
+                HTTP_CLIENT, prov.userinfo_endpoint, tokens.access_token,
+                id_claims["sub"], prov.issuer,
+            )
         except GrindvaktError as e:
             # Error details stay in the server log; never echo str(e) to the browser.
             app.logger.warning("login failed: %s", e)

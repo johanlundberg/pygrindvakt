@@ -268,17 +268,27 @@ fn oauth_error_response(
 }
 
 /// Render an OAuth error as a redirect back to the client (authorization
-/// endpoint). Backs `OAuthError.to_redirect(redirect_uri)`.
+/// endpoint). Backs `OAuthError.to_redirect(redirect_uri, response_mode)`.
 #[pyfunction]
-#[pyo3(signature = (code, redirect_uri, description = None, state = None))]
+#[pyo3(signature = (code, redirect_uri, response_mode, description = None, state = None))]
 fn oauth_error_redirect(
     code: &str,
     redirect_uri: &str,
+    response_mode: &str,
     description: Option<String>,
     state: Option<String>,
 ) -> PyResult<crate::http::Response> {
+    let fragment = match response_mode {
+        "query" => false,
+        "fragment" => true,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported response_mode: {other}"
+            )))
+        }
+    };
     Ok(crate::http::Response::wrap(
-        build_oauth_error(code, description, state)?.to_redirect(redirect_uri),
+        build_oauth_error(code, description, state)?.to_redirect(redirect_uri, fragment),
     ))
 }
 

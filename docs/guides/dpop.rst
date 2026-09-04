@@ -63,7 +63,8 @@ configuration:
            except DpopError:
                return to_flask(OAuthError("invalid_dpop_proof").to_response())
        try:
-           tr = op.handle_token_request(data.form, TOKEN_URL, auth_header=data.authorization(), dpop=proof)
+           tr = op.handle_token_request(data.form_pairs, TOKEN_URL,
+                                        auth_header=data.authorization(), dpop=proof)
        except OAuthError as e:
            return to_flask(e.to_response())
        resp = tr.to_response()                      # token_type is "DPoP" when proof was given
@@ -159,11 +160,10 @@ A Python store (:class:`~pygrindvakt.dpop.ReplayStoreProtocol`)
    :class:`pygrindvakt.DpopServerError` (HTTP 500) and the exception is
    logged via ``sys.unraisablehook``.
 
-:class:`~pygrindvakt.dpop.NoReplayStore` with ``require_nonce=True``
-   Records nothing; the server nonce bounds the replay window to
-   ``nonce_lifetime_secs`` instead. This is stateless and replica-safe.
-   Using ``NoReplayStore`` **without** ``require_nonce`` leaves proofs
-   replayable, so the binding emits a ``UserWarning`` in that combination.
+There is no safe no-op option. ``NoReplayStore`` remains only as a deprecated
+compatibility name and cannot be constructed. Requiring a server nonce does
+not change this: replaying a captured proof also replays its still-valid
+nonce. Every deployment therefore needs an atomic replay store.
 
 Errors at a glance
 ------------------

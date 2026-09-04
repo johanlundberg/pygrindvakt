@@ -1,5 +1,7 @@
 """Package-level checks: version, submodule registration, exception hierarchy."""
 
+import pytest
+
 import pygrindvakt
 from pygrindvakt import OAuthError
 
@@ -51,9 +53,17 @@ def test_oauth_error_is_constructible_and_renders():
     assert r.header("content-type") == "application/json"
     assert r.header("cache-control") == "no-store"
     assert b'"error":"access_denied"' in r.body and b'"state":"xyz"' in r.body
-    rd = e.to_redirect("https://rp.example.com/cb?x=1")
+    rd = e.to_redirect("https://rp.example.com/cb?x=1", "query")
     assert rd.status == 302
     assert rd.header("location") == "https://rp.example.com/cb?x=1&error=access_denied&error_description=nope&state=xyz"
+    fragment = e.to_redirect("https://rp.example.com/cb", "fragment")
+    assert fragment.header("location") == (
+        "https://rp.example.com/cb#error=access_denied&error_description=nope&state=xyz"
+    )
+    with pytest.raises(ValueError, match="response_mode"):
+        e.to_redirect("https://rp.example.com/cb", "form_post")
+    with pytest.raises(TypeError):
+        e.to_redirect("https://rp.example.com/cb")
 
 
 def test_oauth_error_invalid_client_gets_www_authenticate():

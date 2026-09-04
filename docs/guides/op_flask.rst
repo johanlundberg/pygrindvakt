@@ -26,8 +26,8 @@ The adapters
            path=r.path.lstrip("/"),
            method=r.method,
            uri=r.url,
-           query=r.args.to_dict(),
-           form=r.form.to_dict(),
+           query=list(r.args.items(multi=True)),
+           form=list(r.form.items(multi=True)),
            body=r.get_data(),
            headers={k.lower(): v for k, v in r.headers.items()},
            cookies=r.cookies.to_dict(),
@@ -37,11 +37,11 @@ The adapters
        """Turn a pygrindvakt ``Response`` into a Flask response."""
        return flask.Response(resp.body, status=resp.status, headers=list(resp.headers))
 
-``HttpRequestData`` is a convenience: the provider methods themselves only
-need the query dict, the form dict and the ``Authorization`` header, so you
-may equally pass ``r.args.to_dict()`` and ``r.headers.get("Authorization")``
-directly. The adapter keeps the views identical across frameworks and gives
-you ``bearer_token()`` for free.
+``HttpRequestData`` is a convenience. Preserve query and form fields as pair
+lists: OAuth requires duplicate parameter names to be rejected, which is
+impossible after a multi-dict has silently collapsed them. The adapter keeps
+the views identical across frameworks and gives you ``bearer_token()`` for
+free.
 
 Building the provider
 ---------------------
@@ -107,7 +107,7 @@ untrusted, so errors are rendered directly.
    def authorization():
        data = request_data()
        try:
-           req = AuthorizationRequest.from_params(data.query)
+           req = AuthorizationRequest.from_params(data.query_pairs)
            op.validate_authorization_request(req)
        except OAuthError as e:
            # The redirect_uri is not trusted until validation succeeds: never redirect here.
@@ -131,11 +131,13 @@ because the URI was validated on the GET.
        claims = authenticate(form.get("username", ""), form.get("password", ""))
        if claims is None:
            err = OAuthError("access_denied", "wrong username or password", req.state)
-           return to_flask(err.to_redirect(req.redirect_uri))       # validated on the GET
+           return to_flask(err.to_redirect(req.redirect_uri,
+                           "fragment" if req.use_fragment() else "query"))
        try:
            return to_flask(op.authorization_redirect(req, form["username"], claims))
        except OAuthError as e:
-           return to_flask(e.to_redirect(req.redirect_uri))
+           return to_flask(e.to_redirect(req.redirect_uri,
+                           "fragment" if req.use_fragment() else "query"))
 
 ``authenticate`` is your application's business: it returns the user's claims
 in ``external_claims`` shape (claim name to list of strings), for example
@@ -150,7 +152,7 @@ Pass the ``acr`` argument when you know how the user authenticated.
    def token():
        data = request_data()
        try:
-           tr = op.handle_token_request(data.form, token_url, auth_header=data.authorization())
+           tr = op.handle_token_request(data.form_pairs, token_url, auth_header=data.authorization())
        except OAuthError as e:
            return to_flask(e.to_response())
        return to_flask(tr.to_response())

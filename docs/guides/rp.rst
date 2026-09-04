@@ -111,8 +111,11 @@ stored nonce.
            return render_template("login_failed.html")
        try:
            ts = rp.exchange_code(http_client, info, me, request.args["code"], code_verifier=pending["verifier"])
-           jwks = rp.fetch_jwks(http_client, info.jwks_uri)
-           claims = rp.verify_id_token(jwks, ts.id_token, info.issuer, me.client_id, pending["nonce"])
+           jwks = rp.fetch_jwks(http_client, info.jwks_uri, info.issuer)
+           claims = rp.verify_id_token(
+               jwks, ts.id_token, info.issuer, me.client_id,
+               pending["nonce"], ["ES256"],
+           )
        except GrindvaktError:
            log.exception("login failed")                     # str(e) is for logs only
            return render_template("login_failed.html")
@@ -120,17 +123,18 @@ stored nonce.
        return redirect("/")
 
 :func:`~pygrindvakt.rp.verify_id_token` checks the signature against the
-JWKS, ``iss``, ``aud`` (your ``client_id``), ``exp``, ``iat`` and the nonce,
-and returns the claims as a dict. A non-200 from the token endpoint raises
+JWKS, the explicit signing-algorithm allowlist, ``iss``, ``sub``, every
+``aud`` value, ``azp`` when applicable, ``exp``, ``iat`` and the nonce, and
+returns the claims as a dict. A non-200 from the token endpoint raises
 :class:`pygrindvakt.AuthnError` with a sanitized, truncated copy of the
 upstream error body; treat it as log material, never show it to the user.
 
 .. important:: The nonce is required.
 
    ``verify_id_token`` refuses ``expected_nonce=None`` with
-   :class:`pygrindvakt.AuthnError`. grindvakt itself silently skips the
-   nonce check in that case, which in the code flow lets a captured id_token
-   be replayed into a different session. The only way past the guard is
+   :class:`pygrindvakt.AuthnError`. Omitting the nonce in the code flow lets a
+   captured id_token be replayed into a different session. The only way past
+   the guard is
    ``unsafe_skip_nonce_check=True``, which emits a ``UserWarning`` and exists
    for flows that genuinely carry no nonce (a pure OAuth 2.0 flow whose
    token response happens to include an id_token). A nonce that *is* given
@@ -141,11 +145,14 @@ Userinfo
 
 .. code-block:: python
 
-   profile = rp.fetch_userinfo(http_client, info.userinfo_endpoint, ts.access_token)
+   profile = rp.fetch_userinfo(
+       http_client, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer
+   )
 
 The request is a POST with the token in the ``Authorization`` header, which
 OIDC Core permits and every OP built with pygrindvakt accepts. A non-200
-raises :class:`pygrindvakt.AuthnError`. The result is a dict;
+raises :class:`pygrindvakt.AuthnError`. The response must contain a string
+``sub`` exactly equal to the validated ID-token subject. The result is a dict;
 :func:`~pygrindvakt.rp.claims_to_attributes` flattens it (or the id_token
 claims) into the ``{name: [values]}`` shape an attribute-based backend or a
 SAML proxy expects.

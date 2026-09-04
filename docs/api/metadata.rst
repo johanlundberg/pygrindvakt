@@ -82,11 +82,15 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       :type: dict[str, Any]
 
       Extension fields (anything not modelled above) as a dict. Assigning
-      replaces the whole set.
+      replaces the whole set. Modelled protocol members cannot be duplicated
+      through ``extra``. ``end_session_endpoint`` is also rejected because
+      this provider does not implement OIDC logout.
 
    .. py:method:: set_extra_field(key: str, value: Any) -> None
 
-      Set one extension field. ``value`` may be any JSON-serializable object.
+      Set one non-protocol extension field. ``value`` may be any
+      JSON-serializable object; reserved and unsupported names raise
+      ``ValueError``.
 
    .. code-block:: python
 
@@ -95,11 +99,18 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       md = metadata.ProviderMetadata("https://issuer.example", "https://issuer.example/oidc")
       md.token_endpoint                       # "https://issuer.example/oidc/token"
       md.scopes_supported = ["openid", "email"]
-      md.claims_parameter_supported = True
-      md.set_extra_field("end_session_endpoint", "https://issuer.example/oidc/logout")
+      md.set_extra_field("organization_name", "Example University")
 
       doc = md.to_dict()
       assert metadata.ProviderMetadata.from_dict(doc).token_endpoint == md.token_endpoint
+
+   .. note::
+
+      :class:`pygrindvakt.provider.Provider` publishes only capabilities it
+      actually implements. At construction it normalizes response types,
+      response modes, grants, subject types, client authentication methods,
+      PKCE methods and the ID-token signing algorithm to the effective engine
+      configuration.
 
    .. note::
 

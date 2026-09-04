@@ -40,7 +40,7 @@ def to_flask(r):
 def token():
     try:
         tr = op.handle_token_request(
-            request.form.to_dict(),
+            list(request.form.items(multi=True)),
             f"{ISSUER}/token",                          # from config, never from Host
             auth_header=request.headers.get("Authorization"),
         )
@@ -68,11 +68,17 @@ state, nonce, verifier = util.random_token(24), util.random_token(24), util.rand
 url = rp.authorization_url(info, me, state, nonce, code_challenge=pkce.s256_challenge(verifier))
 # ... redirect the browser to `url`; on the callback:
 tokens_ = rp.exchange_code(http_client, info, me, code, code_verifier=verifier)
-jwks = rp.fetch_jwks(http_client, info.jwks_uri)
-claims = rp.verify_id_token(jwks, tokens_.id_token, info.issuer, "demo", nonce)
+jwks = rp.fetch_jwks(http_client, info.jwks_uri, info.issuer)
+claims = rp.verify_id_token(
+    jwks, tokens_.id_token, info.issuer, "demo", nonce, ["ES256"]
+)
+userinfo = rp.fetch_userinfo(
+    http_client, info.userinfo_endpoint, tokens_.access_token, claims["sub"], info.issuer
+)
 ```
 
-> **Security:** `verify_id_token` requires the expected nonce. Passing `None`
+> **Security:** `verify_id_token` requires the expected nonce and an explicit
+> signing-algorithm allowlist. Passing `None`
 > raises unless you also pass `unsafe_skip_nonce_check=True`, which emits a
 > `UserWarning`. Other guards the binding adds on top of grindvakt: duplicate
 > `client_id`s and unknown `Client` fields are rejected, reserved id_token claim

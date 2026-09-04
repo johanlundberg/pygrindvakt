@@ -38,8 +38,8 @@ class HttpRequestData:
         path: str = ...,
         method: str = ...,
         uri: str = ...,
-        query: dict[str, str] | None = ...,
-        form: dict[str, str] | None = ...,
+        query: dict[str, str] | list[tuple[str, str]] | None = ...,
+        form: dict[str, str] | list[tuple[str, str]] | None = ...,
         body: bytes | None = ...,
         headers: dict[str, str] | None = ...,
         cookies: dict[str, str] | None = ...,
@@ -61,9 +61,13 @@ class HttpRequestData:
     @query.setter
     def query(self, value: dict[str, str]) -> None: ...
     @property
+    def query_pairs(self) -> list[tuple[str, str]]: ...
+    @property
     def form(self) -> dict[str, str]: ...
     @form.setter
     def form(self, value: dict[str, str]) -> None: ...
+    @property
+    def form_pairs(self) -> list[tuple[str, str]]: ...
     @property
     def body(self) -> bytes: ...
     @body.setter

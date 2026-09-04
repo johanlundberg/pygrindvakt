@@ -36,8 +36,8 @@ self-contained sealed payloads (:doc:`../api/tokens`). Three things remain:
    * - **DPoP replay store**: seen proof ``jti`` values.
      - :class:`pygrindvakt.dpop.ReplayStoreProtocol`:
        ``record(jti, ttl_secs) -> bool``
-     - :class:`~pygrindvakt.dpop.InMemoryReplayStore` (per process),
-       :class:`~pygrindvakt.dpop.NoReplayStore` (with nonces)
+     - :class:`~pygrindvakt.dpop.InMemoryReplayStore` (per process), or a
+       shared protocol implementation
 
 Outbound HTTP (:class:`pygrindvakt.http.HttpClientProtocol`) is injectable
 the same way, though it holds no state that matters here.
@@ -90,6 +90,12 @@ operators. A ``ClientStore.get`` that raises is treated as "unknown client".
 
 Objects missing the protocol methods are rejected with ``TypeError`` when the
 ``Provider`` is built, not at the first request.
+
+The provider deliberately has no implicit token-use store: construction
+fails until the application chooses one. Likewise, DPoP never permits a
+no-op replay store. A server nonce is useful defense in depth, but replaying
+the same proof also replays the same valid nonce, so it cannot replace atomic
+``jti`` tracking.
 
 Fork semantics
 --------------

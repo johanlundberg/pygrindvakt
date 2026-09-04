@@ -185,11 +185,13 @@ OAuthError
       ``cache-control: no-store`` header and, for ``invalid_client``, a
       ``www-authenticate`` header. This output is safe to send to clients.
 
-   .. py:method:: to_redirect(redirect_uri: str) -> pygrindvakt.http.Response
+   .. py:method:: to_redirect(redirect_uri: str, response_mode: str) -> pygrindvakt.http.Response
 
       Render as a ``302`` redirect back to the client with ``error``,
-      ``error_description`` and ``state`` in the query string (the
-      authorization-endpoint error response).
+      ``error_description`` and ``state`` in the query string, or in the URL
+      fragment when ``response_mode="fragment"``. Pass the same mode selected
+      for the successful authorization response. The mode is mandatory so an
+      implicit or hybrid error cannot accidentally fall back to query mode.
 
       Only call this with a ``redirect_uri`` that has already been validated
       against the registered client, i.e. after
@@ -248,7 +250,7 @@ Example
    log = logging.getLogger(__name__)
 
    try:
-       tr = op.handle_token_request(form, TOKEN_URL, auth_header=auth)
+       tr = op.handle_token_request(form_pairs, TOKEN_URL, auth_header=auth)
        resp = tr.to_response()
    except OAuthError as e:
        resp = e.to_response()                 # client-safe: status, JSON body, no-store

@@ -28,7 +28,7 @@ def authorization(request: HttpRequest) -> HttpResponse:
     if request.method == "GET":
         data = request_data(request)
         try:
-            req = AuthorizationRequest.from_params(data.query)
+            req = AuthorizationRequest.from_params(data.query_pairs)
             OP.validate_authorization_request(req)
         except OAuthError as e:
             # The redirect_uri is not trusted until validation succeeds: never redirect here.
@@ -45,11 +45,11 @@ def authorization(request: HttpRequest) -> HttpResponse:
     claims = authenticate(form.get("username", ""), form.get("password", ""))
     if claims is None:
         err = OAuthError("access_denied", "wrong username or password", req.state)
-        return to_django(err.to_redirect(req.redirect_uri))  # validated on the GET
+        return to_django(err.to_redirect(req.redirect_uri, "fragment" if req.use_fragment() else "query"))
     try:
         return to_django(OP.authorization_redirect(req, form["username"], claims))
     except OAuthError as e:
-        return to_django(e.to_redirect(req.redirect_uri))
+        return to_django(e.to_redirect(req.redirect_uri, "fragment" if req.use_fragment() else "query"))
 
 
 @csrf_exempt  # called by OAuth clients, not browsers
@@ -57,7 +57,7 @@ def authorization(request: HttpRequest) -> HttpResponse:
 def token(request: HttpRequest) -> HttpResponse:
     data = request_data(request)
     try:
-        tr = OP.handle_token_request(data.form, TOKEN_URL, auth_header=data.authorization())
+        tr = OP.handle_token_request(data.form_pairs, TOKEN_URL, auth_header=data.authorization())
     except OAuthError as e:
         return to_django(e.to_response())
     return to_django(tr.to_response())

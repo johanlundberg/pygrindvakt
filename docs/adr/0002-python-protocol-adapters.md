@@ -1,6 +1,6 @@
 # ADR 0002: Python protocol adapters for stores and outbound HTTP, failing closed
 
-- **Status:** Accepted
+- **Status:** Amended by the 0.8 OIDC conformance hardening
 - **Date:** 2026-09-02
 - **Deciders:** pygrindvakt maintainers
 
@@ -9,8 +9,8 @@
 grindvakt defines four injection points as async traits and ships only partial
 implementations: `HttpClient` (no implementation at all; tunnelbana brings
 reqwest), `ClientStore` (`InMemoryClientStore`), `TokenUseStore`
-(`InMemoryTokenUseStore`, `RedisStore`), and `ReplayStore` (only the no-op
-`NoReplayStore`). Real deployments need shared state across gunicorn workers
+(`InMemoryTokenUseStore`, `RedisStore`), and `ReplayStore` (historically only
+the no-op `NoReplayStore`). Real deployments need shared state across gunicorn workers
 (Redis, a database) and often already have an HTTP client with proxies, custom
 CAs, or test fakes.
 
@@ -24,7 +24,7 @@ object implementing a small duck-typed protocol:
 | `HttpClient` | `get(url) -> (status, body, content_type)`, `post_form(url, form, headers) -> same` | `http.ReqwestClient` (also the default when `None` is passed) |
 | `ClientStore` | `get(client_id) -> Client \| dict \| None`, `put(client)`, optional `put_with_ttl(client, ttl)` | `client.InMemoryClientStore` |
 | `TokenUseStore` | `consume(token_hash, ttl_secs) -> bool` | `provider.InMemoryTokenUseStore`, `provider.RedisStore` |
-| `ReplayStore` | `record(jti, ttl_secs) -> bool` | `dpop.InMemoryReplayStore`, `dpop.NoReplayStore` |
+| `ReplayStore` | `record(jti, ttl_secs) -> bool` | `dpop.InMemoryReplayStore` |
 
 Implementation rules:
 

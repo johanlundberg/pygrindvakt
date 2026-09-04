@@ -1,9 +1,8 @@
 """Type stubs for ``pygrindvakt.dpop`` - RFC 9449 sender-constrained tokens.
 
 Proof validation is stateless except for ``jti`` replay protection, which is
-delegated to a replay store: the built-in ``InMemoryReplayStore``,
-``NoReplayStore`` (only safe with ``require_nonce=True``), or any Python
-object satisfying ``ReplayStoreProtocol``.
+delegated to an atomic replay store: the built-in ``InMemoryReplayStore`` for
+one process, or a shared Python object satisfying ``ReplayStoreProtocol``.
 """
 
 from typing import Protocol
@@ -40,7 +39,6 @@ class DpopConfig:
 class DpopProof:
     """A validated DPoP proof: the SHA-256 JWK thumbprint of the proof key."""
 
-    def __init__(self, jkt: str) -> None: ...
     @property
     def jkt(self) -> str: ...
 
@@ -53,17 +51,12 @@ class InMemoryReplayStore:
         """Record ``jti``; returns True iff it was not already live."""
 
 class NoReplayStore:
-    """A replay store that records nothing.
-
-    Only safe together with ``DpopConfig(require_nonce=True)``, where the
-    short-lived server nonce bounds the replay window; otherwise a
-    ``UserWarning`` is emitted at validation time.
-    """
+    """Removed compatibility marker whose constructor always raises ValueError."""
 
     def __init__(self) -> None: ...
 
 def validate_proof(
-    store: InMemoryReplayStore | NoReplayStore | ReplayStoreProtocol,
+    store: InMemoryReplayStore | ReplayStoreProtocol,
     config: DpopConfig,
     proof: str,
     htm: str,
@@ -82,7 +75,7 @@ def validate_proof(
     """
 
 def validate_resource_proof(
-    store: InMemoryReplayStore | NoReplayStore | ReplayStoreProtocol,
+    store: InMemoryReplayStore | ReplayStoreProtocol,
     config: DpopConfig,
     proof: str,
     htm: str,

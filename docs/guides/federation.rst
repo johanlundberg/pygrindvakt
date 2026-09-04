@@ -136,7 +136,8 @@ order:
 
    op_meta = entity.metadata["openid_provider"]
    op_jwks = federation.entity_metadata_jwks(None, op_meta, entity.subject, entity.subject_jwks)
-   claims = rp.verify_id_token(op_jwks, id_token, entity.subject, my_client_id, nonce)
+   claims = rp.verify_id_token(op_jwks, id_token, entity.subject, my_client_id,
+                               nonce, ["ES256"])
 
 Metadata policy
 ---------------
@@ -225,7 +226,7 @@ federation front end implements in Rust; in Python it is a few lines around
    def authorization():
        data = request_data()
        try:
-           req = AuthorizationRequest.from_params(data.query)
+           req = AuthorizationRequest.from_params(data.query_pairs)
            if op.clients.get(req.client_id) is None and req.client_id.startswith("https://"):
                auto_register(req.client_id)
            op.validate_authorization_request(req)
@@ -243,7 +244,10 @@ Points worth noting:
   authorization request must be a signed request object (``request``
   parameter) signed with one of those keys; unpack and verify it with
   :func:`pygrindvakt.jwt.verify_with_jwks` before ``from_params``, merging the
-  JWT claims over the query parameters.
+  JWT claims over the query parameters. RFC 8707 represents multiple
+  ``resource`` values in a request object as a JSON array; expand that verified
+  array into repeated ``("resource", value)`` pairs when building the ordered
+  input to ``from_params``.
 * ``put_with_ttl`` keeps the OP's view of the RP no longer than the trust
   anchor vouches for it. :class:`~pygrindvakt.client.InMemoryClientStore`
   supports it natively; a Python :class:`~pygrindvakt.client.ClientStoreProtocol`

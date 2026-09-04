@@ -1,13 +1,14 @@
 //! Bindings for `grindvakt::dpop` - RFC 9449 sender-constrained tokens.
 //!
 //! Proof validation is stateless except for jti replay protection, which is
-//! delegated to a `ReplayStore`: the built-in `InMemoryReplayStore`,
-//! `NoReplayStore` (only safe with `require_nonce=True`), or any Python object
-//! with `record(jti: str, ttl_secs: int) -> bool`.
+//! delegated to an atomic `ReplayStore`: the built-in `InMemoryReplayStore`
+//! for one process, or a shared Python object with
+//! `record(jti: str, ttl_secs: int) -> bool`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
@@ -15,7 +16,7 @@ use grindvakt::dpop as gd;
 use grindvakt::dpop::ReplayStore;
 use grindvakt::provider::{InMemoryTokenUseStore as RsTokenUseStore, TokenUseStore};
 
-use crate::convert::{log_unraisable, new_submodule, require_methods, warn};
+use crate::convert::{log_unraisable, new_submodule, require_methods};
 use crate::errors::dpop_err;
 
 /// Upper bound on a `jti` we are willing to remember (defends the replay
@@ -102,18 +103,12 @@ pub struct DpopProof {
 
 #[pymethods]
 impl DpopProof {
-    #[new]
-    fn new(jkt: String) -> Self {
-        Self {
-            inner: gd::DpopProof { jkt },
-        }
-    }
     #[getter]
     fn jkt(&self) -> &str {
-        &self.inner.jkt
+        self.inner.jkt()
     }
     fn __repr__(&self) -> String {
-        format!("DpopProof(jkt={:?})", self.inner.jkt)
+        format!("DpopProof(jkt={:?})", self.inner.jkt())
     }
 }
 
@@ -162,17 +157,18 @@ impl InMemoryReplayStore {
     }
 }
 
-/// A replay store that records nothing. Only safe together with
-/// `DpopConfig(require_nonce=True)`, where the short-lived server nonce bounds
-/// the replay window; otherwise a `UserWarning` is emitted at validation time.
+/// Removed fail-closed compatibility marker. DPoP always requires an atomic
+/// replay store; nonces provide freshness, not single-use semantics.
 #[pyclass(module = "pygrindvakt.dpop", name = "NoReplayStore", frozen)]
 pub struct NoReplayStore;
 
 #[pymethods]
 impl NoReplayStore {
     #[new]
-    fn new() -> Self {
-        Self
+    fn new() -> PyResult<Self> {
+        Err(PyValueError::new_err(
+            "NoReplayStore is unsafe and no longer supported; configure an atomic ReplayStore",
+        ))
     }
     fn __repr__(&self) -> &'static str {
         "NoReplayStore()"
@@ -223,19 +219,10 @@ fn extract_replay_store(obj: &Bound<'_, PyAny>) -> PyResult<Store> {
     })))
 }
 
-fn store_ref(py: Python<'_>, store: &Store, config: &DpopConfig) -> Arc<dyn ReplayStore> {
+fn store_ref(_py: Python<'_>, store: &Store, _config: &DpopConfig) -> Arc<dyn ReplayStore> {
     match store {
         Store::Rust(s) => s.clone(),
-        Store::None => {
-            if !config.inner.require_nonce {
-                warn(
-                    py,
-                    "NoReplayStore without DpopConfig(require_nonce=True) leaves DPoP proofs \
-                     replayable for proof_max_age_secs; use InMemoryReplayStore or a shared store.",
-                );
-            }
-            Arc::new(gd::NoReplayStore)
-        }
+        Store::None => Arc::new(gd::NoReplayStore),
     }
 }
 

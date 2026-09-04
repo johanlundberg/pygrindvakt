@@ -25,9 +25,9 @@ class OAuthError(GrindvaktError):
         """Return a copy carrying ``state`` (the client's value to echo back)."""
     def to_response(self) -> Response:
         """Render as a direct JSON error response (token / userinfo endpoints)."""
-    def to_redirect(self, redirect_uri: str) -> Response:
+    def to_redirect(self, redirect_uri: str, response_mode: str) -> Response:
         """Render as a redirect back to the client (authorization endpoint).
 
         Only call this with a ``redirect_uri`` that has already been validated
-        against the registered client.
+        against the registered client. The response mode is mandatory.
         """

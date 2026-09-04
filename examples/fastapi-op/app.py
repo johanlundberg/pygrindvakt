@@ -49,14 +49,14 @@ async def request_data(request: Request) -> HttpRequestData:
     """
     body = await request.body()
     headers = {k.lower(): v for k, v in request.headers.items()}
-    form: dict[str, str] = {}
+    form: list[tuple[str, str]] = []
     if headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
-        form = dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
+        form = parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True)
     return HttpRequestData(
         path=request.url.path.lstrip("/"),
         method=request.method,
         uri=str(request.url),
-        query=dict(request.query_params),
+        query=list(request.query_params.multi_items()),
         form=form,
         body=body,
         headers=headers,
@@ -117,7 +117,7 @@ async def jwks():
 async def authorization(request: Request):
     data = await request_data(request)
     try:
-        req = AuthorizationRequest.from_params(data.query)
+        req = AuthorizationRequest.from_params(data.query_pairs)
         await run_in_threadpool(OP.validate_authorization_request, req)
     except OAuthError as e:
         # The redirect_uri is not trusted until validation succeeds: never redirect here.
@@ -137,12 +137,12 @@ async def login(request: Request):
     claims = authenticate(data.form.get("username", ""), data.form.get("password", ""))
     if claims is None:
         err = OAuthError("access_denied", "wrong username or password", req.state)
-        out = to_fastapi(err.to_redirect(req.redirect_uri))  # validated on the GET
+        out = to_fastapi(err.to_redirect(req.redirect_uri, "fragment" if req.use_fragment() else "query"))
     else:
         try:
             out = to_fastapi(await run_in_threadpool(OP.authorization_redirect, req, data.form["username"], claims))
         except OAuthError as e:
-            out = to_fastapi(e.to_redirect(req.redirect_uri))
+            out = to_fastapi(e.to_redirect(req.redirect_uri, "fragment" if req.use_fragment() else "query"))
     out.delete_cookie(AUTHZ_COOKIE)
     return out
 
@@ -151,7 +151,7 @@ async def login(request: Request):
 async def token(request: Request):
     data = await request_data(request)
     try:
-        tr = await run_in_threadpool(OP.handle_token_request, data.form, TOKEN_URL, auth_header=data.authorization())
+        tr = await run_in_threadpool(OP.handle_token_request, data.form_pairs, TOKEN_URL, auth_header=data.authorization())
     except OAuthError as e:
         return to_fastapi(e.to_response())
     return to_fastapi(tr.to_response())

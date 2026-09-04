@@ -6,9 +6,10 @@
 //! `None` for the built-in client, a `pygrindvakt.http.ReqwestClient`, or any
 //! Python object implementing the `HttpClient` protocol (see `http.rs`).
 //!
-//! HARDENING beyond upstream: `verify_id_token` refuses to run without an
-//! expected nonce unless `unsafe_skip_nonce_check=True` is passed explicitly
-//! (upstream silently skips the check when the nonce is `None`).
+//! The Python API makes nonce omission explicit: `verify_id_token` refuses to
+//! run without an expected nonce unless `unsafe_skip_nonce_check=True` is
+//! passed. It also requires a signing-algorithm allowlist and makes additional
+//! trusted audiences an explicit policy input.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +17,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
+use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
@@ -43,7 +45,8 @@ fn opt_repr(v: Option<&str>) -> String {
 /// and JWKS URI.
 ///
 /// Build one by hand for a statically configured provider, or with
-/// `ProviderInfo.from_metadata(discover(http, issuer))`.
+/// `ProviderInfo.from_metadata(discover(http, issuer))`. Construction rejects
+/// unsafe endpoint URLs before an authorization code or credential can be sent.
 #[pyclass(
     module = "pygrindvakt.rp",
     name = "ProviderInfo",
@@ -71,23 +74,25 @@ impl ProviderInfo {
         token_endpoint: String,
         userinfo_endpoint: Option<String>,
         jwks_uri: Option<String>,
-    ) -> Self {
-        Self {
-            inner: grp::ProviderInfo {
-                issuer,
-                authorization_endpoint,
-                token_endpoint,
-                userinfo_endpoint,
-                jwks_uri,
-            },
-        }
+    ) -> PyResult<Self> {
+        let inner = grp::ProviderInfo {
+            issuer,
+            authorization_endpoint,
+            token_endpoint,
+            userinfo_endpoint,
+            jwks_uri,
+        };
+        inner.validate().map_err(err)?;
+        Ok(Self { inner })
     }
 
     /// Build from a discovered `ProviderMetadata` document (the userinfo
     /// endpoint and JWKS URI are always set in that case).
     #[staticmethod]
-    fn from_metadata(metadata: &ProviderMetadata) -> Self {
-        Self::wrap(grp::ProviderInfo::from(metadata.inner.clone()))
+    fn from_metadata(metadata: &ProviderMetadata) -> PyResult<Self> {
+        let inner = grp::ProviderInfo::from(metadata.inner.clone());
+        inner.validate().map_err(err)?;
+        Ok(Self::wrap(inner))
     }
 
     #[getter]
@@ -294,16 +299,16 @@ pub struct TokenSet {
 #[pymethods]
 impl TokenSet {
     #[getter]
-    fn access_token(&self) -> Option<&str> {
-        self.inner.access_token.as_deref()
+    fn access_token(&self) -> &str {
+        &self.inner.access_token
     }
     #[getter]
-    fn id_token(&self) -> Option<&str> {
-        self.inner.id_token.as_deref()
+    fn id_token(&self) -> &str {
+        &self.inner.id_token
     }
     #[getter]
-    fn token_type(&self) -> Option<&str> {
-        self.inner.token_type.as_deref()
+    fn token_type(&self) -> &str {
+        &self.inner.token_type
     }
     /// The complete token-endpoint response as a dict.
     #[getter]
@@ -313,18 +318,8 @@ impl TokenSet {
 
     fn __repr__(&self) -> String {
         format!(
-            "TokenSet(token_type={}, access_token={}, id_token={})",
-            opt_repr(self.inner.token_type.as_deref()),
-            if self.inner.access_token.is_some() {
-                "<set>"
-            } else {
-                "None"
-            },
-            if self.inner.id_token.is_some() {
-                "<set>"
-            } else {
-                "None"
-            },
+            "TokenSet(token_type={:?}, access_token=<set>, id_token=<set>)",
+            self.inner.token_type,
         )
     }
 }
@@ -378,14 +373,15 @@ fn authorization_url(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    Ok(grp::authorization_url(
+    grp::authorization_url(
         &provider.inner,
         &client.inner,
         state,
         nonce,
         code_challenge,
         &extra_refs,
-    ))
+    )
+    .map_err(err)
 }
 
 /// Build a signed request object (RFC 9101, "JAR") carrying the
@@ -435,17 +431,23 @@ fn discover(
     r.map(ProviderMetadata::wrap).map_err(err)
 }
 
-/// Fetch a JWKS document from `jwks_uri` and return it as a dict
-/// (`{"keys": [...]}`), ready for `verify_id_token`.
+/// Fetch a JWKS document from `jwks_uri` for its associated `issuer` and
+/// return it as a dict (`{"keys": [...]}`), ready for `verify_id_token`.
+///
+/// The issuer is required so loopback HTTP is allowed only for an explicitly
+/// loopback HTTP development issuer.
 #[pyfunction]
-#[pyo3(signature = (http, jwks_uri))]
+#[pyo3(signature = (http, jwks_uri, issuer))]
 fn fetch_jwks<'py>(
     py: Python<'py>,
     http: Option<&Bound<'py, PyAny>>,
     jwks_uri: String,
+    issuer: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let http = extract_http_client(http)?;
-    let r = crate::runtime::block_on(py, async move { grp::fetch_jwks(&http, &jwks_uri).await })?;
+    let r = crate::runtime::block_on(py, async move {
+        grp::fetch_jwks(&http, &jwks_uri, &issuer).await
+    })?;
     let jwks = r.map_err(err)?;
     to_py(py, &jwks)
 }
@@ -476,8 +478,10 @@ fn exchange_code(
 }
 
 /// Verify an `id_token` against the provider JWKS (a dict `{"keys": [...]}`),
-/// `issuer`, audience `client_id`, and `expected_nonce`; `exp` and `iat` are
-/// required. Returns the validated claims as a dict.
+/// `issuer`, audience `client_id`, and `expected_nonce`; `sub`, `exp`, and
+/// `iat` are required. The protected algorithm must be explicitly allowed;
+/// all other audiences must be explicitly trusted and multi-audience tokens
+/// must name this client in `azp`. Returns the validated claims as a dict.
 ///
 /// `expected_nonce` is the nonce this RP sent in the authorization request.
 /// Passing `None` is refused with `AuthnError` unless
@@ -488,7 +492,11 @@ fn exchange_code(
 /// nonce (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
 /// it for the standard code flow allows id_token replay.
 #[pyfunction]
-#[pyo3(signature = (jwks, id_token, issuer, client_id, expected_nonce, unsafe_skip_nonce_check = false))]
+#[pyo3(signature = (jwks, id_token, issuer, client_id, expected_nonce, allowed_algorithms, trusted_additional_audiences = None, unsafe_skip_nonce_check = false))]
+// These arguments are deliberately explicit security-policy inputs in the
+// public Python API; hiding them in an options bag would make unsafe defaults
+// easier to overlook.
+#[allow(clippy::too_many_arguments)]
 fn verify_id_token<'py>(
     py: Python<'py>,
     jwks: &Bound<'py, PyAny>,
@@ -496,6 +504,8 @@ fn verify_id_token<'py>(
     issuer: &str,
     client_id: &str,
     expected_nonce: Option<&str>,
+    allowed_algorithms: Vec<String>,
+    trusted_additional_audiences: Option<Vec<String>>,
     unsafe_skip_nonce_check: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     if expected_nonce.is_none() {
@@ -512,24 +522,55 @@ fn verify_id_token<'py>(
         );
     }
     let jwks = jwks_from_py(jwks)?;
-    let claims =
-        grp::verify_id_token(&jwks, id_token, issuer, client_id, expected_nonce).map_err(err)?;
+    let allowed_algorithms = allowed_algorithms
+        .iter()
+        .map(|alg| {
+            JwsAlgorithm::from_str(alg)
+                .map_err(|e| PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}")))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let trusted_additional_audiences = trusted_additional_audiences.unwrap_or_default();
+    let trusted_refs = trusted_additional_audiences
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let claims = grp::verify_id_token(
+        &jwks,
+        id_token,
+        issuer,
+        client_id,
+        expected_nonce,
+        &allowed_algorithms,
+        &trusted_refs,
+    )
+    .map_err(err)?;
     to_py(py, &claims)
 }
 
 /// Fetch the userinfo document with a Bearer `access_token` and return it as
-/// a dict. Raises `AuthnError` on a non-200 response.
+/// a dict. The response `sub` must exactly match the validated ID-token
+/// subject supplied as `expected_sub`. Raises `AuthnError` on a non-200 or
+/// subject mismatch.
 #[pyfunction]
-#[pyo3(signature = (http, userinfo_endpoint, access_token))]
+#[pyo3(signature = (http, userinfo_endpoint, access_token, expected_sub, issuer))]
 fn fetch_userinfo<'py>(
     py: Python<'py>,
     http: Option<&Bound<'py, PyAny>>,
     userinfo_endpoint: String,
     access_token: String,
+    expected_sub: String,
+    issuer: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let http = extract_http_client(http)?;
     let r = crate::runtime::block_on(py, async move {
-        grp::fetch_userinfo(&http, &userinfo_endpoint, &access_token).await
+        grp::fetch_userinfo(
+            &http,
+            &userinfo_endpoint,
+            &access_token,
+            &expected_sub,
+            &issuer,
+        )
+        .await
     })?;
     let v = r.map_err(err)?;
     to_py(py, &v)

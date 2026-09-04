@@ -25,8 +25,8 @@ before ``POST`` so the raw bytes remain available.
            path=request.path.lstrip("/"),
            method=request.method or "GET",
            uri=request.build_absolute_uri(),
-           query=request.GET.dict(),
-           form=request.POST.dict(),
+           query=[(key, value) for key, values in request.GET.lists() for value in values],
+           form=[(key, value) for key, values in request.POST.lists() for value in values],
            body=body,
            headers={k.lower(): v for k, v in request.headers.items()},
            cookies=dict(request.COOKIES),
@@ -111,7 +111,7 @@ on POST it authenticates and redirects back.
        if request.method == "GET":
            data = request_data(request)
            try:
-               req = AuthorizationRequest.from_params(data.query)
+               req = AuthorizationRequest.from_params(data.query_pairs)
                OP.validate_authorization_request(req)
            except OAuthError as e:
                # The redirect_uri is not trusted until validation succeeds: never redirect here.
@@ -128,11 +128,13 @@ on POST it authenticates and redirects back.
        claims = authenticate(form.get("username", ""), form.get("password", ""))
        if claims is None:
            err = OAuthError("access_denied", "wrong username or password", req.state)
-           return to_django(err.to_redirect(req.redirect_uri))      # validated on the GET
+           return to_django(err.to_redirect(req.redirect_uri,
+                            "fragment" if req.use_fragment() else "query"))
        try:
            return to_django(OP.authorization_redirect(req, form["username"], claims))
        except OAuthError as e:
-           return to_django(e.to_redirect(req.redirect_uri))
+           return to_django(e.to_redirect(req.redirect_uri,
+                            "fragment" if req.use_fragment() else "query"))
 
 In a real deployment ``authenticate`` is ``django.contrib.auth.authenticate``
 plus a mapping from the ``User`` to claims, and you would pass
@@ -151,7 +153,7 @@ POST:
    def token(request: HttpRequest) -> HttpResponse:
        data = request_data(request)
        try:
-           tr = OP.handle_token_request(data.form, TOKEN_URL, auth_header=data.authorization())
+           tr = OP.handle_token_request(data.form_pairs, TOKEN_URL, auth_header=data.authorization())
        except OAuthError as e:
            return to_django(e.to_response())
        return to_django(tr.to_response())

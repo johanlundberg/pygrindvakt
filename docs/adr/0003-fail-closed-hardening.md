@@ -1,6 +1,6 @@
 # ADR 0003: Fail-closed hardening added at the binding boundary
 
-- **Status:** Accepted
+- **Status:** Amended by the 0.8 OIDC conformance hardening
 - **Date:** 2026-09-02
 - **Deciders:** pygrindvakt maintainers
 
@@ -19,7 +19,9 @@ guards implemented in *caller* code around sharp edges of the library:
    id_token claim names from `extra_claims` (`oidc_common.rs` rejects them).
 5. The outbound HTTP client must not follow redirects (token-endpoint bodies
    would be re-sent cross-origin) and must cap response sizes.
-6. `NoReplayStore` is documented as unsafe unless `require_nonce` is set.
+6. `NoReplayStore` was documented as unsafe unless `require_nonce` was set.
+   A nonce cannot replace unique-`jti` tracking because it is replayed with
+   the proof.
 
 Every Flask/Django user would rediscover these. Fixing them upstream would block
 the binding on a grindvakt release and change Rust API behaviour.
@@ -38,7 +40,8 @@ Bake the guards into the binding, following pygamlastan's `unsafe_*` convention:
    `ValueError` for any reserved claim name (`provider.RESERVED_ID_TOKEN_CLAIMS`).
 5. `http.ReqwestClient` uses `redirect::Policy::none()`, connect/read/total
    timeouts, and a streamed body cap; all are validated to be non-zero.
-6. `dpop.NoReplayStore` used with `require_nonce=False` emits a `UserWarning`.
+6. `dpop.NoReplayStore` can no longer be constructed, and any residual use
+   fails closed. DPoP always requires an atomic replay store.
 7. `token_url` / `htu` are explicit parameters everywhere and documented as
    "derive from configuration, never from the `Host` header".
 8. Documentation states that `str(exc)` of a `GrindvaktError` must never be sent
@@ -46,8 +49,7 @@ Bake the guards into the binding, following pygamlastan's `unsafe_*` convention:
 
 ## Consequences
 
-- The binding is slightly stricter than grindvakt; the strictness is always
-  escapable through an explicit, warning-emitting `unsafe_*` argument or by
-  using the lower-level primitive directly.
+- The nonce guard is escapable only through the explicit, warning-emitting
+  `unsafe_skip_nonce_check` argument. Replay protection is not optional.
 - If grindvakt later adopts these guards upstream, the binding's checks become
   redundant but harmless.

@@ -94,8 +94,7 @@ class Provider:
     """The OpenID Provider engine. Build once, share across requests.
 
     ``clients`` is an ``InMemoryClientStore`` or any object implementing
-    ``ClientStoreProtocol``; ``token_use_store`` defaults to a fresh
-    ``InMemoryTokenUseStore``.
+    ``ClientStoreProtocol``; ``token_use_store`` must be selected explicitly.
     """
 
     def __init__(
@@ -105,7 +104,7 @@ class Provider:
         clients: InMemoryClientStore | ClientStoreProtocol,
         codec: TokenCodec,
         lifetimes: TokenLifetimes | None = ...,
-        token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol | None = ...,
+        token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol = ...,
         client_assertion_max_age: int | None = ...,
     ) -> None: ...
     @property
@@ -148,19 +147,21 @@ class Provider:
         ``extra_claims`` are typed id_token claims; the reserved names in
         ``RESERVED_ID_TOKEN_CLAIMS`` raise ``ValueError``.
 
-        On ``OAuthError``, the request's ``redirect_uri`` has already been
-        validated so ``.to_redirect(request.redirect_uri)`` is safe.
+        The request is revalidated at this minting boundary. On ``OAuthError``,
+        pass ``"fragment"`` to ``to_redirect`` when ``request.use_fragment()``
+        is true, otherwise pass ``"query"``.
         """
     def handle_token_request(
         self,
-        form: dict[str, str],
+        form: list[tuple[str, str]],
         token_url: str,
         auth_header: str | None = ...,
         dpop: DpopProof | None = ...,
     ) -> TokenResponse:
         """Handle a token-endpoint request.
 
-        ``form`` is the parsed form body, ``auth_header`` the raw
+        ``form`` is the ordered parsed form body. Mappings are rejected because
+        they erase duplicate names. ``auth_header`` is the raw
         ``Authorization`` header, ``token_url`` the absolute token endpoint
         URL *from configuration* (it is the ``private_key_jwt`` audience and
         the DPoP ``htu``), and ``dpop`` an already-validated ``DpopProof`` if
@@ -168,16 +169,16 @@ class Provider:
         ``.to_response()``.
         """
     def userinfo(self, access_token: str, presented_jkt: str | None = ...) -> dict[str, Any]:
-        """Handle a userinfo request: validate ``access_token`` (and, for a
-        DPoP-bound token, that ``presented_jkt`` matches) and return the claims."""
+        """Require an ``openid``-scoped access token, validate it (and any
+        DPoP key binding), and return the subject and scope-filtered claims."""
     def authenticate_client(
         self,
-        form: dict[str, str],
+        form: list[tuple[str, str]],
         token_url: str,
         auth_header: str | None = ...,
     ) -> Client:
-        """Authenticate a client from a token-endpoint style request (form +
-        ``Authorization`` header) and return the ``Client``."""
+        """Authenticate from ordered token-endpoint form pairs. Mappings are
+        rejected because they erase duplicate parameter names."""
 
 def flatten_claims(external: dict[str, list[str]]) -> dict[str, Any]:
     """Flatten ``{claim: [values]}`` into id_token / userinfo claim values the

@@ -8,14 +8,15 @@ use pyo3::types::PyModule;
 
 use grindvakt::request as gr;
 
-use crate::convert::{from_py, new_submodule, to_py};
+use crate::convert::{from_py, new_submodule, protocol_parameter_pairs, to_py};
 use crate::errors::oauth_err;
 
 /// A parsed OIDC authorization request.
 ///
-/// Build with `AuthorizationRequest.from_params(query_dict)`. It is JSON
-/// round-trippable (`to_dict` / `from_dict`) so applications can stash it in
-/// a session between the authorization request and the redirect back.
+/// Build with `AuthorizationRequest.from_params(query_pairs)`, preserving the
+/// framework's ordered pairs so duplicate protocol parameters can be rejected.
+/// It is JSON round-trippable (`to_dict` / `from_dict`) so applications can
+/// stash it in a session between the authorization request and redirect.
 #[pyclass(
     module = "pygrindvakt.request",
     name = "AuthorizationRequest",
@@ -35,17 +36,21 @@ impl AuthorizationRequest {
 
 #[pymethods]
 impl AuthorizationRequest {
-    /// Parse from a flat parameter dict (the query string, or the merged
-    /// request object). Raises `OAuthError(invalid_request)` on missing
-    /// `client_id` / `response_type` / `redirect_uri` or a bad `claims` value.
+    /// Parse ordered `(name, value)` pairs. Mappings are rejected because they
+    /// may already have erased duplicates. Raises
+    /// `OAuthError(invalid_request)` on duplicates, missing required fields, or
+    /// a malformed `claims` value.
     #[staticmethod]
-    fn from_params(py: Python<'_>, params: BTreeMap<String, String>) -> PyResult<Self> {
-        gr::AuthorizationRequest::from_params(&params)
+    fn from_params(py: Python<'_>, params: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let params = protocol_parameter_pairs(params, "authorization parameters")?;
+        gr::AuthorizationRequest::from_pairs(&params)
             .map(Self::wrap)
             .map_err(|e| oauth_err(py, &e))
     }
 
     #[staticmethod]
+    /// Restore a request previously produced by `to_dict`. This is a trusted
+    /// application-state API and must not be used to parse an HTTP request.
     fn from_dict(d: &Bound<'_, PyAny>) -> PyResult<Self> {
         let inner: gr::AuthorizationRequest = from_py(d)
             .map_err(|e| PyValueError::new_err(format!("invalid AuthorizationRequest: {e}")))?;
@@ -113,6 +118,12 @@ impl AuthorizationRequest {
     fn request_object(&self) -> Option<&str> {
         self.inner.request_object.as_deref()
     }
+    /// RFC 8707 resource indicators, preserving repeated values in request
+    /// order. The application must enforce resource policy before minting.
+    #[getter]
+    fn resources(&self) -> Vec<String> {
+        self.inner.resources.clone()
+    }
     /// Other parameters preserved verbatim.
     #[getter]
     fn extra(&self) -> BTreeMap<String, String> {
@@ -141,6 +152,9 @@ impl AuthorizationRequest {
     fn wants_id_token(&self) -> bool {
         self.inner.wants_id_token()
     }
+    fn wants_access_token(&self) -> bool {
+        self.inner.wants_access_token()
+    }
     /// True when the response must be returned in the URL fragment.
     fn use_fragment(&self) -> bool {
         self.inner.use_fragment()
@@ -149,6 +163,11 @@ impl AuthorizationRequest {
     fn validate_response_type(&self, py: Python<'_>) -> PyResult<()> {
         self.inner
             .validate_response_type()
+            .map_err(|e| oauth_err(py, &e))
+    }
+    fn validate_response_mode(&self, py: Python<'_>) -> PyResult<()> {
+        self.inner
+            .validate_response_mode()
             .map_err(|e| oauth_err(py, &e))
     }
 

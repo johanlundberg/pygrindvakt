@@ -35,7 +35,7 @@ Constants
 
 .. py:data:: RESERVED_ID_TOKEN_CLAIMS
    :type: list[str]
-   :value: ["iss", "sub", "aud", "exp", "iat", "nbf", "jti", "nonce", "auth_time", "acr"]
+   :value: ["iss", "sub", "aud", "exp", "iat", "nbf", "jti", "nonce", "auth_time", "acr", "azp", "at_hash", "c_hash"]
 
    Claim names that :meth:`Provider.authorization_redirect` refuses in
    ``extra_claims``.
@@ -43,14 +43,16 @@ Constants
 Provider
 --------
 
-.. py:class:: Provider(metadata: ProviderMetadata, signing_key: SigningKey, clients: InMemoryClientStore | ClientStoreProtocol, codec: TokenCodec, lifetimes: TokenLifetimes | None = None, token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol | None = None, client_assertion_max_age: int | None = None)
+.. py:class:: Provider(metadata: ProviderMetadata, signing_key: SigningKey, clients: InMemoryClientStore | ClientStoreProtocol, codec: TokenCodec, lifetimes: TokenLifetimes | None = None, token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol, client_assertion_max_age: int | None = None)
 
    The OpenID Provider engine. Build once, share across requests.
 
    * ``metadata``: the discovery document, mainly the issuer and endpoint
      URLs (:class:`pygrindvakt.metadata.ProviderMetadata`). It is copied.
-   * ``signing_key``: signs id_tokens; its public half is published in the
-     JWKS (:class:`pygrindvakt.keys.SigningKey`).
+   * ``signing_key``: an asymmetric key that signs id_tokens; its public
+     half is published in the JWKS (:class:`pygrindvakt.keys.SigningKey`).
+     Symmetric ``HS*`` keys are rejected because OIDC MAC ID tokens must use
+     each client's own ``client_secret``, not one provider-wide secret.
    * ``clients``: an :class:`pygrindvakt.client.InMemoryClientStore` or any
      object implementing :class:`pygrindvakt.client.ClientStoreProtocol`
      (checked at construction; ``TypeError`` if ``get`` / ``put`` are
@@ -58,8 +60,10 @@ Provider
    * ``codec``: seals codes and tokens (:class:`pygrindvakt.tokens.TokenCodec`).
    * ``lifetimes``: token lifetimes; defaults to :class:`TokenLifetimes`
      defaults.
-   * ``token_use_store``: defaults to a fresh :class:`InMemoryTokenUseStore`,
-     which is **per process**. See :doc:`../guides/stores`.
+   * ``token_use_store``: must be selected explicitly. Use
+     :class:`InMemoryTokenUseStore` only for one process, or a shared
+     :class:`RedisStore` / protocol implementation across workers. See
+     :doc:`../guides/stores`.
    * ``client_assertion_max_age``: overrides
      :data:`DEFAULT_CLIENT_ASSERTION_MAX_AGE`.
 
@@ -113,6 +117,13 @@ Provider
       implicit / hybrid response types, the tokens) for ``sub`` and return
       the ``302`` redirect back to the client, with ``state`` echoed.
 
+      The request is validated again immediately before minting, even if it
+      was deserialized from a session. This prevents an application from
+      turning stale or modified session data into tokens. ``sub`` must be
+      non-empty. Standard OIDC profile claims are included only when their
+      corresponding scopes were granted; application-specific claims remain
+      available as custom claims.
+
       ``external_claims`` maps claim name to a **list of string values**, the
       shape an attribute-based identity backend produces. Multi-valued claims
       become JSON arrays; single values are coerced for the standard claims
@@ -123,12 +134,12 @@ Provider
       ``ValueError``. grindvakt would silently drop them, which could hide
       an attempt to override ``sub`` or ``nonce``.
 
-      On :class:`pygrindvakt.OAuthError`, the request's ``redirect_uri`` has
-      already been validated (you called
-      :meth:`validate_authorization_request` before showing the login page),
-      so ``e.to_redirect(request.redirect_uri)`` is safe.
+      On :class:`pygrindvakt.OAuthError`, render the error using the request's
+      response mode: ``"fragment"`` when ``request.use_fragment()`` is true,
+      otherwise ``"query"``. The method itself revalidates the redirect URI
+      before producing any artifact.
 
-   .. py:method:: handle_token_request(form: dict[str, str], token_url: str, auth_header: str | None = None, dpop: DpopProof | None = None) -> TokenResponse
+   .. py:method:: handle_token_request(form: list[tuple[str, str]], token_url: str, auth_header: str | None = None, dpop: DpopProof | None = None) -> TokenResponse
 
       Handle a token-endpoint request for the ``authorization_code``,
       ``refresh_token`` and ``client_credentials`` grants, authenticating the
@@ -136,7 +147,8 @@ Provider
       ``client_secret_post`` (form fields), ``private_key_jwt``
       (``client_assertion``) or ``none``, as registered.
 
-      * ``form`` is the parsed form body.
+      * ``form`` is the ordered parsed form body. Mappings are rejected because
+        they may already have erased duplicate OAuth parameter names.
       * ``token_url`` is the absolute token endpoint URL **from
         configuration**. It is the audience a ``private_key_jwt`` assertion
         must name and the ``htu`` a DPoP proof must be bound to. Never derive
@@ -150,18 +162,22 @@ Provider
       Authorization codes and refresh tokens are single-use: a replay is
       ``invalid_grant``. Refresh tokens are rotated. Raises
       :class:`pygrindvakt.OAuthError`; render it with ``.to_response()``.
+      An ID token is issued only when the original scope contained
+      ``openid``. The ``client_credentials`` grant rejects ``openid`` because
+      it has no authenticated end user.
 
    .. py:method:: userinfo(access_token: str, presented_jkt: str | None = None) -> dict[str, Any]
 
       Handle a userinfo request: validate ``access_token`` and return the
       claims (``sub`` plus the claims resolved at authorization time,
-      filtered by scope). For a DPoP-bound token, ``presented_jkt`` (the
+      filtered by scope). The token must carry the ``openid`` scope. For a
+      DPoP-bound token, ``presented_jkt`` (the
       ``jkt`` of a proof validated with
       :func:`pygrindvakt.dpop.validate_resource_proof`) must match the
       token's ``cnf.jkt``; a bound token presented as plain Bearer is
       rejected. Raises :class:`pygrindvakt.OAuthError`.
 
-   .. py:method:: authenticate_client(form: dict[str, str], token_url: str, auth_header: str | None = None) -> Client
+   .. py:method:: authenticate_client(form: list[tuple[str, str]], token_url: str, auth_header: str | None = None) -> Client
 
       Authenticate a client from a token-endpoint style request (form +
       ``Authorization`` header) and return the
@@ -169,7 +185,8 @@ Provider
       for custom endpoints (introspection, revocation, registration
       management) that need client authentication. A ``private_key_jwt``
       assertion's ``jti`` is consumed here too, so an assertion cannot be
-      replayed against another endpoint.
+      replayed against another endpoint. ``form`` must be ordered pairs;
+      mappings are rejected because they erase duplicate names.
 
    .. code-block:: python
 
@@ -187,14 +204,14 @@ Provider
       )
 
       # Authorization endpoint, GET:
-      req = AuthorizationRequest.from_params(query)
+      req = AuthorizationRequest.from_params(query_pairs)
       op.validate_authorization_request(req)                # OAuthError -> e.to_response()
       # ... authenticate the user, then:
       resp = op.authorization_redirect(req, "alice", {"email": ["alice@example.com"]})
 
       # Token endpoint:
       try:
-          resp = op.handle_token_request(form, f"{ISSUER}/token", auth_header=auth).to_response()
+          resp = op.handle_token_request(form_pairs, f"{ISSUER}/token", auth_header=auth).to_response()
       except OAuthError as e:
           resp = e.to_response()
 

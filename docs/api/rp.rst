@@ -13,11 +13,11 @@ Outbound HTTP goes through the ``http`` argument of the networked functions:
 or any object implementing :class:`pygrindvakt.http.HttpClientProtocol`.
 Networked calls block the calling thread with the GIL released.
 
-.. note:: Hardening beyond upstream
+.. note:: Nonce policy
 
    :func:`verify_id_token` refuses to run without an expected nonce unless
-   ``unsafe_skip_nonce_check=True`` is passed explicitly. grindvakt silently
-   skips the check when the nonce is ``None``.
+   ``unsafe_skip_nonce_check=True`` is passed explicitly. This Python API
+   guard makes an intentional nonce-free flow visible in code review.
 
 Provider and client
 -------------------
@@ -27,6 +27,11 @@ Provider and client
    The minimal upstream-provider information the RP needs. Immutable. Build
    one by hand for a statically configured provider, or with
    :meth:`from_metadata` from a discovered document.
+
+   Construction validates the issuer and every endpoint as absolute HTTPS
+   URLs. Plain HTTP is allowed only when the issuer itself is a loopback HTTP
+   development origin, and then only for loopback endpoint hosts. URL
+   credentials and fragments are rejected before any credentials can be sent.
 
    .. py:staticmethod:: from_metadata(metadata: ProviderMetadata) -> ProviderInfo
 
@@ -95,11 +100,11 @@ Provider and client
    ``repr()`` never shows the token values.
 
    .. py:property:: access_token
-      :type: str | None
+      :type: str
    .. py:property:: id_token
-      :type: str | None
+      :type: str
    .. py:property:: token_type
-      :type: str | None
+      :type: str
    .. py:property:: raw
       :type: dict[str, Any]
 
@@ -121,7 +126,8 @@ Starting the flow
    PKCE ``S256`` challenge (:func:`pygrindvakt.pkce.s256_challenge`).
    ``extra`` adds further query parameters, as a dict or as a list of
    ``(name, value)`` pairs when a name must repeat; anything else raises
-   ``ValueError``.
+   ``ValueError``. Library-controlled parameter names and ambiguous duplicate
+   extension names are rejected; repeatable ``resource`` remains supported.
 
 .. py:function:: signed_request_object(provider: ProviderInfo, client: RpClient, key: SigningKey, state: str, nonce: str, code_challenge: str | None = None) -> str
 
@@ -150,10 +156,12 @@ Discovery and keys
    :class:`pygrindvakt.AuthnError` / :class:`pygrindvakt.BadRequestError`
    on an issuer mismatch or unusable document.
 
-.. py:function:: fetch_jwks(http: HttpClientProtocol | None, jwks_uri: str) -> dict[str, Any]
+.. py:function:: fetch_jwks(http: HttpClientProtocol | None, jwks_uri: str, issuer: str) -> dict[str, Any]
 
-   Fetch a JWKS document from ``jwks_uri`` and return it as a dict
-   (``{"keys": [...]}``), ready for :func:`verify_id_token`. Cache it and
+   Fetch a JWKS document from ``jwks_uri`` for its associated ``issuer``
+   and return it as a dict (``{"keys": [...]}``), ready for
+   :func:`verify_id_token`. The issuer is mandatory so remote metadata cannot
+   inherit the loopback HTTP development exception. Cache the result and
    refetch when an id_token arrives with an unknown ``kid``.
 
 Finishing the flow
@@ -172,11 +180,14 @@ Finishing the flow
    sanitized, truncated copy of the upstream error body (for example
    ``invalid_client`` or ``invalid_grant``). That message is for logs.
 
-.. py:function:: verify_id_token(jwks: dict[str, Any], id_token: str, issuer: str, client_id: str, expected_nonce: str | None, unsafe_skip_nonce_check: bool = False) -> dict[str, Any]
+.. py:function:: verify_id_token(jwks: dict[str, Any], id_token: str, issuer: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False) -> dict[str, Any]
 
    Verify an ``id_token`` against the provider JWKS (a dict
    ``{"keys": [...]}``), the expected ``issuer``, audience ``client_id`` and
-   ``expected_nonce``; ``exp`` and ``iat`` are required. Returns the
+   ``expected_nonce``; ``sub``, ``exp`` and ``iat`` are required. The protected
+   algorithm must be in ``allowed_algorithms``. Additional audiences are
+   rejected unless explicitly listed in ``trusted_additional_audiences``;
+   multi-audience tokens also require ``azp`` equal to ``client_id``. Returns the
    validated claims as a dict. Raises :class:`pygrindvakt.AuthnError` (or
    another :class:`pygrindvakt.GrindvaktError` subclass) on any failure:
    bad signature, unknown key, wrong issuer or audience, expired, nonce
@@ -194,10 +205,13 @@ Finishing the flow
       (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
       it for the standard code flow allows id_token replay.
 
-.. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str, access_token: str) -> dict[str, Any]
+.. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str, access_token: str, expected_sub: str, issuer: str) -> dict[str, Any]
 
    Fetch the userinfo document with a Bearer ``access_token`` and return it
-   as a dict. Raises :class:`pygrindvakt.AuthnError` on a non-200 response.
+   as a dict. The response must contain a string ``sub`` exactly equal to
+   ``expected_sub`` from the validated ID token. The associated ``issuer``
+   is mandatory to scope the loopback HTTP development exception. Raises
+   :class:`pygrindvakt.AuthnError` on a non-200 or subject mismatch.
 
    The request is a **POST** with an empty form body and the token in the
    ``Authorization`` header (the ``HttpClient`` protocol has no per-request
@@ -241,9 +255,10 @@ Example
    # Callback: check state, then exchange and verify.
    try:
        ts = rp.exchange_code(http_client, info, me, code, code_verifier=verifier)
-       claims = rp.verify_id_token(rp.fetch_jwks(http_client, info.jwks_uri), ts.id_token,
-                                   info.issuer, me.client_id, nonce)
-       profile = rp.fetch_userinfo(http_client, info.userinfo_endpoint, ts.access_token)
+       claims = rp.verify_id_token(rp.fetch_jwks(http_client, info.jwks_uri, info.issuer), ts.id_token,
+                                   info.issuer, me.client_id, nonce, ["ES256"])
+       profile = rp.fetch_userinfo(http_client, info.userinfo_endpoint, ts.access_token,
+                                   claims["sub"], info.issuer)
    except AuthnError:
        log.exception("login failed")            # never show str(e) to the user
        raise

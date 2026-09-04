@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -91,7 +92,7 @@ class FakeHttpClient:
             try:
                 tr = in_thread(
                     self.op.handle_token_request,
-                    dict(form),
+                    list(form),
                     f"{ISSUER}/token",
                     auth_header=hdrs.get("authorization"),
                 )
@@ -130,7 +131,8 @@ def op(op_key):
     md = metadata.ProviderMetadata(ISSUER)
     c = client.Client(CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uris=[REDIRECT_URI])
     return provider.Provider(
-        md, op_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret")
+        md, op_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret"),
+        token_use_store=provider.InMemoryTokenUseStore(),
     )
 
 
@@ -159,7 +161,7 @@ def run_authorization(op, prov, rpc, state, nonce, verifier, sub="alice", claims
     """Drive the OP side of the flow and return the authorization code."""
     url = rp.authorization_url(prov, rpc, state, nonce, pkce.s256_challenge(verifier))
     params = {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
-    req = request.AuthorizationRequest.from_params(params)
+    req = request.AuthorizationRequest.from_params(list(params.items()))
     op.validate_authorization_request(req)
     resp = op.authorization_redirect(req, sub, claims or {"email": ["a@b"]})
     assert resp.status in (302, 303)
@@ -182,8 +184,9 @@ def test_discover_returns_metadata_for_issuer(http):
 
 
 def test_discover_with_trailing_slash(http):
-    """A trailing slash on the requested issuer is normalized away."""
-    assert rp.discover(http, ISSUER + "/").issuer == ISSUER
+    """Issuer identifiers differing by a trailing slash are not conflated."""
+    with pytest.raises(AuthnError):
+        rp.discover(http, ISSUER + "/")
 
 
 def test_discover_rejects_plain_http_before_fetching(http):
@@ -219,7 +222,7 @@ def test_discover_rejects_issuer_mismatch(op):
 
 def test_fetch_jwks_returns_one_key(http, prov):
     """``fetch_jwks`` returns the JWKS dict with the OP's single signing key."""
-    jwks = rp.fetch_jwks(http, prov.jwks_uri)
+    jwks = rp.fetch_jwks(http, prov.jwks_uri, prov.issuer)
     assert isinstance(jwks, dict)
     assert len(jwks["keys"]) == 1
     assert jwks["keys"][0]["kid"] == "op-1"
@@ -321,7 +324,8 @@ def test_rp_client_rejects_unused_signing_key(rp_key):
 
 def test_authorization_url_contains_parameters(prov, rpc):
     """state, nonce, PKCE challenge and extra params are all present."""
-    url = rp.authorization_url(prov, rpc, "st-1", "n-1", "chal", extra={"prompt": "login"})
+    challenge = pkce.s256_challenge("v" * 43)
+    url = rp.authorization_url(prov, rpc, "st-1", "n-1", challenge, extra={"prompt": "login"})
     assert url.startswith(prov.authorization_endpoint + "?")
     q = parse_qs(urlsplit(url).query)
     assert q["response_type"] == ["code"]
@@ -330,7 +334,7 @@ def test_authorization_url_contains_parameters(prov, rpc):
     assert q["scope"] == ["openid profile email"]
     assert q["state"] == ["st-1"]
     assert q["nonce"] == ["n-1"]
-    assert q["code_challenge"] == ["chal"]
+    assert q["code_challenge"] == [challenge]
     assert q["code_challenge_method"] == ["S256"]
     assert q["prompt"] == ["login"]
 
@@ -353,6 +357,62 @@ def test_authorization_url_appends_to_existing_query(rpc):
     assert url.startswith(f"{ISSUER}/authz?tenant=x&response_type=code")
 
 
+def test_provider_info_rejects_unsafe_endpoints_and_reserved_query(rpc):
+    for endpoint in ["http://example.com/token", "file:///tmp/token", "https://u:p@example.com/token",
+                     "https://example.com/token#fragment", "http://127.0.0.1:8000/token"]:
+        with pytest.raises(GrindvaktError):
+            rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", endpoint)
+    with pytest.raises(GrindvaktError, match="library-controlled"):
+        rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization?client_id=attacker", f"{ISSUER}/token")
+    # Separate HTTPS endpoint origins remain legitimate. Loopback HTTP is a
+    # development exception only when the issuer is itself loopback HTTP.
+    rp.ProviderInfo(ISSUER, "https://login.example.net/authorization", "https://tokens.example.net/token")
+    rp.ProviderInfo("http://127.0.0.1:8000", "http://127.0.0.1:8000/authorization",
+                    "http://localhost:8000/token")
+
+
+def test_direct_endpoint_fetches_bind_loopback_http_to_issuer():
+    """A remote issuer cannot send credential-bearing fetches to loopback."""
+    with pytest.raises(GrindvaktError, match="absolute https URL"):
+        rp.fetch_jwks(
+            RaisingHttpClient(),
+            "http://127.0.0.1:8000/jwks",
+            "https://remote.example",
+        )
+    with pytest.raises(GrindvaktError, match="absolute https URL"):
+        rp.fetch_userinfo(
+            RaisingHttpClient(),
+            "http://127.0.0.1:8000/userinfo",
+            "access-token",
+            "alice",
+            "https://remote.example",
+        )
+
+
+def test_public_rp_requires_pkce_at_every_boundary(prov, rp_key):
+    public = rp.RpClient("public", REDIRECT_URI, auth_method="none")
+    with pytest.raises(GrindvaktError, match="PKCE"):
+        rp.authorization_url(prov, public, "state", "nonce")
+    with pytest.raises(GrindvaktError, match="PKCE"):
+        rp.signed_request_object(prov, public, rp_key, "state", "nonce")
+    with pytest.raises(GrindvaktError, match="PKCE"):
+        rp.exchange_code(RaisingHttpClient(), prov, public, "code")
+
+
+def test_authorization_url_rejects_reserved_and_ambiguous_extras(prov, rpc):
+    with pytest.raises(GrindvaktError, match="library-controlled"):
+        rp.authorization_url(prov, rpc, "state", "nonce", extra={"redirect_uri": "https://evil/cb"})
+    with pytest.raises(GrindvaktError, match="duplicate"):
+        rp.authorization_url(prov, rpc, "state", "nonce", extra=[("prompt", "login"), ("prompt", "none")])
+    configured = rp.ProviderInfo(
+        ISSUER, f"{ISSUER}/authorization?tenant=configured", f"{ISSUER}/token")
+    with pytest.raises(GrindvaktError, match="duplicate"):
+        rp.authorization_url(configured, rpc, "state", "nonce", extra={"tenant": "override"})
+    url = rp.authorization_url(prov, rpc, "state", "nonce",
+                               extra=[("resource", "https://api-1"), ("resource", "https://api-2")])
+    assert len(parse_qs(urlsplit(url).query)["resource"]) == 2
+
+
 # --- full code flow -----------------------------------------------------------------
 
 
@@ -370,14 +430,16 @@ def test_full_code_flow(op, http, prov, rpc):
     assert ts.access_token not in repr(ts) and ts.id_token not in repr(ts)
     assert 'token_type="' in repr(ts)
 
-    jwks = rp.fetch_jwks(http, prov.jwks_uri)
-    claims = rp.verify_id_token(jwks, ts.id_token, ISSUER, CLIENT_ID, nonce)
+    jwks = rp.fetch_jwks(http, prov.jwks_uri, prov.issuer)
+    claims = rp.verify_id_token(jwks, ts.id_token, ISSUER, CLIENT_ID, nonce, ["ES256"])
     assert claims["sub"] == "alice"
     assert claims["iss"] == ISSUER
     assert claims["nonce"] == nonce
     assert claims["aud"] == CLIENT_ID or CLIENT_ID in claims["aud"]
 
-    info = rp.fetch_userinfo(http, prov.userinfo_endpoint, ts.access_token)
+    info = rp.fetch_userinfo(
+        http, prov.userinfo_endpoint, ts.access_token, claims["sub"], prov.issuer
+    )
     assert info["sub"] == "alice"
     assert info["email"] == "a@b"
 
@@ -391,7 +453,8 @@ def test_exchange_code_with_client_secret_post(op, prov):
         token_endpoint_auth_method="client_secret_post",
     )
     op2 = provider.Provider(
-        op.metadata, op.signing_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret")
+        op.metadata, op.signing_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret"),
+        token_use_store=provider.InMemoryTokenUseStore(),
     )
     rpc = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET, auth_method="client_secret_post")
     verifier = util.random_token(48)
@@ -435,23 +498,23 @@ def issued(op, http, prov, rpc):
     nonce, verifier = util.random_token(), util.random_token(48)
     code = run_authorization(op, prov, rpc, "st", nonce, verifier)
     ts = rp.exchange_code(http, prov, rpc, code, verifier)
-    return ts.id_token, rp.fetch_jwks(http, prov.jwks_uri), nonce
+    return ts.id_token, rp.fetch_jwks(http, prov.jwks_uri, prov.issuer), nonce
 
 
 def test_verify_id_token_nonce_mismatch(issued):
     """A wrong expected nonce is rejected."""
     id_token, jwks, _nonce = issued
     with pytest.raises(GrindvaktError, match="nonce"):
-        rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, "not-the-nonce")
+        rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, "not-the-nonce", ["ES256"])
 
 
 def test_verify_id_token_wrong_audience_and_issuer(issued):
     """Audience and issuer are enforced."""
     id_token, jwks, nonce = issued
     with pytest.raises(GrindvaktError):
-        rp.verify_id_token(jwks, id_token, ISSUER, "other-client", nonce)
+        rp.verify_id_token(jwks, id_token, ISSUER, "other-client", nonce, ["ES256"])
     with pytest.raises(GrindvaktError):
-        rp.verify_id_token(jwks, id_token, "https://other.example.com", CLIENT_ID, nonce)
+        rp.verify_id_token(jwks, id_token, "https://other.example.com", CLIENT_ID, nonce, ["ES256"])
 
 
 def test_verify_id_token_wrong_key(issued):
@@ -459,31 +522,70 @@ def test_verify_id_token_wrong_key(issued):
     id_token, _jwks, nonce = issued
     other = keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid="op-1")
     with pytest.raises(GrindvaktError):
-        rp.verify_id_token(other.to_public_jwks(), id_token, ISSUER, CLIENT_ID, nonce)
+        rp.verify_id_token(other.to_public_jwks(), id_token, ISSUER, CLIENT_ID, nonce, ["ES256"])
 
 
 def test_verify_id_token_requires_nonce_by_default(issued):
     """expected_nonce=None without the unsafe flag raises AuthnError."""
     id_token, jwks, _nonce = issued
     with pytest.raises(AuthnError, match="expected_nonce is required"):
-        rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, None)
+        rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, None, ["ES256"])
 
 
 def test_verify_id_token_unsafe_skip_warns(issued):
     """unsafe_skip_nonce_check=True skips the check and emits a UserWarning."""
     id_token, jwks, _nonce = issued
     with pytest.warns(UserWarning, match="nonce check skipped"):
-        claims = rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, None, unsafe_skip_nonce_check=True)
+        claims = rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, None, ["ES256"], unsafe_skip_nonce_check=True)
     assert claims["sub"] == "alice"
 
 
 def test_verify_id_token_unsafe_flag_with_nonce_still_checks(issued):
     """The flag only matters when no nonce is given; a given nonce is enforced."""
     id_token, jwks, nonce = issued
-    claims = rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, nonce, unsafe_skip_nonce_check=True)
+    claims = rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, nonce, ["ES256"], unsafe_skip_nonce_check=True)
     assert claims["nonce"] == nonce
     with pytest.raises(GrindvaktError, match="nonce"):
-        rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, "wrong", unsafe_skip_nonce_check=True)
+        rp.verify_id_token(jwks, id_token, ISSUER, CLIENT_ID, "wrong", ["ES256"], unsafe_skip_nonce_check=True)
+
+
+def test_verify_id_token_subject_audience_azp_and_algorithm_policy(op_key):
+    now = int(time.time())
+    base = {"iss": ISSUER, "sub": "alice", "aud": CLIENT_ID, "iat": now, "exp": now + 300,
+            "nonce": "n"}
+    jwks = op_key.to_public_jwks()
+
+    missing_sub = {key: value for key, value in base.items() if key != "sub"}
+    with pytest.raises(GrindvaktError, match="sub"):
+        rp.verify_id_token(jwks, jwt.sign(op_key, missing_sub), ISSUER, CLIENT_ID, "n", ["ES256"])
+
+    single_array = {**base, "aud": [CLIENT_ID]}
+    assert rp.verify_id_token(
+        jwks, jwt.sign(op_key, single_array), ISSUER, CLIENT_ID, "n", ["ES256"]
+    )["sub"] == "alice"
+    with pytest.raises(GrindvaktError, match="azp"):
+        rp.verify_id_token(
+            jwks,
+            jwt.sign(op_key, {**single_array, "azp": "another-client"}),
+            ISSUER,
+            CLIENT_ID,
+            "n",
+            ["ES256"],
+        )
+
+    multi = {**base, "aud": [CLIENT_ID, "https://api.example"]}
+    with pytest.raises(GrindvaktError, match="untrusted audience"):
+        rp.verify_id_token(jwks, jwt.sign(op_key, multi), ISSUER, CLIENT_ID, "n", ["ES256"])
+    with pytest.raises(GrindvaktError, match="azp"):
+        rp.verify_id_token(jwks, jwt.sign(op_key, multi), ISSUER, CLIENT_ID, "n", ["ES256"],
+                           ["https://api.example"])
+    accepted = {**multi, "azp": CLIENT_ID}
+    assert rp.verify_id_token(jwks, jwt.sign(op_key, accepted), ISSUER, CLIENT_ID, "n", ["ES256"],
+                              ["https://api.example"])["sub"] == "alice"
+    with pytest.raises(GrindvaktError):
+        rp.verify_id_token(jwks, jwt.sign(op_key, base), ISSUER, CLIENT_ID, "n", ["RS256"])
+    with pytest.raises(GrindvaktError, match="allowed"):
+        rp.verify_id_token(jwks, jwt.sign(op_key, base), ISSUER, CLIENT_ID, "n", [])
 
 
 # --- userinfo -------------------------------------------------------------------
@@ -492,7 +594,59 @@ def test_verify_id_token_unsafe_flag_with_nonce_still_checks(issued):
 def test_fetch_userinfo_bad_token_raises(http, prov):
     """A rejected access token surfaces as AuthnError."""
     with pytest.raises(AuthnError, match="userinfo returned"):
-        rp.fetch_userinfo(http, prov.userinfo_endpoint, "garbage")
+        rp.fetch_userinfo(
+            http, prov.userinfo_endpoint, "garbage", "expected-sub", prov.issuer
+        )
+
+
+def test_fetch_userinfo_requires_matching_subject():
+    class UserInfoHttp:
+        def get(self, url):
+            raise AssertionError("unexpected GET")
+
+        def post_form(self, url, form, headers):
+            return 200, b'{"sub":"mallory","email":"m@example.test"}', "application/json"
+
+    with pytest.raises(AuthnError, match="subject"):
+        rp.fetch_userinfo(
+            UserInfoHttp(), f"{ISSUER}/userinfo", "access-token", "alice", ISSUER
+        )
+
+
+@pytest.mark.parametrize("payload", [
+    {"id_token": "i", "token_type": "Bearer"},
+    {"access_token": "a", "token_type": "Bearer"},
+    {"access_token": "a", "id_token": "i"},
+    {"access_token": "", "id_token": "i", "token_type": "Bearer"},
+])
+def test_exchange_code_rejects_partial_success(payload):
+    class TokenHttp:
+        def get(self, url):
+            raise AssertionError("unexpected GET")
+
+        def post_form(self, url, form, headers):
+            return 200, json.dumps(payload).encode(), "application/json"
+
+    info = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    confidential = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET)
+    with pytest.raises(AuthnError, match="missing"):
+        rp.exchange_code(TokenHttp(), info, confidential, "code")
+
+
+def test_exchange_code_rejects_unknown_token_type():
+    """An RP must not use an access-token scheme it does not implement."""
+    class TokenHttp:
+        def get(self, url):
+            raise AssertionError("unexpected GET")
+
+        def post_form(self, url, form, headers):
+            payload = {"access_token": "a", "id_token": "i", "token_type": "Unknown"}
+            return 200, json.dumps(payload).encode(), "application/json"
+
+    info = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    confidential = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET)
+    with pytest.raises(AuthnError, match="unsupported token_type"):
+        rp.exchange_code(TokenHttp(), info, confidential, "code")
 
 
 # --- client assertions / request objects ----------------------------------------
@@ -523,7 +677,8 @@ def test_private_key_jwt_client_authenticates(op, http, prov, rp_key):
         jwks=rp_key.to_public_jwks(),
     )
     op2 = provider.Provider(
-        op.metadata, op.signing_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret")
+        op.metadata, op.signing_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret"),
+        token_use_store=provider.InMemoryTokenUseStore(),
     )
     http2 = FakeHttpClient(op2)
     rpc = rp.RpClient("jwt-client", REDIRECT_URI, auth_method="private_key_jwt", signing_key=rp_key)
@@ -541,7 +696,8 @@ def test_private_key_jwt_client_authenticates(op, http, prov, rp_key):
 
 def test_signed_request_object(prov, rpc, rp_key):
     """The request object carries the authorization parameters, signed by key."""
-    jar = rp.signed_request_object(prov, rpc, rp_key, "st-1", "n-1", "chal")
+    challenge = pkce.s256_challenge("v" * 43)
+    jar = rp.signed_request_object(prov, rpc, rp_key, "st-1", "n-1", challenge)
     v = jwt.Validation().with_issuer(CLIENT_ID).with_audience(ISSUER)
     claims = jwt.verify_with_jwks(rp_key.to_public_jwks(), jar, v)
     assert claims["client_id"] == CLIENT_ID
@@ -549,7 +705,7 @@ def test_signed_request_object(prov, rpc, rp_key):
     assert claims["response_type"] == "code"
     assert claims["state"] == "st-1"
     assert claims["nonce"] == "n-1"
-    assert claims["code_challenge"] == "chal"
+    assert claims["code_challenge"] == challenge
     assert claims["code_challenge_method"] == "S256"
     assert claims["jti"]
     plain = jwt.peek_claims_unverified(rp.signed_request_object(prov, rpc, rp_key, "st", "n"))

@@ -71,13 +71,15 @@ class OAuthError(_native.GrindvaktError):
         """
         return _native.oauth_error_response(self.code, self.description, self.state)
 
-    def to_redirect(self, redirect_uri: str):
+    def to_redirect(self, redirect_uri: str, response_mode: str):
         """Render as a redirect back to the client (authorization endpoint).
 
         Only call this with a ``redirect_uri`` that has already been validated
         against the registered client (i.e. after
-        ``Provider.validate_authorization_request`` succeeded).
+        ``Provider.validate_authorization_request`` succeeded). Pass the
+        validated request's ``"query"`` or ``"fragment"`` response mode;
+        there is deliberately no default.
         """
         return _native.oauth_error_redirect(
-            self.code, redirect_uri, self.description, self.state
+            self.code, redirect_uri, response_mode, self.description, self.state
         )

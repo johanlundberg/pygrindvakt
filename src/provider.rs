@@ -1,7 +1,7 @@
 //! Bindings for `grindvakt::provider` - the OpenID Provider engine.
 //!
 //! A `Provider` is constructed once at startup and shared across requests. Its
-//! endpoint methods take already-extracted inputs (query / form dicts, header
+//! endpoint methods take already-extracted ordered pairs and header
 //! strings) and return `Response` objects or raise `OAuthError`, so any web
 //! framework can drive it: see `examples/` for Flask, Django and FastAPI.
 //!
@@ -22,9 +22,11 @@ use grindvakt::provider as gp;
 use grindvakt::provider::TokenUseStore;
 
 use crate::client::{extract_client_store, Client};
-use crate::convert::{from_py, log_unraisable, new_submodule, require_methods, to_py};
+use crate::convert::{
+    from_py, log_unraisable, new_submodule, protocol_parameter_pairs, require_methods, to_py,
+};
 use crate::dpop::DpopProof;
-use crate::errors::{internal_err, oauth_err};
+use crate::errors::{err, internal_err, oauth_err};
 use crate::http::Response;
 use crate::keys::SigningKey;
 use crate::metadata::ProviderMetadata;
@@ -42,6 +44,9 @@ const RESERVED_ID_TOKEN_CLAIMS: &[&str] = &[
     "nonce",
     "auth_time",
     "acr",
+    "azp",
+    "at_hash",
+    "c_hash",
 ];
 
 // ---------------------------------------------------------------------------
@@ -302,8 +307,8 @@ pub fn extract_token_use_store(obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Token
 /// The OpenID Provider engine. Build once, share across requests.
 ///
 /// `clients` is an `InMemoryClientStore` or any object implementing the
-/// `ClientStore` protocol; `token_use_store` defaults to a fresh
-/// `InMemoryTokenUseStore`.
+/// `ClientStore` protocol. `token_use_store` is mandatory so multi-process
+/// deployments cannot silently select process-local replay protection.
 #[pyclass(module = "pygrindvakt.provider", name = "Provider", frozen)]
 pub struct Provider {
     pub inner: Arc<gp::Provider>,
@@ -318,7 +323,6 @@ impl Provider {
                         token_use_store = None, client_assertion_max_age = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        py: Python<'_>,
         metadata: &ProviderMetadata,
         signing_key: &SigningKey,
         clients: &Bound<'_, PyAny>,
@@ -328,24 +332,21 @@ impl Provider {
         client_assertion_max_age: Option<u64>,
     ) -> PyResult<Self> {
         let store = extract_client_store(clients)?;
+        let (token_use_store, token_use_store_obj) = match token_use_store {
+            Some(t) if !t.is_none() => (extract_token_use_store(t)?, t.clone().unbind()),
+            _ => return Err(PyValueError::new_err(
+                "token_use_store is required; pass InMemoryTokenUseStore() explicitly only for a single-process deployment",
+            )),
+        };
         let mut p = gp::Provider::new(
             metadata.inner.clone(),
             signing_key.inner.clone(),
             store,
             codec.inner.clone(),
             lifetimes.map(|l| l.inner.clone()).unwrap_or_default(),
-        );
-        let token_use_store_obj = match token_use_store {
-            Some(t) if !t.is_none() => {
-                p = p.with_token_use_store(extract_token_use_store(t)?);
-                t.clone().unbind()
-            }
-            _ => {
-                let s = Py::new(py, InMemoryTokenUseStore::new())?;
-                p = p.with_token_use_store(s.get().inner.clone());
-                s.into_any()
-            }
-        };
+            token_use_store,
+        )
+        .map_err(err)?;
         if let Some(secs) = client_assertion_max_age {
             p = p.with_client_assertion_max_age(secs);
         }
@@ -420,11 +421,13 @@ impl Provider {
     /// `external_claims` maps claim name -> list of string values (multi-valued
     /// claims become JSON arrays; single values are coerced for standard
     /// claims such as `email_verified`). `extra_claims` are typed id_token
-    /// claims; the reserved names (`iss`, `sub`, `aud`, `exp`, `iat`, `nbf`,
-    /// `jti`, `nonce`, `auth_time`, `acr`) raise `ValueError`.
+    /// claims; protocol-owned claims such as `sub`, `nonce`, `azp`, `at_hash`,
+    /// and `c_hash` raise `ValueError`. The request is validated again at this
+    /// minting boundary, and an empty subject is rejected.
     ///
-    /// On `OAuthError`, the request's `redirect_uri` has already been validated
-    /// so `.to_redirect(request.redirect_uri)` is safe.
+    /// On `OAuthError`, use fragment mode when `request.use_fragment()` is
+    /// true; otherwise use query mode. This preserves the successful response's
+    /// delivery mode without exposing a token-bearing flow in the query.
     #[pyo3(signature = (request, sub, external_claims = None, acr = None, extra_claims = None))]
     fn authorization_redirect(
         &self,
@@ -448,34 +451,36 @@ impl Provider {
                 "extra_claims must not contain reserved id_token claim(s): {reserved:?}"
             )));
         }
-        self.inner
-            .authorization_redirect_with_claims(
-                &request.inner,
-                sub,
-                &external_claims.unwrap_or_default(),
-                acr,
-                &extra,
-            )
-            .map(Response::wrap)
-            .map_err(|e| oauth_err(py, &e))
+        let p = self.inner.clone();
+        let request = request.inner.clone();
+        let external_claims = external_claims.unwrap_or_default();
+        let result = crate::runtime::block_on(py, async move {
+            p.authorization_redirect_with_claims(&request, sub, &external_claims, acr, &extra)
+                .await
+        })?;
+        result.map(Response::wrap).map_err(|e| oauth_err(py, &e))
     }
 
     /// Handle a token-endpoint request.
     ///
-    /// `form` is the parsed form body, `auth_header` the raw `Authorization`
+    /// `form` is the ordered parsed form body. Mappings are rejected because
+    /// they may already have erased duplicates. `auth_header` is the raw `Authorization`
     /// header, `token_url` the absolute token endpoint URL *from
     /// configuration* (it is the `private_key_jwt` audience and the DPoP
     /// `htu`), and `dpop` an already-validated `DpopProof` if the request
     /// carried one. Raises `OAuthError`; render it with `.to_response()`.
     #[pyo3(signature = (form, token_url, auth_header = None, dpop = None))]
+    /// Handle a token request from ordered form pairs so duplicate OAuth
+    /// parameters are rejected before processing.
     fn handle_token_request(
         &self,
         py: Python<'_>,
-        form: BTreeMap<String, String>,
+        form: &Bound<'_, PyAny>,
         token_url: String,
         auth_header: Option<String>,
         dpop: Option<DpopProof>,
     ) -> PyResult<TokenResponse> {
+        let form = protocol_parameter_pairs(form, "token form")?;
         let p = self.inner.clone();
         let dpop = dpop.map(|d| d.inner);
         let r = crate::runtime::block_on(py, async move {
@@ -486,8 +491,9 @@ impl Provider {
             .map_err(|e| oauth_err(py, &e))
     }
 
-    /// Handle a userinfo request: validate `access_token` (and, for a
-    /// DPoP-bound token, that `presented_jkt` matches) and return the claims.
+    /// Handle a userinfo request: require an `openid`-scoped access token,
+    /// validate it (and, for a DPoP-bound token, its `presented_jkt`), and
+    /// return the subject and scope-filtered claims.
     #[pyo3(signature = (access_token, presented_jkt = None))]
     fn userinfo<'py>(
         &self,
@@ -504,15 +510,17 @@ impl Provider {
     }
 
     /// Authenticate a client from a token-endpoint style request (form +
-    /// `Authorization` header) and return the `Client`.
+    /// `Authorization` header) and return the `Client`. Mappings are rejected;
+    /// ordered form pairs preserve duplicate names for rejection.
     #[pyo3(signature = (form, token_url, auth_header = None))]
     fn authenticate_client(
         &self,
         py: Python<'_>,
-        form: BTreeMap<String, String>,
+        form: &Bound<'_, PyAny>,
         token_url: String,
         auth_header: Option<String>,
     ) -> PyResult<Client> {
+        let form = protocol_parameter_pairs(form, "token form")?;
         let p = self.inner.clone();
         let r = crate::runtime::block_on(py, async move {
             p.authenticate_client(&form, auth_header.as_deref(), &token_url)

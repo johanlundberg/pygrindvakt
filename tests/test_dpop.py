@@ -118,10 +118,9 @@ def test_nonce_challenge_then_accept(dpop_key):
         dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL, nonce="forged"), "POST", TOKEN_URL)
 
 
-def test_no_replay_store_warns_without_nonce(dpop_key):
-    cfg = dpop.DpopConfig()
-    with pytest.warns(UserWarning, match="NoReplayStore"):
-        dpop.validate_proof(dpop.NoReplayStore(), cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
+def test_no_replay_store_fails_closed():
+    with pytest.raises(ValueError, match="no longer supported"):
+        dpop.NoReplayStore()
 
 
 def test_python_replay_store_and_failure(dpop_key):
@@ -160,8 +159,7 @@ def test_dpop_bound_token_end_to_end(op, dpop_key):
     store = dpop.InMemoryReplayStore()
     cfg = dpop.DpopConfig()
     proof = dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
-    tr = op.handle_token_request(
-        {"grant_type": "client_credentials", "client_id": "svc", "client_secret": "svc-secret", "scope": "read"},
+    tr = op.handle_token_request(list({"grant_type": "client_credentials", "client_id": "svc", "client_secret": "svc-secret", "scope": "read"}.items()),
         TOKEN_URL, dpop=proof)
     assert tr.token_type == "DPoP"
     with pytest.raises(OAuthError):
@@ -169,7 +167,8 @@ def test_dpop_bound_token_end_to_end(op, dpop_key):
     ath = base64.urlsafe_b64encode(hashlib.sha256(tr.access_token.encode()).digest()).rstrip(b"=").decode()
     rp = dpop.validate_resource_proof(store, cfg, make_proof(dpop_key, "GET", USERINFO_URL, ath=ath), "GET",
                                       USERINFO_URL, tr.access_token)
-    assert op.userinfo(tr.access_token, presented_jkt=rp.jkt)["sub"] == "svc"
+    with pytest.raises(OAuthError, match="openid scope"):
+        op.userinfo(tr.access_token, presented_jkt=rp.jkt)
     with pytest.raises(DpopInvalidError):  # wrong ath
         dpop.validate_resource_proof(store, cfg, make_proof(dpop_key, "GET", USERINFO_URL, ath="x"), "GET",
                                      USERINFO_URL, tr.access_token)
@@ -178,6 +177,6 @@ def test_dpop_bound_token_end_to_end(op, dpop_key):
 
 
 def test_dpop_proof_class():
-    p = dpop.DpopProof("abc")
-    assert p.jkt == "abc" and "abc" in repr(p)
+    with pytest.raises(TypeError):
+        dpop.DpopProof("abc")
     assert dpop.InMemoryReplayStore().record("j", 10) is True

@@ -40,8 +40,8 @@ def request_data() -> HttpRequestData:
         path=r.path.lstrip("/"),
         method=r.method,
         uri=r.url,
-        query=r.args.to_dict(),
-        form=r.form.to_dict(),
+        query=list(r.args.items(multi=True)),
+        form=list(r.form.items(multi=True)),
         body=r.get_data(),
         headers={k.lower(): v for k, v in r.headers.items()},
         cookies=r.cookies.to_dict(),
@@ -76,7 +76,7 @@ def create_app(issuer: str = ISSUER) -> Flask:
     def authorization():
         data = request_data()
         try:
-            req = AuthorizationRequest.from_params(data.query)
+            req = AuthorizationRequest.from_params(data.query_pairs)
             op.validate_authorization_request(req)
         except OAuthError as e:
             # The redirect_uri is not trusted until validation succeeds: never redirect here.
@@ -94,17 +94,17 @@ def create_app(issuer: str = ISSUER) -> Flask:
         claims = authenticate(form.get("username", ""), form.get("password", ""))
         if claims is None:
             err = OAuthError("access_denied", "wrong username or password", req.state)
-            return to_flask(err.to_redirect(req.redirect_uri))  # validated on the GET
+            return to_flask(err.to_redirect(req.redirect_uri, "fragment" if req.use_fragment() else "query"))
         try:
             return to_flask(op.authorization_redirect(req, form["username"], claims))
         except OAuthError as e:
-            return to_flask(e.to_redirect(req.redirect_uri))
+            return to_flask(e.to_redirect(req.redirect_uri, "fragment" if req.use_fragment() else "query"))
 
     @app.post("/token")
     def token():
         data = request_data()
         try:
-            tr = op.handle_token_request(data.form, token_url, auth_header=data.authorization())
+            tr = op.handle_token_request(data.form_pairs, token_url, auth_header=data.authorization())
         except OAuthError as e:
             return to_flask(e.to_response())
         return to_flask(tr.to_response())

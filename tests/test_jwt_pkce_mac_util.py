@@ -60,8 +60,10 @@ def test_pkce_rfc7636_vector():
     assert pkce.s256_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
     assert pkce.verify(verifier, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "S256")
     assert not pkce.verify(verifier, "wrong", "S256")
-    assert pkce.verify("abc", "abc", "plain")
-    assert pkce.verify("abc", "abc")  # RFC 7636 section 4.3: no method means plain
+    valid_plain = "a" * 43
+    assert pkce.verify(valid_plain, valid_plain, "plain")
+    assert not pkce.verify("abc", "abc", "plain")
+    assert pkce.verify(valid_plain, valid_plain)  # RFC 7636 section 4.3: no method means plain
     assert not pkce.verify(verifier, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")  # plain compare fails
     assert not pkce.verify("abc", "abc", "S512")
 

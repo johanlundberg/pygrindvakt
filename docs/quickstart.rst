@@ -74,7 +74,7 @@ directly.
    from pygrindvakt.request import AuthorizationRequest
 
    try:
-       req = AuthorizationRequest.from_params(query)     # dict[str, str] from the URL
+       req = AuthorizationRequest.from_params(query_pairs)  # preserve duplicates for rejection
        op.validate_authorization_request(req)            # returns the registered Client
    except OAuthError as e:
        return e.to_response()                            # 400 JSON, never a redirect
@@ -93,7 +93,8 @@ validated, so protocol errors may be redirected.
            {"email": ["alice@example.com"], "email_verified": ["true"]},
        )
    except OAuthError as e:
-       resp = e.to_redirect(req.redirect_uri)
+       mode = "fragment" if req.use_fragment() else "query"
+       resp = e.to_redirect(req.redirect_uri, mode)
    # resp.status == 302, resp.header("location") carries ?code=...&state=...
 
 **Token**: hand over the form body, the *configured* token URL and the raw
@@ -103,7 +104,7 @@ validated, so protocol errors may be redirected.
 
    try:
        tr = op.handle_token_request(
-           form,                                  # dict[str, str] from the POST body
+           form_pairs,                            # preserve duplicates for rejection
            f"{ISSUER}/token",                     # from configuration, never from Host
            auth_header=headers.get("authorization"),
        )
@@ -160,11 +161,13 @@ then exchange the returned code and verify the id_token.
 
    # 2. On the callback: check `state`, then exchange the code.
    tokens_ = rp.exchange_code(http_client, info, me, code, code_verifier=verifier)
-   jwks = rp.fetch_jwks(http_client, info.jwks_uri)
-   claims = rp.verify_id_token(jwks, tokens_.id_token, info.issuer, "demo", nonce)
-   userinfo = rp.fetch_userinfo(http_client, info.userinfo_endpoint, tokens_.access_token)
+   jwks = rp.fetch_jwks(http_client, info.jwks_uri, info.issuer)
+   claims = rp.verify_id_token(jwks, tokens_.id_token, info.issuer, "demo", nonce, ["ES256"])
+   userinfo = rp.fetch_userinfo(http_client, info.userinfo_endpoint, tokens_.access_token,
+                                claims["sub"], info.issuer)
 
-``verify_id_token`` **requires** the expected nonce. Passing ``None`` raises
+``verify_id_token`` **requires** the expected nonce and an explicit signing
+algorithm allowlist. Passing ``None`` for the nonce raises
 :class:`pygrindvakt.AuthnError` unless you also pass
 ``unsafe_skip_nonce_check=True``, which emits a ``UserWarning``; that is
 reserved for flows that genuinely carry no nonce.
@@ -196,7 +199,7 @@ tests of your own application:
        def post_form(self, url, form, headers):
            hdrs = {k.lower(): v for k, v in headers}
            try:
-               tr = self.op.handle_token_request(dict(form), url, auth_header=hdrs.get("authorization"))
+               tr = self.op.handle_token_request(form, url, auth_header=hdrs.get("authorization"))
                return 200, json.dumps(tr.to_dict()).encode(), "application/json"
            except OAuthError as e:
                r = e.to_response()

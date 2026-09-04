@@ -12,6 +12,35 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 Initial release, binding `grindvakt` 0.7.2 (with the `pkcs11` and `redis`
 features compiled in).
 
+- **Breaking:** ``OAuthError.to_redirect`` now requires an explicit response
+  mode. Provider construction rejects symmetric ``HS*`` ID-token signing
+  keys, and token requests presenting multiple client-authentication methods
+  fail with ``invalid_client``.
+- **Breaking:** ``rp.fetch_jwks`` and ``rp.fetch_userinfo`` require their
+  associated issuer. Loopback HTTP service endpoints are accepted only for
+  loopback HTTP issuers
+  or federation entities, preventing remote metadata from redirecting token,
+  UserInfo, or JWKS traffic to a local plaintext endpoint.
+- Updated the protocol engine to `grindvakt` 0.8.0 and added fail-closed OIDC
+  validation for endpoints, ID-token algorithms/audiences/subjects, PKCE,
+  UserInfo subject binding, response modes, duplicate parameters, and replay
+  stores.
+- Implemented complete implicit/hybrid authorization responses with OIDC
+  `c_hash` / `at_hash`, and stopped issuing ID tokens or UserInfo responses for
+  non-OpenID scopes.
+- Provider construction now requires an explicit token-use store; DPoP proofs
+  can only be obtained through successful validation.
+- **Breaking:** Authorization, token, and client-authentication protocol entry
+  points require ordered parameter pairs and reject mappings, ensuring duplicate
+  names cannot be erased before validation. Trusted session restoration remains
+  available through ``AuthorizationRequest.from_dict``.
+- ID-token validation now accepts a single-element JSON array in ``aud``
+  without requiring ``azp``; a supplied ``azp`` and all multi-audience trust
+  checks remain enforced.
+- **Breaking:** Authorization requests expose repeated RFC 8707 ``resource``
+  parameters via ``AuthorizationRequest.resources`` instead of ``extra``, while
+  continuing to reject duplicates of every single-valued protocol parameter.
+
 ### Added
 
 - One Python submodule per grindvakt module: `http`, `keys`, `client`,

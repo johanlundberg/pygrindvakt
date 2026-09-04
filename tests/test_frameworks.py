@@ -96,6 +96,10 @@ class FlaskDriver:
         return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.data)
 
     def post(self, path, form, headers=None):
+        if isinstance(form, list):
+            from werkzeug.datastructures import MultiDict
+
+            form = MultiDict(form)
         r = self.client.post(path, data=form, headers=headers)
         return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.data)
 
@@ -129,7 +133,11 @@ class FastapiDriver:
         return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
     def post(self, path, form, headers=None):
-        r = self.client.post(path, data=form, headers=headers, follow_redirects=False)
+        if isinstance(form, list):
+            headers = {**(headers or {}), "content-type": "application/x-www-form-urlencoded"}
+            r = self.client.post(path, content=urlencode(form), headers=headers, follow_redirects=False)
+        else:
+            r = self.client.post(path, data=form, headers=headers, follow_redirects=False)
         return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
 
@@ -230,7 +238,7 @@ def test_full_code_flow(op_app):
     assert body["token_type"] == "Bearer" and body["access_token"] and body["refresh_token"]
 
     jwks = op_app.get("/jwks").json()
-    claims = rp.verify_id_token(jwks, body["id_token"], OP_ISSUER, "demo", "n-1")
+    claims = rp.verify_id_token(jwks, body["id_token"], OP_ISSUER, "demo", "n-1", ["ES256"])
     assert claims["sub"] == "alice" and claims["email"] == "alice@example.com"
 
     r = op_app.get("/userinfo", headers={"Authorization": f"Bearer {body['access_token']}"})
@@ -257,6 +265,22 @@ def test_unknown_client_is_not_redirected(op_app):
     assert 400 <= r.status < 500 and "location" not in r.headers
     assert r.headers["content-type"].startswith("application/json")
     assert r.json()["error"] in ("invalid_client", "invalid_request", "unauthorized_client")
+
+
+def test_duplicate_authorization_parameter_is_rejected_by_every_adapter(op_app):
+    """Flask, Django, and FastAPI preserve duplicate query values for rejection."""
+    params = list(AUTHZ_PARAMS.items()) + [("client_id", "attacker")]
+    r = op_app.get("/authorization", params)
+    assert r.status == 400
+    assert r.json()["error"] == "invalid_request"
+
+
+def test_duplicate_token_parameter_is_rejected_by_every_adapter(op_app):
+    """Duplicate token form fields reach Provider as ordered pairs."""
+    form = [("grant_type", "authorization_code"), ("grant_type", "refresh_token")]
+    r = op_app.post("/token", form)
+    assert r.status == 400
+    assert r.json()["error"] == "invalid_request"
 
 
 def test_login_without_pending_request_is_rejected(op_app):

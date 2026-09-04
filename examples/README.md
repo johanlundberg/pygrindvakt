@@ -62,7 +62,7 @@ read by the RP), `OP_SIGNING_JWK` / `OP_KEY_FILE`, `OP_SECRET` (token codec),
 * `/authorization` POST: after checking the credentials, `from_dict` restores
   the request and `Provider.authorization_redirect(req, sub, claims)` mints the
   code and returns the redirect. A failed login becomes
-  `OAuthError("access_denied", ...).to_redirect(req.redirect_uri)`.
+  `OAuthError("access_denied", ...).to_redirect(req.redirect_uri, mode)`.
 * `/token`: `Provider.handle_token_request(form, TOKEN_URL, auth_header=...)`.
   `TOKEN_URL` comes from the configured issuer, never from the `Host` header,
   because it is the `private_key_jwt` audience and the DPoP `htu`.
