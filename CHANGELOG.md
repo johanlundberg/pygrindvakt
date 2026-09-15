@@ -7,10 +7,14 @@ needed to track the upstream `grindvakt` library and correct protocol or
 security handling. `pygrindvakt` is a thin PyO3 binding; most entries reflect
 adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
-## [0.1.0] - 2026-09-02
+## Unreleased
 
-Initial release, binding `grindvakt` 0.7.2 (with the `pkcs11` and `redis`
-features compiled in).
+## [0.1.0] - 2026-09-15
+
+Initial release, binding `grindvakt` 0.8.0 with the `pkcs11` and `redis`
+features compiled in.
+
+### Added
 
 - **Breaking:** ``OAuthError.to_redirect`` now requires an explicit response
   mode. Provider construction rejects symmetric ``HS*`` ID-token signing
@@ -40,9 +44,6 @@ features compiled in).
 - **Breaking:** Authorization requests expose repeated RFC 8707 ``resource``
   parameters via ``AuthorizationRequest.resources`` instead of ``extra``, while
   continuing to reject duplicates of every single-valued protocol parameter.
-
-### Added
-
 - One Python submodule per grindvakt module: `http`, `keys`, `client`,
   `metadata`, `request`, `tokens`, `provider`, `dpop`, `rp`, `federation`,
   `discovery`, `jwt`, `pkce`, `mac`, `util`.
