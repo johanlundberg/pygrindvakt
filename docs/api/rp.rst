@@ -113,7 +113,7 @@ Provider and client
 Starting the flow
 -----------------
 
-.. py:function:: authorization_url(provider: ProviderInfo, client: RpClient, state: str, nonce: str, code_challenge: str | None = None, extra: dict[str, str] | list[tuple[str, str]] | None = None) -> str
+.. py:function:: authorization_url(provider: ProviderInfo, client: RpClient, state: str, nonce: str, code_challenge: str | None = None, extra: dict[str, str] | list[tuple[str, str]] | None = None, *, redirect_uri: str | None = None) -> str
 
    Build the authorization request URL to redirect the user to, with
    ``response_type=code``, the client's id, redirect URI and scope,
@@ -129,7 +129,27 @@ Starting the flow
    ``ValueError``. Library-controlled parameter names and ambiguous duplicate
    extension names are rejected; repeatable ``resource`` remains supported.
 
-.. py:function:: signed_request_object(provider: ProviderInfo, client: RpClient, key: SigningKey, state: str, nonce: str, code_challenge: str | None = None) -> str
+   ``redirect_uri`` overrides the client's configured value for this call
+   only. It must be an absolute URL without a fragment, else
+   :class:`pygrindvakt.BadRequestError` is raised, and the same value must
+   be passed to :func:`exchange_code`; keep it in the session.
+
+.. py:function:: begin(provider: ProviderInfo, client: RpClient, *, extra: dict[str, str] | list[tuple[str, str]] | None = None, redirect_uri: str | None = None, pkce: bool = True, request_object_key: SigningKey | None = None) -> tuple[str, str, str, str | None]
+
+   Start an authorization-code flow: generate a fresh ``state`` and
+   ``nonce`` (32 random bytes each, base64url) and a PKCE verifier (48
+   random bytes, 64 characters), and return ``(url, state, nonce,
+   verifier)``. The challenge is ``S256``. Store ``state``, ``nonce`` and
+   ``verifier`` (and ``redirect_uri`` if overridden) in the user's session.
+
+   ``pkce=False`` omits PKCE and returns ``None`` as the verifier; it is
+   refused with :class:`pygrindvakt.BadRequestError` for public clients
+   (``auth_method="none"``). With ``request_object_key`` a signed request
+   object (see :func:`signed_request_object`) is added as the ``request``
+   parameter. ``extra`` and ``redirect_uri`` behave as in
+   :func:`authorization_url`.
+
+.. py:function:: signed_request_object(provider: ProviderInfo, client: RpClient, key: SigningKey, state: str, nonce: str, code_challenge: str | None = None, *, redirect_uri: str | None = None) -> str
 
    Build a signed request object (RFC 9101, "JAR") carrying the
    authorization-request parameters as JWT claims, signed with ``key``, with
@@ -139,7 +159,8 @@ Starting the flow
    OpenID Federation automatic registration needs this: pass the result as
    the ``request`` parameter via ``authorization_url(..., extra={"request":
    jar})`` alongside the plain parameters. ``key`` must be one of the RP's
-   published client keys.
+   published client keys. ``redirect_uri`` overrides the client's value, as
+   in :func:`authorization_url`.
 
 Discovery and keys
 ------------------
@@ -167,14 +188,15 @@ Discovery and keys
 Finishing the flow
 ------------------
 
-.. py:function:: exchange_code(http: HttpClientProtocol | None, provider: ProviderInfo, client: RpClient, code: str, code_verifier: str | None = None) -> TokenSet
+.. py:function:: exchange_code(http: HttpClientProtocol | None, provider: ProviderInfo, client: RpClient, code: str, code_verifier: str | None = None, *, redirect_uri: str | None = None) -> TokenSet
 
    Exchange an authorization ``code`` for tokens at the provider's token
    endpoint, authenticating as configured on ``client``
    (``client_secret_basic`` via the ``Authorization`` header,
    ``client_secret_post`` in the form, ``private_key_jwt`` with a fresh
    assertion, or nothing). ``code_verifier`` is the PKCE verifier matching
-   the challenge sent in :func:`authorization_url`.
+   the challenge sent in :func:`authorization_url`. If the authorization
+   request overrode ``redirect_uri``, pass the same ``redirect_uri`` here.
 
    A non-200 response raises :class:`pygrindvakt.AuthnError` carrying a
    sanitized, truncated copy of the upstream error body (for example
@@ -242,15 +264,14 @@ Example
 
 .. code-block:: python
 
-   from pygrindvakt import AuthnError, http, pkce, rp, util
+   from pygrindvakt import AuthnError, http, rp
 
    http_client = http.ReqwestClient()
    info = rp.ProviderInfo.from_metadata(rp.discover(http_client, "https://op.example.com"))
    me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret=os.environ["OIDC_SECRET"])
 
    # Login: keep state, nonce and verifier in the session.
-   state, nonce, verifier = util.random_token(24), util.random_token(24), util.random_token(32)
-   redirect_to = rp.authorization_url(info, me, state, nonce, code_challenge=pkce.s256_challenge(verifier))
+   redirect_to, state, nonce, verifier = rp.begin(info, me)
 
    # Callback: check state, then exchange and verify.
    try:

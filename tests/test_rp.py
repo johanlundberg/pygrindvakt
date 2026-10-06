@@ -17,6 +17,7 @@ import pytest
 
 from pygrindvakt import (
     AuthnError,
+    BadRequestError,
     GrindvaktError,
     InternalError,
     OAuthError,
@@ -59,6 +60,7 @@ def in_thread(fn, *args, **kwargs):
     if "error" in box:
         raise box["error"]
     return box["value"]
+ALT_REDIRECT_URI = "https://rp.example.com/alt-cb"
 
 
 class FakeHttpClient:
@@ -67,6 +69,7 @@ class FakeHttpClient:
     def __init__(self, op):
         self.op = op
         self.calls: list[tuple[str, str]] = []
+        self.forms: list[list[tuple[str, str]]] = []
 
     @staticmethod
     def _json(value, status=200):
@@ -87,6 +90,7 @@ class FakeHttpClient:
 
     def post_form(self, url, form, headers):
         self.calls.append(("POST", url))
+        self.forms.append(list(form))
         hdrs = {k.lower(): v for k, v in headers}
         if url == f"{ISSUER}/token":
             try:
@@ -129,7 +133,7 @@ def op_key():
 @pytest.fixture
 def op(op_key):
     md = metadata.ProviderMetadata(ISSUER)
-    c = client.Client(CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uris=[REDIRECT_URI])
+    c = client.Client(CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uris=[REDIRECT_URI, ALT_REDIRECT_URI])
     return provider.Provider(
         md, op_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret"),
         token_use_store=provider.InMemoryTokenUseStore(),
@@ -411,6 +415,113 @@ def test_authorization_url_rejects_reserved_and_ambiguous_extras(prov, rpc):
     url = rp.authorization_url(prov, rpc, "state", "nonce",
                                extra=[("resource", "https://api-1"), ("resource", "https://api-2")])
     assert len(parse_qs(urlsplit(url).query)["resource"]) == 2
+
+
+# --- redirect_uri override ----------------------------------------------------------
+
+
+def test_redirect_uri_override_in_authorization_url_and_jar(prov, rpc, rp_key):
+    url = rp.authorization_url(prov, rpc, "st", "n", redirect_uri=ALT_REDIRECT_URI)
+    assert parse_qs(urlsplit(url).query)["redirect_uri"] == [ALT_REDIRECT_URI]
+    assert rpc.redirect_uri == REDIRECT_URI  # the client itself is unchanged
+    jar = rp.signed_request_object(prov, rpc, rp_key, "st", "n", redirect_uri=ALT_REDIRECT_URI)
+    import base64
+
+    claims = json.loads(base64.urlsafe_b64decode(jar.split(".")[1] + "=="))
+    assert claims["redirect_uri"] == ALT_REDIRECT_URI
+
+
+def test_redirect_uri_override_reaches_token_request(op, http, prov, rpc):
+    state, nonce, verifier = util.random_token(), util.random_token(), util.random_token(48)
+    url = rp.authorization_url(
+        prov, rpc, state, nonce, pkce.s256_challenge(verifier), redirect_uri=ALT_REDIRECT_URI
+    )
+    req = request.AuthorizationRequest.from_params(
+        [(k, v[0]) for k, v in parse_qs(urlsplit(url).query).items()]
+    )
+    op.validate_authorization_request(req)
+    resp = op.authorization_redirect(req, "alice", {"email": ["a@b"]})
+    code = parse_qs(urlsplit(resp.header("location")).query)["code"][0]
+    ts = rp.exchange_code(http, prov, rpc, code, verifier, redirect_uri=ALT_REDIRECT_URI)
+    assert ts.id_token
+    assert ("redirect_uri", ALT_REDIRECT_URI) in http.forms[-1]
+    assert ("redirect_uri", REDIRECT_URI) not in http.forms[-1]
+
+
+@pytest.mark.parametrize("bad", ["https://rp.example.com/cb#frag", "/relative", ""])
+def test_redirect_uri_override_rejected(prov, rpc, rp_key, bad):
+    with pytest.raises(BadRequestError):
+        rp.authorization_url(prov, rpc, "st", "n", redirect_uri=bad)
+    with pytest.raises(BadRequestError):
+        rp.signed_request_object(prov, rpc, rp_key, "st", "n", redirect_uri=bad)
+    with pytest.raises(BadRequestError):
+        rp.exchange_code(RaisingHttpClient(), prov, rpc, "code", "v" * 43, redirect_uri=bad)
+    with pytest.raises(BadRequestError):
+        rp.begin(prov, rpc, redirect_uri=bad)
+
+
+# --- begin ----------------------------------------------------------------------------
+
+
+def test_begin_returns_url_state_nonce_verifier(prov, rpc):
+    url, state, nonce, verifier = rp.begin(prov, rpc)
+    q = parse_qs(urlsplit(url).query)
+    assert q["state"] == [state]
+    assert q["nonce"] == [nonce]
+    assert q["code_challenge_method"] == ["S256"]
+    assert q["code_challenge"] == [pkce.s256_challenge(verifier)]
+    assert pkce.verify(verifier, q["code_challenge"][0], "S256")
+    assert len(verifier) == 64
+    assert len(state) == len(nonce) == 43
+
+
+def test_begin_values_are_fresh(prov, rpc):
+    a = rp.begin(prov, rpc)
+    b = rp.begin(prov, rpc)
+    for i in (1, 2, 3):
+        assert a[i] != b[i]
+
+
+def test_begin_extra_and_override(prov, rpc):
+    url, *_ = rp.begin(prov, rpc, extra={"prompt": "login"}, redirect_uri=ALT_REDIRECT_URI)
+    q = parse_qs(urlsplit(url).query)
+    assert q["prompt"] == ["login"]
+    assert q["redirect_uri"] == [ALT_REDIRECT_URI]
+
+
+def test_begin_pkce_false(prov, rpc):
+    url, _, _, verifier = rp.begin(prov, rpc, pkce=False)
+    assert verifier is None
+    assert "code_challenge" not in parse_qs(urlsplit(url).query)
+
+
+def test_begin_pkce_false_refused_for_public_client(prov):
+    public = rp.RpClient("public", REDIRECT_URI, auth_method="none")
+    with pytest.raises(BadRequestError, match="PKCE"):
+        rp.begin(prov, public, pkce=False)
+    url, *_ = rp.begin(prov, public)
+    assert "code_challenge" in parse_qs(urlsplit(url).query)
+
+
+def test_begin_with_request_object(prov, rpc, rp_key):
+    url, *_ = rp.begin(prov, rpc, request_object_key=rp_key)
+    q = parse_qs(urlsplit(url).query)
+    assert q["request"][0].count(".") == 2
+
+
+def test_begin_then_exchange_code_flow(op, http, prov, rpc):
+    url, state, nonce, verifier = rp.begin(prov, rpc)
+    req = request.AuthorizationRequest.from_params(
+        [(k, v[0]) for k, v in parse_qs(urlsplit(url).query).items()]
+    )
+    op.validate_authorization_request(req)
+    resp = op.authorization_redirect(req, "alice", {"email": ["a@b"]})
+    q = parse_qs(urlsplit(resp.header("location")).query)
+    assert q["state"] == [state]
+    ts = rp.exchange_code(http, prov, rpc, q["code"][0], verifier)
+    jwks = rp.fetch_jwks(http, prov.jwks_uri, prov.issuer)
+    claims = rp.verify_id_token(jwks, ts.id_token, ISSUER, CLIENT_ID, nonce, ["ES256"])
+    assert claims["sub"] == "alice"
 
 
 # --- full code flow -----------------------------------------------------------------
