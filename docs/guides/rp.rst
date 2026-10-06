@@ -59,8 +59,9 @@ inconsistent combinations raise ``ValueError`` rather than being ignored.
 Starting the flow: PKCE, state and nonce in the session
 -------------------------------------------------------
 
-Generate three fresh random values per login and store them in the user's
-session before redirecting:
+:func:`~pygrindvakt.rp.begin` generates three fresh random values per login
+and builds the authorization URL; store the values in the user's session
+before redirecting:
 
 * ``state`` binds the callback to this browser session (CSRF protection on
   the callback).
@@ -71,14 +72,38 @@ session before redirecting:
 
 .. code-block:: python
 
-   from pygrindvakt import pkce, util
-
    @app.get("/login")
    def login():
-       state, nonce, verifier = util.random_token(24), util.random_token(24), util.random_token(32)
+       url, state, nonce, verifier = rp.begin(info, me)
        session["oidc"] = {"state": state, "nonce": nonce, "verifier": verifier}
-       url = rp.authorization_url(info, me, state, nonce, code_challenge=pkce.s256_challenge(verifier))
        return redirect(url)
+
+``state`` and ``nonce`` are 32 random bytes each and the verifier is 48
+(64 characters, within the RFC 7636 range). ``pkce=False`` is refused for
+public clients.
+
+Under the hood this is :func:`~pygrindvakt.rp.authorization_url` plus
+:func:`pygrindvakt.util.random_token` and
+:func:`pygrindvakt.pkce.s256_challenge`; call those directly if you need
+full control.
+
+Per-request redirect URI
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``begin``, ``authorization_url`` and ``signed_request_object`` accept a
+keyword-only ``redirect_uri`` that replaces the client's configured one for
+that call. It must be an absolute URL without a fragment
+(:class:`pygrindvakt.BadRequestError` otherwise) and be registered at the OP.
+Pass the **same value** to ``exchange_code(..., redirect_uri=...)`` (RFC 6749
+section 4.1.3), so keep it in the session with the other values:
+
+.. code-block:: python
+
+   url, state, nonce, verifier = rp.begin(info, me, redirect_uri=cb)
+   session["oidc"] = {"state": state, "nonce": nonce, "verifier": verifier, "redirect_uri": cb}
+   # callback:
+   ts = rp.exchange_code(http_client, info, me, code,
+                         code_verifier=pending["verifier"], redirect_uri=pending["redirect_uri"])
 
 ``authorization_url`` also accepts ``extra`` parameters (a dict or a list of
 pairs, so names can repeat) for ``prompt``, ``acr_values``, ``login_hint`` or
@@ -210,6 +235,9 @@ alongside the plain parameters:
 
    jar = rp.signed_request_object(info, me, rp_key, state, nonce, code_challenge=challenge)
    url = rp.authorization_url(info, me, state, nonce, code_challenge=challenge, extra={"request": jar})
+
+   # or, with generated state/nonce/verifier:
+   url, state, nonce, verifier = rp.begin(info, me, request_object_key=rp_key)
 
 Using a custom HTTP client
 --------------------------

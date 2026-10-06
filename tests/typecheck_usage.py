@@ -53,6 +53,12 @@ def use_all() -> None:
     me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
     rp.exchange_code(reqwest, info, me, "code")
     rp.exchange_code(custom, info, me, "code", code_verifier="v")
+    rp.exchange_code(reqwest, info, me, "code", "v", redirect_uri="https://rp.example.com/alt")
+    url, state, nonce, verifier = rp.begin(info, me)
+    check: tuple[str, str, str, str | None] = (url, state, nonce, verifier)
+    del check
+    rp.begin(info, me, extra={"prompt": "login"}, redirect_uri="https://rp.example.com/alt", pkce=False)
+    rp.authorization_url(info, me, state, nonce, redirect_uri=None)
     rp.fetch_jwks(fetch, "https://op.example.com/jwks", "https://op.example.com")
     rp.fetch_userinfo(
         reqwest, "https://op.example.com/ui", "tok", "sub", "https://op.example.com"

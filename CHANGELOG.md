@@ -9,6 +9,16 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## Unreleased
 
+### Added
+
+- `rp.begin(provider, client, *, extra, redirect_uri, pkce, request_object_key)`
+  generates `state`, `nonce` and a PKCE verifier, and returns
+  `(url, state, nonce, verifier)`. `pkce=False` is refused for public clients;
+  `request_object_key` adds a signed request object.
+- Keyword-only `redirect_uri` override on `rp.authorization_url`,
+  `rp.signed_request_object` and `rp.exchange_code` (absolute URL, no
+  fragment; the same value must be passed to `exchange_code`).
+
 ### Changed
 
 - `py.typed` is now empty (the package is fully typed) instead of `partial`.

@@ -352,14 +352,29 @@ fn extra_params(extra: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(String, Strin
     }
 }
 
+/// Return the upstream client, with `redirect_uri` swapped in when given.
+/// The upstream functions validate it (absolute URL, no fragment) and raise
+/// `BadRequestError` otherwise.
+fn effective_client(client: &RpClient, redirect_uri: Option<String>) -> grp::RpClient {
+    let mut inner = client.inner.clone();
+    if let Some(r) = redirect_uri {
+        inner.redirect_uri = r;
+    }
+    inner
+}
+
 /// Build the authorization request URL to redirect the user to.
+///
+/// `redirect_uri` overrides the client's configured value for this request
+/// only; it must be an absolute URL without a fragment, and the same value
+/// must be passed to `exchange_code`.
 ///
 /// `state` and `nonce` must be fresh random values bound to the user's
 /// session; `code_challenge` is the PKCE `S256` challenge
 /// (`pygrindvakt.pkce.s256_challenge`). `extra` adds further query
 /// parameters (e.g. `{"prompt": "login"}` or a signed `request` object).
 #[pyfunction]
-#[pyo3(signature = (provider, client, state, nonce, code_challenge = None, extra = None))]
+#[pyo3(signature = (provider, client, state, nonce, code_challenge = None, extra = None, *, redirect_uri = None))]
 fn authorization_url(
     provider: &ProviderInfo,
     client: &RpClient,
@@ -367,7 +382,9 @@ fn authorization_url(
     nonce: &str,
     code_challenge: Option<&str>,
     extra: Option<&Bound<'_, PyAny>>,
+    redirect_uri: Option<String>,
 ) -> PyResult<String> {
+    let client = effective_client(client, redirect_uri);
     let extra = extra_params(extra)?;
     let extra_refs: Vec<(&str, &str)> = extra
         .iter()
@@ -375,7 +392,7 @@ fn authorization_url(
         .collect();
     grp::authorization_url(
         &provider.inner,
-        &client.inner,
+        &client,
         state,
         nonce,
         code_challenge,
@@ -391,8 +408,9 @@ fn authorization_url(
 /// the `request` parameter (via `authorization_url(..., extra={"request": jar})`)
 /// alongside the plain parameters. `key` must be one of the RP's published
 /// client keys. The object is valid for 300 seconds and carries a `jti`.
+/// `redirect_uri` overrides the client's value, as in `authorization_url`.
 #[pyfunction]
-#[pyo3(signature = (provider, client, key, state, nonce, code_challenge = None))]
+#[pyo3(signature = (provider, client, key, state, nonce, code_challenge = None, *, redirect_uri = None))]
 fn signed_request_object(
     provider: &ProviderInfo,
     client: &RpClient,
@@ -400,16 +418,73 @@ fn signed_request_object(
     state: &str,
     nonce: &str,
     code_challenge: Option<&str>,
+    redirect_uri: Option<String>,
 ) -> PyResult<String> {
+    let client = effective_client(client, redirect_uri);
     grp::signed_request_object(
         &provider.inner,
-        &client.inner,
+        &client,
         &key.inner,
         state,
         nonce,
         code_challenge,
     )
     .map_err(err)
+}
+
+/// Start an authorization-code flow in one call.
+///
+/// Generates a fresh `state` and `nonce` (32 random bytes each) and, unless
+/// `pkce=False`, a PKCE verifier (48 random bytes, 64 characters) with its
+/// `S256` challenge. Returns `(url, state, nonce, verifier)`; `verifier` is
+/// `None` when `pkce=False`. Store `state`, `nonce` and `verifier` (and
+/// `redirect_uri`, if overridden) in the user's session.
+///
+/// Public clients (`auth_method="none"`) cannot disable PKCE: `pkce=False`
+/// raises `BadRequestError`. When `request_object_key` is given, a signed
+/// request object (RFC 9101) is added as `extra["request"]`.
+#[pyfunction]
+#[pyo3(signature = (provider, client, *, extra = None, redirect_uri = None, pkce = true, request_object_key = None))]
+fn begin(
+    provider: &ProviderInfo,
+    client: &RpClient,
+    extra: Option<&Bound<'_, PyAny>>,
+    redirect_uri: Option<String>,
+    pkce: bool,
+    request_object_key: Option<&SigningKey>,
+) -> PyResult<(String, String, String, Option<String>)> {
+    let client = effective_client(client, redirect_uri);
+    let mut extra = extra_params(extra)?;
+    let state = grindvakt::util::random_token(32);
+    let nonce = grindvakt::util::random_token(32);
+    let verifier = pkce.then(|| grindvakt::util::random_token(48));
+    let challenge = verifier.as_deref().map(grindvakt::pkce::s256_challenge);
+    if let Some(key) = request_object_key {
+        let jar = grp::signed_request_object(
+            &provider.inner,
+            &client,
+            &key.inner,
+            &state,
+            &nonce,
+            challenge.as_deref(),
+        )
+        .map_err(err)?;
+        extra.push(("request".to_string(), jar));
+    }
+    let extra_refs: Vec<(&str, &str)> = extra
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let url = grp::authorization_url(
+        &provider.inner,
+        &client,
+        &state,
+        &nonce,
+        challenge.as_deref(),
+        &extra_refs,
+    )
+    .map_err(err)?;
+    Ok((url, state, nonce, verifier))
 }
 
 /// Discover provider metadata from `issuer` (`/.well-known/openid-configuration`).
@@ -456,10 +531,14 @@ fn fetch_jwks<'py>(
 /// endpoint, authenticating as configured on `client`. `code_verifier` is the
 /// PKCE verifier matching the challenge sent in `authorization_url`.
 ///
+/// If the authorization request used a `redirect_uri` override, pass the
+/// same value here (RFC 6749 section 4.1.3); store it in the session with
+/// the state, nonce and verifier.
+///
 /// A non-200 response raises `AuthnError` carrying a sanitized, truncated
 /// copy of the upstream error body.
 #[pyfunction]
-#[pyo3(signature = (http, provider, client, code, code_verifier = None))]
+#[pyo3(signature = (http, provider, client, code, code_verifier = None, *, redirect_uri = None))]
 fn exchange_code(
     py: Python<'_>,
     http: Option<&Bound<'_, PyAny>>,
@@ -467,10 +546,11 @@ fn exchange_code(
     client: &RpClient,
     code: String,
     code_verifier: Option<String>,
+    redirect_uri: Option<String>,
 ) -> PyResult<TokenSet> {
     let http = extract_http_client(http)?;
     let provider = provider.inner.clone();
-    let client = client.inner.clone();
+    let client = effective_client(client, redirect_uri);
     let r = crate::runtime::block_on(py, async move {
         grp::exchange_code(&http, &provider, &client, &code, code_verifier.as_deref()).await
     })?;
@@ -601,6 +681,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TokenSet>()?;
     m.add_function(wrap_pyfunction!(authorization_url, &m)?)?;
     m.add_function(wrap_pyfunction!(signed_request_object, &m)?)?;
+    m.add_function(wrap_pyfunction!(begin, &m)?)?;
     m.add_function(wrap_pyfunction!(discover, &m)?)?;
     m.add_function(wrap_pyfunction!(fetch_jwks, &m)?)?;
     m.add_function(wrap_pyfunction!(exchange_code, &m)?)?;

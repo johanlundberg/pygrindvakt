@@ -80,6 +80,8 @@ def authorization_url(
     nonce: str,
     code_challenge: str | None = ...,
     extra: dict[str, str] | list[tuple[str, str]] | None = ...,
+    *,
+    redirect_uri: str | None = ...,
 ) -> str: ...
 def signed_request_object(
     provider: ProviderInfo,
@@ -88,7 +90,18 @@ def signed_request_object(
     state: str,
     nonce: str,
     code_challenge: str | None = ...,
+    *,
+    redirect_uri: str | None = ...,
 ) -> str: ...
+def begin(
+    provider: ProviderInfo,
+    client: RpClient,
+    *,
+    extra: dict[str, str] | list[tuple[str, str]] | None = ...,
+    redirect_uri: str | None = ...,
+    pkce: bool = ...,
+    request_object_key: SigningKey | None = ...,
+) -> tuple[str, str, str, str | None]: ...
 def discover(http: _HttpArg, issuer: str) -> ProviderMetadata: ...
 def fetch_jwks(http: _HttpArg, jwks_uri: str, issuer: str) -> dict[str, Any]: ...
 def exchange_code(
@@ -97,6 +110,8 @@ def exchange_code(
     client: RpClient,
     code: str,
     code_verifier: str | None = ...,
+    *,
+    redirect_uri: str | None = ...,
 ) -> TokenSet: ...
 def verify_id_token(
     jwks: dict[str, Any],
