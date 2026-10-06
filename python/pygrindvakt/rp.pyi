@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from .http import _HttpArg
 from .keys import SigningKey
 from .metadata import ProviderMetadata
 
@@ -88,10 +89,10 @@ def signed_request_object(
     nonce: str,
     code_challenge: str | None = ...,
 ) -> str: ...
-def discover(http: Any | None, issuer: str) -> ProviderMetadata: ...
-def fetch_jwks(http: Any | None, jwks_uri: str, issuer: str) -> dict[str, Any]: ...
+def discover(http: _HttpArg, issuer: str) -> ProviderMetadata: ...
+def fetch_jwks(http: _HttpArg, jwks_uri: str, issuer: str) -> dict[str, Any]: ...
 def exchange_code(
-    http: Any | None,
+    http: _HttpArg,
     provider: ProviderInfo,
     client: RpClient,
     code: str,
@@ -108,7 +109,7 @@ def verify_id_token(
     unsafe_skip_nonce_check: bool = ...,
 ) -> dict[str, Any]: ...
 def fetch_userinfo(
-    http: Any | None,
+    http: _HttpArg,
     userinfo_endpoint: str,
     access_token: str,
     expected_sub: str,

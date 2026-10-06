@@ -19,6 +19,11 @@
 //! following redirects (a 307/308 would re-send token-endpoint form bodies
 //! cross-origin), and for bounding response sizes. The built-in client does all
 //! three.
+//!
+//! A Python client runs on the thread driving the call, holding the GIL, so an
+//! instance shared across threads must be thread-safe itself; calling back into
+//! pygrindvakt from it is supported at the cost of a helper thread per nested
+//! call (see `runtime::block_on`).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -523,6 +528,17 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Never follows redirects, enforces connect/read/total timeouts and a
 /// streaming response-size cap. Also exposes `get` / `post_form` so it
 /// satisfies the Python `HttpClient` protocol itself.
+///
+/// Thread safety: the class is `frozen` and shares its state behind an `Arc`,
+/// so one instance can be used from many threads; the GIL is released during
+/// I/O (`runtime::block_on`), so concurrent calls run in parallel. `http=None`
+/// selects a process-wide default instance with the same properties.
+///
+/// Fork safety: the connection pool is keyed by PID and rebuilt lazily in the
+/// child after `fork`; inherited connections are never reused and the tokio
+/// runtime is rebuilt per process (see ADR 0001). A request in flight in
+/// another thread at fork time does not exist in the child. Create a
+/// `RedisStore` after fork; a `ReqwestClient` may be created before it.
 #[pyclass(module = "pygrindvakt.http", name = "ReqwestClient", frozen)]
 pub struct ReqwestClient {
     pub inner: Arc<ReqwestHttpClient>,

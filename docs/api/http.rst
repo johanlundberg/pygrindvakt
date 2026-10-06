@@ -6,6 +6,13 @@ pygrindvakt.http
 Framework-agnostic request and response types, the outbound ``HttpClient``
 protocol, and the built-in reqwest client.
 
+.. warning::
+
+   **Import name.** ``from pygrindvakt import http`` rebinds the name ``http``
+   in your module and shadows the standard-library :mod:`http` package there
+   (``http.HTTPStatus``, ``http.client``, ``http.server``, ...). Prefer
+   ``from pygrindvakt import http as gv_http`` or ``import pygrindvakt.http``.
+
 :class:`HttpRequestData` is what a web-framework adapter builds from the
 incoming request (see :doc:`../guides/op_flask`); :class:`Response` is what
 the application turns back into its framework's response type. Neither
@@ -188,7 +195,8 @@ Outbound HTTP client protocol
       on ``get``.
 
    The implementation runs on the thread that is driving the pygrindvakt
-   call, holding the GIL. It may call back into pygrindvakt, which is how a
+   call, holding the GIL (so a client shared across threads must be
+   thread-safe itself). It may call back into pygrindvakt, which is how a
    test's fake client drives an in-process
    :class:`pygrindvakt.provider.Provider`; the nested call runs on a helper
    thread and costs one thread spawn.
@@ -240,6 +248,8 @@ Outbound HTTP client protocol
 Built-in client
 ---------------
 
+.. _reqwest-client-fork:
+
 .. py:class:: ReqwestClient(connect_timeout: int = 10, read_timeout: int = 15, request_timeout: int = 30, max_response_bytes: int = 8388608, user_agent: str | None = None)
 
    The built-in outbound HTTP client (reqwest + rustls; no OpenSSL).
@@ -251,8 +261,27 @@ Built-in client
    constructor raises ``ValueError``. The default ``user_agent`` is
    ``pygrindvakt/<version>``.
 
-   The connection pool is keyed by process id and rebuilt after ``fork``, so a
-   client created in a gunicorn master keeps working in the workers.
+   .. rubric:: Threads and fork
+
+   *Threads.* Instances are immutable and share their state, so one
+   ``ReqwestClient`` can safely be used from many threads. The GIL is released
+   during I/O, so concurrent calls run in parallel. ``http=None`` selects a
+   process-wide default instance with the same properties.
+
+   *Fork.* The connection pool is keyed by process id and rebuilt lazily in a
+   child after ``fork``; connections inherited from the parent are never
+   reused, and the tokio runtime is rebuilt per process (see
+   `ADR 0001 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0001-sync-api-over-embedded-tokio-runtime.md>`_).
+   A client created in a gunicorn master therefore keeps working in the
+   workers. A request that was in flight in another thread at the moment of
+   ``fork`` does not exist in the child. A ``ReqwestClient`` may be created
+   before ``fork``; a :class:`~pygrindvakt.provider.RedisStore` must be created
+   after it (see :doc:`../guides/stores`).
+
+   *Python clients.* A Python :class:`HttpClientProtocol` implementation runs
+   on the calling thread while it holds the GIL, so an instance shared across
+   threads must be thread-safe itself. A re-entrant call back into pygrindvakt
+   from inside it costs a helper thread.
 
    It also exposes ``get`` / ``post_form`` so it satisfies the Python
    :class:`HttpClientProtocol` itself, which makes it usable from your own

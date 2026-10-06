@@ -60,5 +60,10 @@ Python thread), created lazily and stored in a PID-keyed slot.
   HTTP client timeouts (30 s total by default) and Redis command timeouts.
 - Worker threads never touch Python, so interpreter shutdown cannot hang on
   them. Rule: never `tokio::spawn` a future that calls `Python::attach`.
+- `ReqwestClient` is frozen and `Arc`-shared: one instance is safe across
+  threads, the GIL is released during I/O, and `http=None` uses a process-wide
+  default with the same properties. User-facing summary: the `ReqwestClient`
+  section of `docs/api/http.rst` and the deployment note in
+  `docs/guides/rp.rst`.
 - A `RedisStore` must be constructed after fork (gunicorn `post_fork` hook or
   lazily in the worker).
