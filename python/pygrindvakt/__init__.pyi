@@ -66,6 +66,9 @@ class AttributeMappingError(GrindvaktError):
 class JoseError(GrindvaktError):
     """JOSE (JWS/JWE/JWK) error (500)."""
 
+class UnknownKeyError(JoseError):
+    """The token's ``kid`` names no key in the issuer's JWK Set, even after a refresh (401)."""
+
 class JsonError(GrindvaktError):
     """JSON (de)serialization error (500)."""
 
@@ -103,6 +106,7 @@ __all__ = [
     "CryptoError",
     "AttributeMappingError",
     "JoseError",
+    "UnknownKeyError",
     "JsonError",
     "InternalError",
     "NoBoundEndpointError",

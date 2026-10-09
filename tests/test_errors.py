@@ -28,6 +28,7 @@ EXPECTED_CLASS_CODES = {
     "CryptoError": "crypto",
     "AttributeMappingError": "attribute",
     "JoseError": "jose",
+    "UnknownKeyError": "unknown_kid",
     "JsonError": "json",
     "InternalError": "internal",
     "NoBoundEndpointError": "no_bound_endpoint",

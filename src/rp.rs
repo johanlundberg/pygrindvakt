@@ -12,7 +12,8 @@
 //! trusted audiences an explicit policy input.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use grindvakt::http::{HttpClient, HttpFetchResponse};
@@ -22,11 +23,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
+use grindvakt::jose_rs::jwk::JwkSet;
+use grindvakt::jwt as gj;
 use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
 use crate::convert::{from_py, new_submodule, to_py, warn};
-use crate::errors::{err, with_code, AuthnError, ConfigError};
+use crate::errors::{err, with_code, AuthnError, ConfigError, UnknownKeyError};
 use crate::http::extract_http_client;
 use crate::jwt::jwks_from_py;
 use crate::keys::SigningKey;
@@ -778,11 +781,174 @@ fn exchange_code(
         .map_err(|e| failures.err(py, e))
 }
 
-/// Verify an `id_token` against the provider JWKS (a dict `{"keys": [...]}`),
-/// `issuer`, audience `client_id`, and `expected_nonce`; `sub`, `exp`, and
-/// `iat` are required. The protected algorithm must be explicitly allowed;
-/// all other audiences must be explicitly trusted and multi-audience tokens
-/// must name this client in `azp`. Returns the validated claims as a dict.
+/// Convert a Python int option to an unsigned seconds value.
+fn seconds(name: &str, v: Option<i64>) -> PyResult<Option<u64>> {
+    v.map(|v| {
+        u64::try_from(v).map_err(|_| PyValueError::new_err(format!("{name} must not be negative")))
+    })
+    .transpose()
+}
+
+fn parse_algorithms(algs: &[String]) -> PyResult<Vec<JwsAlgorithm>> {
+    algs.iter()
+        .map(|alg| {
+            JwsAlgorithm::from_str(alg)
+                .map_err(|e| PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}")))
+        })
+        .collect()
+}
+
+/// Enforce the nonce policy shared by `verify_id_token` and
+/// `JwksCache.verify_id_token`.
+fn check_nonce_policy(
+    py: Python<'_>,
+    expected_nonce: Option<&str>,
+    unsafe_skip_nonce_check: bool,
+) -> PyResult<()> {
+    if expected_nonce.is_none() {
+        if !unsafe_skip_nonce_check {
+            return Err(AuthnError::new_err(
+                "expected_nonce is required; pass unsafe_skip_nonce_check=True only for flows \
+                 without a nonce",
+            ));
+        }
+        warn(
+            py,
+            "verify_id_token: nonce check skipped (unsafe_skip_nonce_check=True); the id_token \
+             is not bound to this authorization request",
+        );
+    }
+    Ok(())
+}
+
+/// Everything `grindvakt::rp::verify_id_token_with` needs besides the key set
+/// and the token itself.
+struct IdTokenPolicy {
+    algorithms: Vec<JwsAlgorithm>,
+    trusted_additional_audiences: Vec<String>,
+    leeway: Option<u64>,
+    max_age: Option<u64>,
+    acr_values: Option<Vec<String>>,
+    access_token: Option<String>,
+    require_at_hash: bool,
+    authorization_code: Option<String>,
+    require_c_hash: bool,
+}
+
+impl IdTokenPolicy {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        allowed_algorithms: &[String],
+        trusted_additional_audiences: Option<Vec<String>>,
+        leeway: Option<i64>,
+        max_age: Option<i64>,
+        acr_values: Option<Vec<String>>,
+        access_token: Option<String>,
+        require_at_hash: bool,
+        authorization_code: Option<String>,
+        require_c_hash: bool,
+    ) -> PyResult<Self> {
+        let policy = Self {
+            algorithms: parse_algorithms(allowed_algorithms)?,
+            trusted_additional_audiences: trusted_additional_audiences.unwrap_or_default(),
+            leeway: seconds("leeway", leeway)?,
+            max_age: seconds("max_age", max_age)?,
+            acr_values,
+            access_token,
+            require_at_hash,
+            authorization_code,
+            require_c_hash,
+        };
+        // Fail on configuration errors before any key-set fetch; upstream
+        // repeats these checks.
+        if policy.require_at_hash && policy.access_token.is_none() {
+            return Err(err(RsError::BadRequest(
+                "require_at_hash needs an access_token to check against".into(),
+            )));
+        }
+        if policy.require_c_hash && policy.authorization_code.is_none() {
+            return Err(err(RsError::BadRequest(
+                "require_c_hash needs an authorization_code to check against".into(),
+            )));
+        }
+        if policy.leeway.is_some_and(|l| l > grp::MAX_ID_TOKEN_LEEWAY) {
+            return Err(err(RsError::BadRequest(format!(
+                "id_token leeway must be at most {} seconds",
+                grp::MAX_ID_TOKEN_LEEWAY
+            ))));
+        }
+        if policy.acr_values.as_ref().is_some_and(Vec::is_empty) {
+            return Err(err(RsError::BadRequest(
+                "acr_values must not be empty when set".into(),
+            )));
+        }
+        Ok(policy)
+    }
+
+    fn verify(
+        &self,
+        py: Python<'_>,
+        jwks: &JwkSet,
+        id_token: &str,
+        issuer: &str,
+        client_id: &str,
+        expected_nonce: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let trusted = self
+            .trusted_additional_audiences
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let acr = self
+            .acr_values
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect::<Vec<_>>());
+        // `allow_unchecked_hashes` keeps `verify_id_token`'s historical
+        // behaviour: an at_hash / c_hash is checked when the matching value is
+        // given and ignored otherwise.
+        let mut options = grp::IdTokenOptions::new().allow_unchecked_hashes();
+        if let Some(v) = self.leeway {
+            options = options.with_leeway(v);
+        }
+        if let Some(v) = self.max_age {
+            options = options.with_max_age(v);
+        }
+        if let Some(v) = acr.as_deref() {
+            options = options.with_acr_values(v);
+        }
+        if let Some(v) = self.access_token.as_deref() {
+            options = options.with_access_token(v);
+        }
+        if self.require_at_hash {
+            options = options.with_required_at_hash();
+        }
+        if let Some(v) = self.authorization_code.as_deref() {
+            options = options.with_authorization_code(v);
+        }
+        if self.require_c_hash {
+            options = options.with_required_c_hash();
+        }
+        let claims = grp::verify_id_token_with(
+            jwks,
+            id_token,
+            issuer,
+            client_id,
+            expected_nonce,
+            &self.algorithms,
+            &trusted,
+            &options,
+        )
+        .map_err(err)?;
+        Ok(to_py(py, &claims)?.unbind())
+    }
+}
+
+/// Verify an `id_token` against the provider JWKS (a dict `{"keys": [...]}`
+/// or a `JwksCache`), `issuer`, audience `client_id`, and `expected_nonce`;
+/// `sub`, `exp`, and `iat` are required. The protected algorithm must be
+/// explicitly allowed; all other audiences must be explicitly trusted and
+/// multi-audience tokens must name this client in `azp`. Returns the validated
+/// claims as a dict.
 ///
 /// `expected_nonce` is the nonce this RP sent in the authorization request.
 /// Passing `None` is refused with `AuthnError` unless
@@ -792,8 +958,25 @@ fn exchange_code(
 /// SECURITY: only skip the nonce check for flows that genuinely carry no
 /// nonce (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
 /// it for the standard code flow allows id_token replay.
+///
+/// Optional extra checks (keyword-only, all off by default):
+///
+/// * `leeway`: clock-skew tolerance in seconds for `exp` / `nbf` / `iat` and
+///   the future-`auth_time` check (default 60; above 300 is `BadRequestError`).
+/// * `max_age`: requires a numeric `auth_time` claim no older than `max_age`
+///   seconds (`iat` is not used; a missing or non-numeric `auth_time` is an
+///   `AuthnError`; leeway is not added).
+/// * `acr_values`: the `acr` claim must be present and in this list.
+/// * `access_token` / `authorization_code`: validate `at_hash` / `c_hash`
+///   when the id_token carries one. `require_at_hash` / `require_c_hash`
+///   additionally reject tokens without the claim (they need the matching
+///   value, else `BadRequestError`). An `EdDSA` token carrying a hash claim
+///   cannot be checked (`CryptoError`).
 #[pyfunction]
-#[pyo3(signature = (jwks, id_token, issuer, client_id, expected_nonce, allowed_algorithms, trusted_additional_audiences = None, unsafe_skip_nonce_check = false))]
+#[pyo3(signature = (jwks, id_token, issuer, client_id, expected_nonce, allowed_algorithms,
+                    trusted_additional_audiences = None, unsafe_skip_nonce_check = false, *,
+                    leeway = None, max_age = None, acr_values = None, access_token = None,
+                    require_at_hash = false, authorization_code = None, require_c_hash = false))]
 // These arguments are deliberately explicit security-policy inputs in the
 // public Python API; hiding them in an options bag would make unsafe defaults
 // easier to overlook.
@@ -808,44 +991,370 @@ fn verify_id_token<'py>(
     allowed_algorithms: Vec<String>,
     trusted_additional_audiences: Option<Vec<String>>,
     unsafe_skip_nonce_check: bool,
+    leeway: Option<i64>,
+    max_age: Option<i64>,
+    acr_values: Option<Vec<String>>,
+    access_token: Option<String>,
+    require_at_hash: bool,
+    authorization_code: Option<String>,
+    require_c_hash: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if expected_nonce.is_none() {
-        if !unsafe_skip_nonce_check {
-            return Err(AuthnError::new_err(
-                "expected_nonce is required; pass unsafe_skip_nonce_check=True only for flows \
-                 without a nonce",
+    check_nonce_policy(py, expected_nonce, unsafe_skip_nonce_check)?;
+    let policy = IdTokenPolicy::new(
+        &allowed_algorithms,
+        trusted_additional_audiences,
+        leeway,
+        max_age,
+        acr_values,
+        access_token,
+        require_at_hash,
+        authorization_code,
+        require_c_hash,
+    );
+    let set = JwksSource::from_py(jwks)?;
+    let policy = policy?;
+    let set = set.resolve(py, id_token)?;
+    Ok(policy
+        .verify(py, &set, id_token, issuer, client_id, expected_nonce)?
+        .into_bound(py))
+}
+
+// ---------------------------------------------------------------------------
+// JwksCache
+// ---------------------------------------------------------------------------
+
+/// A JWKS argument: a literal key set or a `JwksCache`.
+enum JwksSource<'py> {
+    Set(Arc<JwkSet>),
+    Cache(Bound<'py, JwksCache>),
+}
+
+impl<'py> JwksSource<'py> {
+    fn from_py(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(cache) = obj.cast::<JwksCache>() {
+            return Ok(Self::Cache(cache.clone()));
+        }
+        Ok(Self::Set(Arc::new(jwks_from_py(obj)?)))
+    }
+
+    /// The key set to verify `token` against (for a cache: refreshed once if
+    /// the token's `kid` is unknown).
+    fn resolve(&self, py: Python<'py>, token: &str) -> PyResult<Arc<JwkSet>> {
+        match self {
+            Self::Set(set) => Ok(set.clone()),
+            Self::Cache(cache) => cache.get().resolve_for_token(py, token),
+        }
+    }
+}
+
+/// Monotonic seconds since first use; the default cache clock. Unaffected by
+/// wall-clock changes and valid across `fork`.
+fn monotonic_now() -> f64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+struct CacheEntry {
+    jwks: Arc<JwkSet>,
+    expires_at: f64,
+}
+
+#[derive(Default)]
+struct CacheState {
+    entry: Option<Arc<CacheEntry>>,
+    /// Clock reading of the latest fetch attempt (successful or not).
+    last_attempt: Option<f64>,
+}
+
+/// RAII token for the single in-flight fetch; see `JwksCache::begin_flight`.
+struct Flight<'a> {
+    cache: &'a JwksCache,
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.cache.flight.lock().unwrap_or_else(|e| e.into_inner());
+        *busy = false;
+        self.cache.flight_done.notify_one();
+    }
+}
+
+/// A caching JWK Set fetcher for one issuer.
+///
+/// Holds the key set fetched from `jwks_uri` and refetches it when it
+/// expires. The lifetime is the response's `Cache-Control: max-age` minus
+/// `Age` when present, else `default_ttl`, clamped to `[min_ttl, max_ttl]`
+/// (so `no-store` / `no-cache` / `max-age=0` still cache for `min_ttl`; set
+/// `min_ttl=0` to refetch every time). An expired set is never served: a
+/// failed refetch raises. Concurrent callers share a single fetch.
+///
+/// `verify_id_token` refreshes the set at most once when the token's `kid` is
+/// not in it (key rotation), but no more often than `min_refresh_interval`
+/// seconds after the previous fetch attempt; if the `kid` is still unknown it
+/// raises `UnknownKeyError`. The cache is plain in-process memory: it stays
+/// valid in a forked child, but fork only while no other thread is inside a
+/// cache call.
+///
+/// `_now` is a private test hook: a zero-argument callable returning the
+/// clock in seconds.
+#[pyclass(module = "pygrindvakt.rp", name = "JwksCache", frozen)]
+pub struct JwksCache {
+    http: Option<Py<PyAny>>,
+    jwks_uri: String,
+    issuer: String,
+    default_ttl: u64,
+    min_ttl: u64,
+    max_ttl: u64,
+    min_refresh_interval: u64,
+    clock: Option<Py<PyAny>>,
+    state: RwLock<CacheState>,
+    flight: Mutex<bool>,
+    flight_done: Condvar,
+}
+
+impl JwksCache {
+    fn now(&self) -> f64 {
+        match &self.clock {
+            Some(clock) => Python::attach(|py| clock.call0(py).and_then(|v| v.extract::<f64>(py)))
+                .unwrap_or_else(|_| monotonic_now()),
+            None => monotonic_now(),
+        }
+    }
+
+    fn snapshot(&self) -> Option<Arc<CacheEntry>> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry
+            .clone()
+    }
+
+    fn valid_entry(&self, now: f64) -> Option<Arc<CacheEntry>> {
+        self.snapshot().filter(|e| now < e.expires_at)
+    }
+
+    /// Wait (with the GIL released, because the holder needs the GIL to run a
+    /// Python HTTP adapter) until no other thread is fetching, then become the
+    /// fetching thread.
+    fn begin_flight(&self, py: Python<'_>) -> Flight<'_> {
+        py.detach(|| {
+            let mut busy = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+            while *busy {
+                busy = self
+                    .flight_done
+                    .wait(busy)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            *busy = true;
+        });
+        Flight { cache: self }
+    }
+
+    fn rate_limited(&self, now: f64) -> bool {
+        let last = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_attempt;
+        last.is_some_and(|t| now - t < self.min_refresh_interval as f64)
+    }
+
+    /// Fetch and store the key set. The caller holds the flight.
+    fn fetch(&self, py: Python<'_>) -> PyResult<Arc<CacheEntry>> {
+        let attempt = self.now();
+        self.state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_attempt = Some(attempt);
+        // A fresh client (and `Failures` slot) per fetch, so a transport
+        // error is chained to this call's failure only.
+        let (http, failures) = extract_http_client(self.http.as_ref().map(|h| h.bind(py)))?;
+        let (uri, issuer) = (self.jwks_uri.clone(), self.issuer.clone());
+        let r = crate::runtime::block_on(py, async move {
+            grp::fetch_jwks_response(&http, &uri, &issuer).await
+        })?;
+        let resp = r.map_err(|e| failures.err(py, e))?;
+        let ttl = resp
+            .cache_ttl_secs()
+            .unwrap_or(self.default_ttl)
+            .clamp(self.min_ttl, self.max_ttl);
+        let entry = Arc::new(CacheEntry {
+            jwks: Arc::new(resp.jwks),
+            expires_at: self.now() + ttl as f64,
+        });
+        self.state.write().unwrap_or_else(|e| e.into_inner()).entry = Some(entry.clone());
+        Ok(entry)
+    }
+
+    /// The current key set, fetching it first if there is none or it expired.
+    fn ensure(&self, py: Python<'_>) -> PyResult<Arc<CacheEntry>> {
+        if let Some(e) = self.valid_entry(self.now()) {
+            return Ok(e);
+        }
+        let _flight = self.begin_flight(py);
+        // Another thread may have fetched while we waited.
+        if let Some(e) = self.valid_entry(self.now()) {
+            return Ok(e);
+        }
+        self.fetch(py)
+    }
+
+    fn resolve_for_token(&self, py: Python<'_>, token: &str) -> PyResult<Arc<JwkSet>> {
+        let entry = self.ensure(py)?;
+        // An unreadable header is left to the verifier's own error.
+        let Some(kid) = gj::peek_header(token).ok().and_then(|h| h.kid) else {
+            return Ok(entry.jwks.clone());
+        };
+        if !kid_unknown(&entry.jwks, &kid) {
+            return Ok(entry.jwks.clone());
+        }
+        let _flight = self.begin_flight(py);
+        let entry = match self.snapshot() {
+            // Another thread refreshed while we waited.
+            Some(current) if !Arc::ptr_eq(&current, &entry) => current,
+            _ if self.rate_limited(self.now()) => entry,
+            _ => self.fetch(py)?,
+        };
+        if kid_unknown(&entry.jwks, &kid) {
+            return Err(UnknownKeyError::new_err(
+                "token kid does not name a key in the issuer's JWK Set (refresh may have been skipped by the minimum refresh interval)",
             ));
         }
-        warn(
-            py,
-            "verify_id_token: nonce check skipped (unsafe_skip_nonce_check=True); the id_token \
-             is not bound to this authorization request",
-        );
+        Ok(entry.jwks.clone())
     }
-    let jwks = jwks_from_py(jwks)?;
-    let allowed_algorithms = allowed_algorithms
-        .iter()
-        .map(|alg| {
-            JwsAlgorithm::from_str(alg)
-                .map_err(|e| PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}")))
+}
+
+/// The set has keys with a `kid` and none of them is `kid`.
+fn kid_unknown(jwks: &JwkSet, kid: &str) -> bool {
+    jwks.keys.iter().any(|k| k.kid.is_some())
+        && !jwks.keys.iter().any(|k| k.kid.as_deref() == Some(kid))
+}
+
+#[pymethods]
+impl JwksCache {
+    #[new]
+    #[pyo3(signature = (http, jwks_uri, issuer, *, default_ttl = 3600, min_ttl = 60,
+                        max_ttl = 86400, min_refresh_interval = 30, _now = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        http: Option<&Bound<'_, PyAny>>,
+        jwks_uri: String,
+        issuer: String,
+        default_ttl: i64,
+        min_ttl: i64,
+        max_ttl: i64,
+        min_refresh_interval: i64,
+        _now: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        // Validate the client and the URLs now rather than on first use.
+        extract_http_client(http)?;
+        grp::validate_issuer(&issuer).map_err(err)?;
+        grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer).map_err(err)?;
+        let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
+        let (default_ttl, min_ttl, max_ttl) = (
+            get("default_ttl", default_ttl)?,
+            get("min_ttl", min_ttl)?,
+            get("max_ttl", max_ttl)?,
+        );
+        if min_ttl > max_ttl {
+            return Err(PyValueError::new_err("min_ttl must not exceed max_ttl"));
+        }
+        Ok(Self {
+            http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
+            jwks_uri,
+            issuer,
+            default_ttl,
+            min_ttl,
+            max_ttl,
+            min_refresh_interval: get("min_refresh_interval", min_refresh_interval)?,
+            clock: _now,
+            state: RwLock::default(),
+            flight: Mutex::new(false),
+            flight_done: Condvar::new(),
         })
-        .collect::<PyResult<Vec<_>>>()?;
-    let trusted_additional_audiences = trusted_additional_audiences.unwrap_or_default();
-    let trusted_refs = trusted_additional_audiences
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let claims = grp::verify_id_token(
-        &jwks,
-        id_token,
-        issuer,
-        client_id,
-        expected_nonce,
-        &allowed_algorithms,
-        &trusted_refs,
-    )
-    .map_err(err)?;
-    to_py(py, &claims)
+    }
+
+    #[getter]
+    fn jwks_uri(&self) -> &str {
+        &self.jwks_uri
+    }
+
+    #[getter]
+    fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "JwksCache(jwks_uri={:?}, issuer={:?})",
+            self.jwks_uri, self.issuer
+        )
+    }
+
+    /// The cached key set as a dict (`{"keys": [...]}`), fetching it first if
+    /// none is cached or it expired. Raises if that fetch fails; an expired
+    /// set is never returned.
+    fn jwks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let entry = self.ensure(py)?;
+        to_py(py, &*entry.jwks)
+    }
+
+    /// Force a refetch. The first fetch always happens; afterwards a call
+    /// within `min_refresh_interval` seconds of the previous fetch attempt is
+    /// a silent no-op. A failed fetch raises and keeps the cached set.
+    fn refresh(&self, py: Python<'_>) -> PyResult<()> {
+        let _flight = self.begin_flight(py);
+        if self.snapshot().is_some() && self.rate_limited(self.now()) {
+            return Ok(());
+        }
+        self.fetch(py).map(|_| ())
+    }
+
+    /// `rp.verify_id_token` against this cache's key set for `issuer`; same
+    /// keyword options. If the token's `kid` is not in the (non-empty-kid)
+    /// set, the set is refreshed once (rate-limited) and a still-unknown
+    /// `kid` raises `UnknownKeyError`. Tokens without `kid` follow
+    /// `verify_id_token`.
+    #[pyo3(signature = (id_token, client_id, expected_nonce, allowed_algorithms, *,
+                        trusted_additional_audiences = None, unsafe_skip_nonce_check = false,
+                        leeway = None, max_age = None, acr_values = None, access_token = None,
+                        require_at_hash = false, authorization_code = None,
+                        require_c_hash = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_id_token<'py>(
+        &self,
+        py: Python<'py>,
+        id_token: &str,
+        client_id: &str,
+        expected_nonce: Option<&str>,
+        allowed_algorithms: Vec<String>,
+        trusted_additional_audiences: Option<Vec<String>>,
+        unsafe_skip_nonce_check: bool,
+        leeway: Option<i64>,
+        max_age: Option<i64>,
+        acr_values: Option<Vec<String>>,
+        access_token: Option<String>,
+        require_at_hash: bool,
+        authorization_code: Option<String>,
+        require_c_hash: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        check_nonce_policy(py, expected_nonce, unsafe_skip_nonce_check)?;
+        let policy = IdTokenPolicy::new(
+            &allowed_algorithms,
+            trusted_additional_audiences,
+            leeway,
+            max_age,
+            acr_values,
+            access_token,
+            require_at_hash,
+            authorization_code,
+            require_c_hash,
+        )?;
+        let set = self.resolve_for_token(py, id_token)?;
+        Ok(policy
+            .verify(py, &set, id_token, &self.issuer, client_id, expected_nonce)?
+            .into_bound(py))
+    }
 }
 
 /// Fetch the UserInfo document with a Bearer `access_token` and return its
@@ -911,7 +1420,7 @@ fn fetch_userinfo<'py>(
             "typ is only used with trust=\"typed\"",
         ));
     }
-    let jwks = jwks.map(jwks_from_py).transpose()?;
+    let jwks = jwks.map(JwksSource::from_py).transpose()?;
     let algs = allowed_algorithms
         .map(|algs| {
             algs.iter()
@@ -989,8 +1498,10 @@ fn fetch_userinfo<'py>(
         if require_exp {
             options = options.with_require_exp();
         }
+        // A cache refreshes once if the response's `kid` is unknown.
+        let jwks = jwks.resolve(py, resp.text().trim())?;
         grp::userinfo_signed_claims(
-            jwks,
+            &jwks,
             &resp,
             &issuer,
             &client_id,
@@ -1026,6 +1537,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ProviderInfo>()?;
     m.add_class::<RpClient>()?;
     m.add_class::<TokenSet>()?;
+    m.add_class::<JwksCache>()?;
     m.add_function(wrap_pyfunction!(authorization_url, &m)?)?;
     m.add_function(wrap_pyfunction!(signed_request_object, &m)?)?;
     m.add_function(wrap_pyfunction!(begin, &m)?)?;

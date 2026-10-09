@@ -130,7 +130,7 @@ def exchange_code(
     redirect_uri: str | None = ...,
 ) -> TokenSet: ...
 def verify_id_token(
-    jwks: dict[str, Any],
+    jwks: dict[str, Any] | JwksCache,
     id_token: str,
     issuer: str,
     client_id: str,
@@ -138,7 +138,89 @@ def verify_id_token(
     allowed_algorithms: list[str],
     trusted_additional_audiences: list[str] | None = ...,
     unsafe_skip_nonce_check: bool = ...,
-) -> dict[str, Any]: ...
+    *,
+    leeway: int | None = ...,
+    max_age: int | None = ...,
+    acr_values: list[str] | None = ...,
+    access_token: str | None = ...,
+    require_at_hash: bool = ...,
+    authorization_code: str | None = ...,
+    require_c_hash: bool = ...,
+) -> dict[str, Any]:
+    """Verify an id_token and return its claims.
+
+    ``jwks`` is a key-set dict or a :class:`JwksCache`. Optional checks, all
+    off by default:
+
+    * ``leeway``: clock-skew tolerance in seconds (default 60; above 300 raises
+      ``BadRequestError``).
+    * ``max_age``: needs a numeric ``auth_time`` no older than ``max_age``
+      seconds (``iat`` is not used; a missing or non-numeric ``auth_time`` is
+      an ``AuthnError``; leeway is not added).
+    * ``acr_values``: ``acr`` must be present and listed.
+    * ``access_token`` / ``authorization_code``: check ``at_hash`` / ``c_hash``
+      when present; ``require_at_hash`` / ``require_c_hash`` also reject
+      tokens lacking the claim (and need the matching value, else
+      ``BadRequestError``). ``EdDSA`` tokens carrying a hash claim cannot be
+      checked (``CryptoError``).
+    """
+
+class JwksCache:
+    """Caching JWK Set fetcher for one issuer, with kid-rotation refresh.
+
+    The set is refetched on expiry: ``Cache-Control: max-age`` minus ``Age``
+    when present, else ``default_ttl``, clamped to ``[min_ttl, max_ttl]``
+    (``no-store`` / ``no-cache`` / ``max-age=0`` therefore still cache for
+    ``min_ttl``; use ``min_ttl=0`` to always refetch). An expired set is never
+    served: a failed refetch raises. Concurrent callers share one fetch.
+    The cache is in-process memory; it stays valid after ``fork``.
+    """
+
+    def __init__(
+        self,
+        http: _HttpArg,
+        jwks_uri: str,
+        issuer: str,
+        *,
+        default_ttl: int = 3600,
+        min_ttl: int = 60,
+        max_ttl: int = 86400,
+        min_refresh_interval: int = 30,
+    ) -> None: ...
+    @property
+    def jwks_uri(self) -> str: ...
+    @property
+    def issuer(self) -> str: ...
+    def jwks(self) -> dict[str, Any]:
+        """The cached key set, fetched first if absent or expired."""
+    def refresh(self) -> None:
+        """Force a refetch; a no-op within ``min_refresh_interval`` seconds of
+        the previous attempt, except for the very first fetch."""
+    def verify_id_token(
+        self,
+        id_token: str,
+        client_id: str,
+        expected_nonce: str | None,
+        allowed_algorithms: list[str],
+        *,
+        trusted_additional_audiences: list[str] | None = ...,
+        unsafe_skip_nonce_check: bool = ...,
+        leeway: int | None = ...,
+        max_age: int | None = ...,
+        acr_values: list[str] | None = ...,
+        access_token: str | None = ...,
+        require_at_hash: bool = ...,
+        authorization_code: str | None = ...,
+        require_c_hash: bool = ...,
+    ) -> dict[str, Any]:
+        """:func:`verify_id_token` against this cache's keys and issuer.
+
+        If the token's ``kid`` is missing from a set whose keys have ``kid``s,
+        the set is refreshed once (rate-limited by ``min_refresh_interval``)
+        and a still-unknown ``kid`` raises ``UnknownKeyError``.
+        """
+    def __repr__(self) -> str: ...
+
 @overload
 def fetch_userinfo(
     http: _HttpArg,
@@ -148,7 +230,7 @@ def fetch_userinfo(
     issuer: str,
     *,
     method: Literal["POST"] = ...,
-    jwks: dict[str, Any] | None = ...,
+    jwks: dict[str, Any] | JwksCache | None = ...,
     client_id: str | None = ...,
     allowed_algorithms: list[str] | None = ...,
     trust: Literal["typed", "dedicated_keys", "untyped_shared_key_compat"] | None = ...,
@@ -183,7 +265,7 @@ def fetch_userinfo(
     issuer: str,
     *,
     method: Literal["GET"],
-    jwks: dict[str, Any] | None = ...,
+    jwks: dict[str, Any] | JwksCache | None = ...,
     client_id: str | None = ...,
     allowed_algorithms: list[str] | None = ...,
     trust: Literal["typed", "dedicated_keys", "untyped_shared_key_compat"] | None = ...,

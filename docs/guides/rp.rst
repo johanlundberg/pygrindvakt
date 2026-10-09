@@ -27,9 +27,9 @@ wrong place cannot redirect you to someone else's endpoints.
    md = rp.discover(http_client, "https://op.example.com")
    info = rp.ProviderInfo.from_metadata(md)
 
-Discovery is one HTTP round trip; cache ``info`` (and the JWKS, below) for
-the process lifetime and refresh on a timer or when verification fails with
-an unknown ``kid``. For a statically configured OP, build the
+Discovery is one HTTP round trip; keep ``info`` for the process lifetime and
+refresh it on a timer. The provider's signing keys are cached by a
+:class:`~pygrindvakt.rp.JwksCache` (see below). For a statically configured OP, build the
 :class:`~pygrindvakt.rp.ProviderInfo` by hand instead:
 
 .. code-block:: python
@@ -118,13 +118,16 @@ The callback: exchange and verify
 ---------------------------------
 
 On the callback, check ``state`` first and pop the session entry so it can be
-used only once. Then exchange the code with the stored verifier, fetch the
-JWKS and verify the id_token against the issuer, your ``client_id`` and the
-stored nonce.
+used only once. Then exchange the code with the stored verifier and verify the
+id_token against the issuer, your ``client_id`` and the stored nonce, using the
+process-wide :class:`~pygrindvakt.rp.JwksCache`.
 
 .. code-block:: python
 
    from pygrindvakt import AuthnError, GrindvaktError
+
+   # Created once at startup, next to `info`; thread-safe, shared by all requests.
+   jwks_cache = rp.JwksCache(http_client, info.jwks_uri, info.issuer)
 
    @app.get("/callback")
    def callback():
@@ -136,9 +139,8 @@ stored nonce.
            return render_template("login_failed.html")
        try:
            ts = rp.exchange_code(http_client, info, me, request.args["code"], code_verifier=pending["verifier"])
-           jwks = rp.fetch_jwks(http_client, info.jwks_uri, info.issuer)
            claims = rp.verify_id_token(
-               jwks, ts.id_token, info.issuer, me.client_id,
+               jwks_cache, ts.id_token, info.issuer, me.client_id,
                pending["nonce"], ["ES256"],
            )
        except GrindvaktError:
@@ -166,6 +168,46 @@ log them verbatim or show them to the user.
    for flows that genuinely carry no nonce (a pure OAuth 2.0 flow whose
    token response happens to include an id_token). A nonce that *is* given
    is always enforced, flag or not.
+
+Key caching and rotation
+------------------------
+
+Do not call :func:`~pygrindvakt.rp.fetch_jwks` per login: it costs a request
+each time and gives no rotation handling. A
+:class:`~pygrindvakt.rp.JwksCache` fetches the set on first use, reuses it for
+the lifetime the OP advertises (``Cache-Control: max-age``, bounded by
+``min_ttl`` / ``max_ttl``, else ``default_ttl``), and shares one fetch between
+concurrent requests. When an id_token names a ``kid`` it does not have, it
+refetches once (at most every ``min_refresh_interval`` seconds, so garbage
+``kid`` values cannot flood the OP) and either verifies with the rotated key
+or raises :class:`~pygrindvakt.UnknownKeyError`. It never serves an expired
+set: if the OP is unreachable when the set expires, verification fails with an
+:class:`~pygrindvakt.InternalError` (``code == "transport"``) instead of
+trusting possibly revoked keys.
+
+.. code-block:: python
+
+   from pygrindvakt import UnknownKeyError
+
+   try:
+       claims = jwks_cache.verify_id_token(ts.id_token, me.client_id, nonce, ["ES256"])
+   except UnknownKeyError:
+       ...  # token signed by a key the issuer does not publish: reject
+
+``rp.verify_id_token(jwks_cache, id_token, issuer, ...)`` is equivalent, and
+the cache is accepted as ``jwks=`` by :func:`~pygrindvakt.rp.fetch_userinfo`
+for signed UserInfo responses. Extra checks are keyword options on both:
+``max_age`` (against ``auth_time``), ``acr_values``, ``access_token`` /
+``require_at_hash``, ``authorization_code`` / ``require_c_hash``, ``leeway``
+(see :func:`~pygrindvakt.rp.verify_id_token`).
+
+.. code-block:: python
+
+   claims = jwks_cache.verify_id_token(
+       ts.id_token, me.client_id, nonce, ["ES256"],
+       max_age=300, acr_values=["urn:mfa"],
+       access_token=ts.access_token, require_at_hash=True,
+   )
 
 Userinfo
 --------

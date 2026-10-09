@@ -22,6 +22,7 @@ The hierarchy mirrors grindvakt's ``Error`` and ``DpopError`` enums:
    ├── CryptoError                      500
    ├── AttributeMappingError            500
    ├── JoseError                        500
+   │   └── UnknownKeyError              401
    ├── JsonError                        500
    ├── InternalError                    500
    ├── NoBoundEndpointError             404
@@ -119,6 +120,8 @@ Error codes
      - ``attribute``
    * - ``JoseError``
      - ``jose``
+   * - ``UnknownKeyError``
+     - ``unknown_kid``
    * - ``JsonError``
      - ``json``
    * - ``NoBoundEndpointError``
@@ -227,6 +230,18 @@ One subclass per ``grindvakt::Error`` variant.
 
    JOSE (JWS / JWE / JWK) error (``status_hint`` 500): a malformed JWK, a JWKS
    that does not deserialize, a JWK generation failure.
+
+.. py:exception:: UnknownKeyError
+
+   Subclass of :class:`JoseError` (``status_hint`` 401, ``code``
+   ``unknown_kid``). Raised by :class:`pygrindvakt.rp.JwksCache` (and by
+   :func:`pygrindvakt.rp.verify_id_token` / :func:`pygrindvakt.rp.fetch_userinfo`
+   given a cache) when a token's ``kid`` names no key in the issuer's JWK Set
+   even after the one rate-limited refresh. It is raised before the signature
+   is checked and is the "reject, do not retry" signal for key-rotation
+   handling. Because it derives from :class:`JoseError`, not
+   :class:`AuthnError`, catch it explicitly if you treat both as a failed
+   login.
 
 .. py:exception:: JsonError
 

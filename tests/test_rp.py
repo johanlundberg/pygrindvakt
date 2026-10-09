@@ -19,6 +19,7 @@ from pygrindvakt import (
     AuthnError,
     BadRequestError,
     ConfigError,
+    CryptoError,
     GrindvaktError,
     InternalError,
     OAuthError,
@@ -1187,3 +1188,146 @@ def test_end_session_url_rejects_reserved_extras_and_empty(lprov):
     p = rp.ProviderInfo(ISSUER, f"{ISSUER}/a", f"{ISSUER}/token", end_session_endpoint=f"{ISSUER}/logout?state=x")
     with pytest.raises(BadRequestError, match="library-controlled"):
         rp.end_session_url(p)
+
+
+# --- verify_id_token options ----------------------------------------------------
+
+
+def _half_hash(value: str, algo: str = "sha256") -> str:
+    import base64
+    import hashlib
+
+    digest = hashlib.new(algo, value.encode()).digest()
+    return base64.urlsafe_b64encode(digest[: len(digest) // 2]).rstrip(b"=").decode()
+
+
+def _co(**extra):
+    now = int(time.time())
+    return {"iss": ISSUER, "sub": "alice", "aud": CLIENT_ID, "iat": now, "exp": now + 300,
+            "nonce": "n", **extra}
+
+
+def _vo(op_key, claims, *args, **kw):
+    token = jwt.sign(op_key, claims)
+    return rp.verify_id_token(op_key.to_public_jwks(), token, ISSUER, CLIENT_ID, "n", ["ES256"],
+                              *args, **kw)
+
+
+def test_verify_options_default_behaviour_unchanged(op_key):
+    """at_hash / c_hash without values to check stay ignored, as before."""
+    claims = _co(at_hash="x", c_hash="y", auth_time=1, acr="whatever")
+    assert _vo(op_key, claims)["sub"] == "alice"
+
+
+def test_verify_leeway_makes_expired_token_pass(op_key):
+    now = int(time.time())
+    expired = _co(iat=now - 400, exp=now - 100)
+    with pytest.raises(GrindvaktError):
+        _vo(op_key, expired)  # default leeway is 60s
+    with pytest.raises(GrindvaktError):
+        _vo(op_key, expired, leeway=30)
+    assert _vo(op_key, expired, leeway=200)["sub"] == "alice"
+
+
+def test_verify_leeway_above_300_rejected(op_key):
+    assert _vo(op_key, _co(), leeway=300)["sub"] == "alice"
+    with pytest.raises(BadRequestError, match="leeway"):
+        _vo(op_key, _co(), leeway=301)
+    with pytest.raises(ValueError, match="negative"):
+        _vo(op_key, _co(), leeway=-1)
+
+
+def test_verify_max_age_uses_auth_time(op_key):
+    now = int(time.time())
+    assert _vo(op_key, _co(auth_time=now - 10), max_age=60)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="older than max_age"):
+        _vo(op_key, _co(auth_time=now - 120), max_age=60)
+    # iat is fresh but irrelevant: auth_time decides.
+    with pytest.raises(AuthnError, match="older than max_age"):
+        _vo(op_key, _co(iat=now, auth_time=now - 1000), max_age=60)
+    # Float auth_time is accepted; future auth_time beyond leeway is not.
+    assert _vo(op_key, _co(auth_time=float(now - 5)), max_age=60)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="future"):
+        _vo(op_key, _co(auth_time=now + 3600), max_age=60)
+
+
+def test_verify_max_age_requires_auth_time(op_key):
+    with pytest.raises(AuthnError, match="auth_time"):
+        _vo(op_key, _co(), max_age=60)
+    with pytest.raises(AuthnError, match="auth_time"):
+        _vo(op_key, _co(auth_time="soon"), max_age=60)
+    with pytest.raises(ValueError, match="negative"):
+        _vo(op_key, _co(auth_time=1), max_age=-5)
+
+
+def test_verify_acr_allow_list(op_key):
+    assert _vo(op_key, _co(acr="mfa"), acr_values=["pwd", "mfa"])["acr"] == "mfa"
+    with pytest.raises(AuthnError, match="acr"):
+        _vo(op_key, _co(acr="pwd"), acr_values=["mfa"])
+    with pytest.raises(AuthnError, match="acr"):
+        _vo(op_key, _co(), acr_values=["mfa"])
+    with pytest.raises(BadRequestError, match="acr_values"):
+        _vo(op_key, _co(acr="mfa"), acr_values=[])
+
+
+def test_verify_at_hash(op_key):
+    at = "the-access-token"
+    claims = _co(at_hash=_half_hash(at))
+    assert _vo(op_key, claims, access_token=at)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="at_hash mismatch"):
+        _vo(op_key, claims, access_token="another-token")
+    # Present but not checkable by default is still accepted (historic behaviour).
+    assert _vo(op_key, claims)["sub"] == "alice"
+
+
+def test_verify_require_at_hash(op_key):
+    at = "the-access-token"
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        _vo(op_key, _co(), access_token=at, require_at_hash=True)
+    # Without the claim and without the requirement the token is not bound.
+    assert _vo(op_key, _co(), access_token=at)["sub"] == "alice"
+    assert _vo(op_key, _co(at_hash=_half_hash(at)), access_token=at,
+                   require_at_hash=True)["sub"] == "alice"
+
+
+def test_verify_require_at_hash_without_access_token_is_bad_request(op_key):
+    with pytest.raises(BadRequestError, match="require_at_hash"):
+        _vo(op_key, _co(at_hash="x"), require_at_hash=True)
+    with pytest.raises(BadRequestError, match="require_c_hash"):
+        _vo(op_key, _co(c_hash="x"), require_c_hash=True)
+
+
+def test_verify_c_hash(op_key):
+    code = "the-auth-code"
+    claims = _co(c_hash=_half_hash(code))
+    assert _vo(op_key, claims, authorization_code=code)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="c_hash mismatch"):
+        _vo(op_key, claims, authorization_code="other-code")
+    with pytest.raises(AuthnError, match="missing c_hash"):
+        _vo(op_key, _co(), authorization_code=code, require_c_hash=True)
+    assert _vo(op_key, claims, authorization_code=code, require_c_hash=True)["sub"] == "alice"
+
+
+def test_verify_hash_with_eddsa(op_key):
+    """EdDSA has no OIDC hash function: a hash claim cannot be checked."""
+    ed = keys.signing_key_from_jwk(keys.generate_ed25519_jwk(), alg="EdDSA", kid="ed-1")
+    jwks = ed.to_public_jwks()
+
+    def verify(claims, **kw):
+        return rp.verify_id_token(jwks, jwt.sign(ed, claims), ISSUER, CLIENT_ID, "n", ["EdDSA"], **kw)
+
+    # No hash claim in the token: access_token alone is harmless...
+    assert verify(_co(), access_token="at")["sub"] == "alice"
+    # ...but requiring it is impossible to satisfy.
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        verify(_co(), access_token="at", require_at_hash=True)
+    # A hash claim present with a supplied value cannot be checked.
+    with pytest.raises(CryptoError, match="token-hash"):
+        verify(_co(at_hash="x"), access_token="at")
+
+
+def test_verify_trusted_additional_audience_keyword(op_key):
+    multi = _co(aud=[CLIENT_ID, "https://api.example"], azp=CLIENT_ID)
+    with pytest.raises(AuthnError, match="untrusted audience"):
+        _vo(op_key, multi)
+    assert _vo(op_key, multi, trusted_additional_audiences=["https://api.example"])["sub"] == "alice"

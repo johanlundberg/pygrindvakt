@@ -31,12 +31,14 @@ def test_exception_hierarchy():
     """All errors derive from GrindvaktError; DPoP errors form their own subtree."""
     E = pygrindvakt
     for cls in (E.BadRequestError, E.AuthnError, E.StateError, E.ConfigError, E.CryptoError,
-                E.AttributeMappingError, E.JoseError, E.JsonError, E.InternalError,
+                E.AttributeMappingError, E.JoseError, E.UnknownKeyError, E.JsonError, E.InternalError,
                 E.NoBoundEndpointError, E.UnknownModuleError, E.DpopError, OAuthError):
         assert issubclass(cls, E.GrindvaktError), cls
     for cls in (E.DpopInvalidError, E.DpopReplayError, E.DpopNonceRequiredError, E.DpopServerError):
         assert issubclass(cls, E.DpopError), cls
+    assert issubclass(E.UnknownKeyError, E.JoseError)
     assert E.AuthnError.status_hint == 401
+    assert E.UnknownKeyError.status_hint == 401
     assert E.NoBoundEndpointError.status_hint == 404
     assert E.BadRequestError.status_hint == 400
     assert E.GrindvaktError.status_hint == 500

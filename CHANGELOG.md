@@ -11,6 +11,19 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Added
 
+- `rp.JwksCache(http, jwks_uri, issuer, *, default_ttl=3600, min_ttl=60,
+  max_ttl=86400, min_refresh_interval=30)`: thread-safe, single-flight JWK Set
+  cache honouring `Cache-Control: max-age` minus `Age` (clamped; `no-store` /
+  `no-cache` are floored by `min_ttl`), never serving an expired set, with
+  `jwks()`, `refresh()` and `verify_id_token(...)`. An unknown `kid` triggers
+  one rate-limited refresh, then `UnknownKeyError`. A cache is accepted as
+  `jwks=` by `rp.verify_id_token` and `rp.fetch_userinfo`. A Python
+  `HttpClient` cannot report response headers, so it always gets `default_ttl`.
+- `UnknownKeyError(JoseError)`, `code == "unknown_kid"`, `status_hint` 401.
+- `rp.verify_id_token` keyword-only options `leeway` (<= 300), `max_age`
+  (checked against `auth_time`, which must be present), `acr_values`,
+  `access_token` / `require_at_hash`, `authorization_code` / `require_c_hash`.
+  Calls without them behave as before.
 - RP-Initiated Logout (OIDC 1.0): `rp.end_session_url(provider, *, id_token_hint,
   client, post_logout_redirect_uri, state, logout_hint, ui_locales, extra)`;
   `ProviderInfo(..., *, end_session_endpoint=None)` and a read-only

@@ -107,6 +107,39 @@ def use_all() -> None:
     dumped: dict[str, object] = md.to_dict(exclude_defaults=True)
     del logout, es, acr, flag, rev, raw, dumped
     rp.fetch_jwks(fetch, "https://op.example.com/jwks", "https://op.example.com")
+    cache = rp.JwksCache(
+        reqwest,
+        "https://op.example.com/jwks",
+        "https://op.example.com",
+        default_ttl=600,
+        min_ttl=30,
+        max_ttl=3600,
+        min_refresh_interval=10,
+    )
+    rp.JwksCache(None, "https://op.example.com/jwks", "https://op.example.com")
+    keyset: dict[str, object] = cache.jwks()
+    cache.refresh()
+    cached_claims: dict[str, object] = cache.verify_id_token(
+        "tok",
+        "demo",
+        "n",
+        ["ES256"],
+        leeway=30,
+        max_age=300,
+        acr_values=["mfa"],
+        access_token="at",
+        require_at_hash=True,
+        authorization_code="c",
+        require_c_hash=False,
+        trusted_additional_audiences=["https://api.example"],
+    )
+    direct: dict[str, object] = rp.verify_id_token(
+        cache, "tok", "https://op.example.com", "demo", "n", ["ES256"], max_age=60
+    )
+    rp.verify_id_token(
+        keyset, "tok", "https://op.example.com", "demo", "n", ["ES256"], leeway=5
+    )
+    del keyset, cached_claims, direct
     rp.fetch_userinfo(
         reqwest, "https://op.example.com/ui", "tok", "sub", "https://op.example.com"
     )
@@ -164,6 +197,14 @@ def use_all() -> None:
 
 
 def use_errors() -> None:
+    try:
+        rp.JwksCache(None, "https://x/jwks", "https://x").verify_id_token(
+            "t", "c", "n", ["ES256"]
+        )
+    except pygrindvakt.UnknownKeyError as ke:
+        jose: pygrindvakt.JoseError = ke
+        print(jose.code, ke.status_hint)
+
     try:
         rp.exchange_code(
             None,

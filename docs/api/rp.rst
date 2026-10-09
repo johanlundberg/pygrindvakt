@@ -209,8 +209,85 @@ Discovery and keys
    Fetch a JWKS document from ``jwks_uri`` for its associated ``issuer``
    and return it as a dict (``{"keys": [...]}``), ready for
    :func:`verify_id_token`. The issuer is mandatory so remote metadata cannot
-   inherit the loopback HTTP development exception. Cache the result and
-   refetch when an id_token arrives with an unknown ``kid``.
+   inherit the loopback HTTP development exception. This is a single
+   uncached fetch; use :class:`JwksCache` to cache the key set and handle key
+   rotation.
+
+.. py:class:: JwksCache(http: HttpClientProtocol | None, jwks_uri: str, issuer: str, *, default_ttl: int = 3600, min_ttl: int = 60, max_ttl: int = 86400, min_refresh_interval: int = 30)
+
+   A thread-safe cache of one issuer's JWK Set (frozen; read-only
+   ``jwks_uri`` and ``issuer`` properties). ``jwks_uri`` and ``issuer`` are
+   validated at construction exactly as :func:`fetch_jwks` does, and so is
+   ``http``; no request is made until first use. Pass the cache wherever a
+   ``jwks`` dict is accepted: :func:`verify_id_token` and, for signed
+   responses, :func:`fetch_userinfo`.
+
+   **Lifetime.** The set lives for the response's ``Cache-Control: max-age``
+   minus its ``Age`` header when present, otherwise ``default_ttl`` seconds,
+   clamped to ``[min_ttl, max_ttl]``. ``no-store``, ``no-cache`` and
+   ``max-age=0`` (and an ``Age`` that exhausts ``max-age``) give a lifetime of
+   0, which ``min_ttl`` then raises: with the default ``min_ttl=60`` such a
+   response is still reused for 60 seconds, protecting the OP from a refetch
+   on every request. Pass ``min_ttl=0`` to honour those directives literally
+   (every use refetches). ``min_ttl`` must not exceed ``max_ttl``; negative
+   values raise ``ValueError``.
+
+   .. note::
+
+      A Python :class:`~pygrindvakt.http.HttpClientProtocol` returns no
+      response headers, so with such a client the lifetime is always
+      ``default_ttl`` (clamped). The built-in
+      :class:`~pygrindvakt.http.ReqwestClient` (or ``None``) reports
+      ``Cache-Control`` and ``Age``.
+
+   **Never stale.** An expired set is not served. If the refetch fails,
+   :meth:`jwks` and the verification methods raise the fetch error (transport
+   failures as :class:`pygrindvakt.InternalError` with ``code == "transport"``
+   and the original exception as ``__cause__``; non-200 answers with
+   ``upstream_status`` and ``code == "upstream_http"``). Failed fetches are
+   not cached, so the next call tries again; a failure while refreshing for an
+   unknown ``kid`` keeps the still-valid cached set.
+
+   **Concurrency.** Callers share one in-flight fetch: sixteen threads that
+   find the cache empty or expired cause a single request, and the others wait
+   (with the GIL released) and reuse its result. The GIL is released during
+   the fetch. Do not call a cache from inside its own HTTP client.
+
+   **Fork.** The cache is plain in-process memory, so a forked child keeps
+   the cached set and its expiry (the clock is monotonic). As with the rest of
+   the library, fork only while no other thread is inside a call.
+
+   .. py:method:: jwks() -> dict[str, Any]
+
+      The key set as a new dict, fetched first if none is cached or it has
+      expired.
+
+   .. py:method:: refresh() -> None
+
+      Force a refetch. The very first fetch always goes through; after that a
+      call within ``min_refresh_interval`` seconds of the previous fetch
+      attempt (successful or not) returns without fetching. A failing fetch
+      raises and leaves the cached set in place.
+
+   .. py:method:: verify_id_token(id_token: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], *, trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False, leeway: int | None = None, max_age: int | None = None, acr_values: list[str] | None = None, access_token: str | None = None, require_at_hash: bool = False, authorization_code: str | None = None, require_c_hash: bool = False) -> dict[str, Any]
+
+      :func:`verify_id_token` against this cache's key set, with the cache's
+      ``issuer`` as the expected issuer; the options are those of the
+      function. Argument errors (missing nonce, bad algorithm name, ``leeway``
+      above 300, ``require_at_hash`` without ``access_token``, an empty
+      ``acr_values``) are raised before anything is fetched.
+
+      The token's header is read without verification to find its ``kid``.
+      If the cached set has keys with a ``kid`` and none equals the token's,
+      the set is refetched once and the check repeated; if it still names no
+      key, :class:`pygrindvakt.UnknownKeyError` (``code == "unknown_kid"``) is
+      raised without verifying anything. That refetch happens at most once per
+      ``min_refresh_interval`` seconds across all callers, counted from the
+      previous fetch attempt, so a stream of tokens with random ``kid`` values
+      cannot make the RP hammer the OP (they get ``UnknownKeyError`` without a
+      fetch). A set whose keys have no ``kid``, and a token without one,
+      behave as in :func:`verify_id_token`: no refresh, and the usual
+      :class:`pygrindvakt.AuthnError`.
 
 Finishing the flow
 ------------------
@@ -232,10 +309,11 @@ Finishing the flow
    details. The description and body may echo secrets: never log them
    verbatim or show them to users.
 
-.. py:function:: verify_id_token(jwks: dict[str, Any], id_token: str, issuer: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False) -> dict[str, Any]
+.. py:function:: verify_id_token(jwks: dict[str, Any] | JwksCache, id_token: str, issuer: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False, *, leeway: int | None = None, max_age: int | None = None, acr_values: list[str] | None = None, access_token: str | None = None, require_at_hash: bool = False, authorization_code: str | None = None, require_c_hash: bool = False) -> dict[str, Any]
 
    Verify an ``id_token`` against the provider JWKS (a dict
-   ``{"keys": [...]}``), the expected ``issuer``, audience ``client_id`` and
+   ``{"keys": [...]}`` or a :class:`JwksCache`), the expected ``issuer``,
+   audience ``client_id`` and
    ``expected_nonce``; ``sub``, ``exp`` and ``iat`` are required. The protected
    algorithm must be in ``allowed_algorithms``. Additional audiences are
    rejected unless explicitly listed in ``trusted_additional_audiences``;
@@ -243,7 +321,52 @@ Finishing the flow
    validated claims as a dict. Raises :class:`pygrindvakt.AuthnError` (or
    another :class:`pygrindvakt.GrindvaktError` subclass) on any failure:
    bad signature, unknown key, wrong issuer or audience, expired, nonce
-   mismatch.
+   mismatch. When the key set has several keys the token must carry a ``kid``
+   (OIDC Core 10.1).
+
+   With none of the keyword options the behaviour is unchanged (a ``at_hash``
+   or ``c_hash`` claim is ignored, as there is nothing to check it against).
+   The options:
+
+   ``leeway``
+      Clock-skew tolerance in seconds for ``exp`` / ``nbf`` / ``iat`` and for
+      the future-``auth_time`` check; default 60. Above 300 raises
+      :class:`pygrindvakt.BadRequestError` (it is for clock drift, not for
+      reviving expired tokens); negative raises ``ValueError``. It is not
+      added to ``max_age``.
+
+   ``max_age``
+      The OIDC ``max_age`` policy, in seconds. It is checked against the
+      ``auth_time`` claim (never ``iat``): the token must carry a numeric
+      ``auth_time`` (a fractional value is floored) with ``now <= auth_time +
+      max_age``. A missing or non-numeric ``auth_time`` is an
+      :class:`pygrindvakt.AuthnError`, as is an ``auth_time`` older than
+      ``max_age`` or more than ``leeway`` in the future. Send ``max_age`` in
+      the authorization request as well; this is the RP-side enforcement.
+
+   ``acr_values``
+      Allow-list: the ``acr`` claim must be a string in the list, else
+      :class:`pygrindvakt.AuthnError`. An empty list is a
+      :class:`pygrindvakt.BadRequestError`.
+
+   ``access_token``, ``require_at_hash``
+      ``at_hash`` is compared with the hash of ``access_token`` (constant
+      time) when the id_token carries one. Without ``require_at_hash`` a token
+      lacking ``at_hash`` is accepted, so it is **not** bound to the access
+      token; set ``require_at_hash=True`` when the binding must hold (implicit
+      and hybrid flows, or an OP known to emit it). ``require_at_hash`` without
+      ``access_token`` raises :class:`pygrindvakt.BadRequestError`.
+
+   ``authorization_code``, ``require_c_hash``
+      The same for ``c_hash`` (hybrid flows need ``require_c_hash=True``).
+
+   The hash is computed with the SHA-2 variant matching the token's ``alg``.
+   ``EdDSA`` defines none: an ``EdDSA`` token that carries ``at_hash`` /
+   ``c_hash`` while the matching value is supplied raises
+   :class:`pygrindvakt.CryptoError`, and ``require_*_hash`` cannot be met by
+   it in practice. An ``EdDSA`` token without the claim passes unless
+   required. Supplying ``access_token`` or ``authorization_code`` to an OP
+   that signs with ``EdDSA`` and emits hashes therefore fails; omit them there.
 
    ``expected_nonce`` is the nonce this RP sent in the authorization
    request. Passing ``None`` is refused with :class:`pygrindvakt.AuthnError`
@@ -257,7 +380,7 @@ Finishing the flow
       (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
       it for the standard code flow allows id_token replay.
 
-.. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str | None, access_token: str, expected_sub: str, issuer: str, *, method: Literal["POST", "GET"] = "POST", jwks: dict[str, Any] | None = None, client_id: str | None = None, allowed_algorithms: list[str] | None = None, trust: str | None = None, typ: str | None = None, max_age: int | None = 300, require_exp: bool = False) -> dict[str, Any]
+.. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str | None, access_token: str, expected_sub: str, issuer: str, *, method: Literal["POST", "GET"] = "POST", jwks: dict[str, Any] | JwksCache | None = None, client_id: str | None = None, allowed_algorithms: list[str] | None = None, trust: str | None = None, typ: str | None = None, max_age: int | None = 300, require_exp: bool = False) -> dict[str, Any]
 
    Fetch the UserInfo response with a Bearer ``access_token`` and return its
    claims as a dict. The ``sub`` must exactly equal ``expected_sub`` from the
@@ -288,8 +411,10 @@ Finishing the flow
    as-is, and fail closed: unless ``jwks``, ``client_id``,
    ``allowed_algorithms`` (non-empty) **and** ``trust`` are all given, an
    :class:`pygrindvakt.AuthnError` with ``code == "userinfo_unverifiable"`` is
-   raised. ``jwks`` is a JWK Set dict in the same form as for
-   :func:`verify_id_token`. The JWS must be signed by a key in ``jwks`` with an
+   raised. ``jwks`` is a JWK Set dict or a :class:`JwksCache`, as for
+   :func:`verify_id_token` (with a cache, an unknown ``kid`` in the response
+   triggers the same single rate-limited refresh, else
+   :class:`pygrindvakt.UnknownKeyError`). The JWS must be signed by a key in ``jwks`` with an
    allowed algorithm and carry a ``kid`` naming it, ``iss`` must equal
    ``issuer``, ``aud`` must be exactly ``client_id`` (multi-audience tokens are
    refused), and ``sub`` must equal ``expected_sub``. A token carrying
@@ -371,6 +496,7 @@ Example
 
    http_client = http.ReqwestClient()
    info = rp.ProviderInfo.from_metadata(rp.discover(http_client, "https://op.example.com"))
+   jwks_cache = rp.JwksCache(http_client, info.jwks_uri, info.issuer)   # once per process
    me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret=os.environ["OIDC_SECRET"])
 
    # Login: keep state, nonce and verifier in the session.
@@ -379,7 +505,7 @@ Example
    # Callback: check state, then exchange and verify.
    try:
        ts = rp.exchange_code(http_client, info, me, code, code_verifier=verifier)
-       claims = rp.verify_id_token(rp.fetch_jwks(http_client, info.jwks_uri, info.issuer), ts.id_token,
+       claims = rp.verify_id_token(jwks_cache, ts.id_token,
                                    info.issuer, me.client_id, nonce, ["ES256"])
        profile = rp.fetch_userinfo(http_client, info.userinfo_endpoint, ts.access_token,
                                    claims["sub"], info.issuer)

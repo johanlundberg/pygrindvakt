@@ -11,6 +11,7 @@
 //! ├── CryptoError (500)                grindvakt::Error::Crypto
 //! ├── AttributeMappingError (500)      grindvakt::Error::Attribute
 //! ├── JoseError (500)                  grindvakt::Error::Jose
+//! │   └── UnknownKeyError (401)        raised by rp.JwksCache (no upstream variant)
 //! ├── JsonError (500)                  grindvakt::Error::Json
 //! ├── InternalError (500)              grindvakt::Error::Internal, and
 //! │                                    other Error::UpstreamHttp (JWKS, discovery,
@@ -91,6 +92,12 @@ create_exception!(
     JoseError,
     GrindvaktError,
     "JOSE (JWS/JWE/JWK) error."
+);
+create_exception!(
+    pygrindvakt,
+    UnknownKeyError,
+    JoseError,
+    "The token's `kid` names no key in the issuer's JWK Set, even after a refresh."
 );
 create_exception!(
     pygrindvakt,
@@ -371,6 +378,7 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     add!(CryptoError, 500u16, "crypto");
     add!(AttributeMappingError, 500u16, "attribute");
     add!(JoseError, 500u16, "jose");
+    add!(UnknownKeyError, 401u16, "unknown_kid");
     add!(JsonError, 500u16, "json");
     add!(InternalError, 500u16, "internal");
     add!(NoBoundEndpointError, 404u16, "no_bound_endpoint");
