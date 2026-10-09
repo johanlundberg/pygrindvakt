@@ -14,9 +14,15 @@ class ProviderMetadata:
     ``revocation_endpoint``, ``end_session_endpoint``, ...) must have their
     documented JSON type (``ValueError`` otherwise). Their typed properties
     return ``None`` when the member is absent (not an empty list / ``False``).
-    ``extra`` / ``set_extra_field`` / ``from_dict`` only type-check these
-    members and never validate URLs; ``end_session_endpoint`` is validated
-    against the issuer by its setter, by ``rp.ProviderInfo`` and by
+    ``extra`` / ``set_extra_field`` / ``from_dict`` and the typed setters
+    type-check these members, and additionally validate URL-typed ones (every
+    ``*_endpoint`` and ``check_session_iframe``) against the issuer (https or
+    loopback http, no fragment or userinfo; ``ValueError``).
+    ``service_documentation``, ``op_policy_uri`` and ``op_tos_uri`` are
+    type-checked only. ``Provider`` warns (``UserWarning``) when asked to
+    advertise logout/revocation/introspection/PAR/session members it does not
+    implement. ``end_session_endpoint`` is validated again by
+    ``rp.ProviderInfo`` and
     ``rp.end_session_url``. Documents from ``rp.discover`` are not type-checked:
     a malformed known member makes the getter return ``None`` while ``raw`` /
     ``to_dict()`` keep the original (and ``from_dict(to_dict())`` then raises

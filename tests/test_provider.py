@@ -385,19 +385,72 @@ def test_non_openid_flow_omits_id_token_and_userinfo_and_claims_are_scope_filter
     assert op.userinfo(tr.access_token) == {"sub": "alice", "tenant": "example"}
 
 
-def test_metadata_does_not_advertise_unimplemented_features(op, op_key):
+def test_explicit_end_session_endpoint_is_advertised_and_warns(op, op_key):
     assert op.discovery_document()["subject_types_supported"] == ["public"]
     md = metadata.ProviderMetadata(ISSUER)
     from pygrindvakt import client, tokens
 
-    # RP-Initiated Logout metadata may be advertised when set explicitly.
     md.set_extra_field("end_session_endpoint", f"{ISSUER}/logout")
     assert md.end_session_endpoint == f"{ISSUER}/logout"
-    advertising = provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"),
-                                    token_use_store=provider.InMemoryTokenUseStore())
+    with pytest.warns(UserWarning, match="does not implement end_session_endpoint"):
+        advertising = provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"),
+                                        token_use_store=provider.InMemoryTokenUseStore())
     assert advertising.discovery_document()["end_session_endpoint"] == f"{ISSUER}/logout"
     with pytest.raises(ValueError, match="reserved"):
         md.extra = {"issuer": "https://evil.example"}
+
+
+def _build(md, op_key):
+    from pygrindvakt import client, tokens
+
+    return provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"),
+                             token_use_store=provider.InMemoryTokenUseStore())
+
+
+def test_provider_warns_once_listing_all_unimplemented_members(op_key):
+    md = metadata.ProviderMetadata(ISSUER)
+    md.revocation_endpoint = f"{ISSUER}/revoke"
+    md.introspection_endpoint = f"{ISSUER}/introspect"
+    md.pushed_authorization_request_endpoint = f"{ISSUER}/par"
+    md.check_session_iframe = f"{ISSUER}/iframe"
+    md.frontchannel_logout_supported = True
+    md.backchannel_logout_supported = True
+    md.require_pushed_authorization_requests = True
+    md.end_session_endpoint = f"{ISSUER}/logout"
+    with pytest.warns(UserWarning) as rec:
+        _build(md, op_key)
+    assert len(rec) == 1
+    msg = str(rec[0].message)
+    for name in ("end_session_endpoint", "revocation_endpoint", "introspection_endpoint",
+                 "pushed_authorization_request_endpoint", "check_session_iframe",
+                 "frontchannel_logout_supported", "backchannel_logout_supported",
+                 "require_pushed_authorization_requests"):
+        assert name in msg
+    assert "claim you are making about your own front end" in msg
+    assert rec[0].filename == __file__
+
+
+def test_provider_silent_without_unimplemented_members(op_key):
+    import warnings
+
+    md = metadata.ProviderMetadata(ISSUER)
+    md.frontchannel_logout_supported = False
+    md.backchannel_logout_supported = False
+    md.require_pushed_authorization_requests = False
+    md.service_documentation = f"{ISSUER}/docs"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _build(md, op_key)
+
+
+def test_metadata_setters_do_not_warn():
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        md = metadata.ProviderMetadata(ISSUER)
+        md.end_session_endpoint = f"{ISSUER}/logout"
+        md.set_extra_field("revocation_endpoint", f"{ISSUER}/revoke")
 
 
 def test_token_lifetimes_and_metadata_customisation(op_key, demo_client):
@@ -461,3 +514,22 @@ def test_redis_store(redis_url):
     assert s.consume(h, 5) is True
     assert s.consume(h, 5) is False
     assert provider.RedisStore.DEFAULT_KEY_PREFIX == "grindvakt:token-use:"
+
+
+def test_failing_constructor_does_not_warn(op_key):
+    import warnings
+
+    from pygrindvakt import tokens
+
+    md = metadata.ProviderMetadata(ISSUER)
+    md.end_session_endpoint = f"{ISSUER}/logout"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(Exception) as ei:
+            provider.Provider(md, op_key, object(), tokens.TokenCodec("s"),
+                              token_use_store=provider.InMemoryTokenUseStore())
+        assert not isinstance(ei.value, UserWarning)
+        with pytest.raises(ValueError, match="token_use_store"):
+            from pygrindvakt import client
+
+            provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"))

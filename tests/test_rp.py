@@ -1133,9 +1133,18 @@ def test_provider_info_rejects_unsafe_end_session_endpoint():
 def test_from_metadata_drops_unsafe_end_session_endpoint():
     """Login must not depend on logout: a bad advertised endpoint becomes None."""
     for bad in ["http://evil.example/l", f"{ISSUER}/l#frag", "https://u:p@op.example.com/l", "not a url"]:
-        md = metadata.ProviderMetadata.from_dict(
-            metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": bad}
-        )
+        import json
+
+        body = json.dumps(metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": bad}).encode()
+
+        class Http:
+            def get(self, url):
+                return 200, body, "application/json"
+
+            def post_form(self, url, form, headers):
+                raise AssertionError
+
+        md = rp.discover(Http(), ISSUER)
         info = rp.ProviderInfo.from_metadata(md)
         assert info.end_session_endpoint is None
         assert info.token_endpoint == f"{ISSUER}/token"

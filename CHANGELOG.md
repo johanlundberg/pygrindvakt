@@ -9,6 +9,34 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** `end_session_endpoint` and related OIDC extension members
+  (`revocation_endpoint`, `introspection_endpoint`,
+  `pushed_authorization_request_endpoint`, `check_session_iframe`,
+  `frontchannel_logout_supported`, `backchannel_logout_supported`, ...) were
+  previously refused on the OP side because the library implements no logout.
+  They are now accepted (RP-Initiated Logout needs `end_session_endpoint`).
+  URL-typed members (every `*_endpoint` and `check_session_iframe`) are
+  validated against the metadata's issuer (https or loopback http, no
+  fragment, no userinfo) on every write path: `from_dict`, the `extra` setter,
+  `set_extra_field` and the typed setters. Inputs that were accepted (for
+  example `"javascript:x"` or non-loopback `http://` via `from_dict` /
+  `extra` / `set_extra_field`) now raise `ValueError`. The dedicated
+  `end_session_endpoint` setter now raises `ValueError` instead of a
+  `GrindvaktError` subclass, so all paths agree. `rp.discover` still never
+  fails over these members. `service_documentation`, `op_policy_uri` and
+  `op_tos_uri` remain type-checked only.
+- **Breaking:** `ProviderMetadata.issuer = ...` now re-validates the URL-typed
+  members already stored in `extra` against the new issuer and raises
+  `ValueError` (naming the member, old issuer kept) if one no longer passes.
+- `Provider(...)` emits a `UserWarning` when its metadata advertises
+  `end_session_endpoint`, `revocation_endpoint`, `introspection_endpoint`,
+  `pushed_authorization_request_endpoint`, `check_session_iframe`, or sets
+  `frontchannel_logout_supported` / `backchannel_logout_supported` /
+  `require_pushed_authorization_requests` to true: the engine implements none
+  of them. Publishing is still allowed; `ProviderMetadata` setters stay silent.
+
 ### Added
 
 - `rp.JwksCache(http, jwks_uri, issuer, *, default_ttl=3600, min_ttl=60,
@@ -31,8 +59,8 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `ProviderInfo(..., *, end_session_endpoint=None)` and a read-only
   `ProviderInfo.end_session_endpoint` (copied by `from_metadata`, validated
   like other endpoints); `ProviderMetadata.end_session_endpoint` (validated
-  setter). A `Provider` advertises it when the caller sets it; no logout
-  endpoint is implemented on the OP side.
+  setter). A `Provider` advertises it when the caller sets it (with a
+  `UserWarning`); no logout endpoint is implemented on the OP side.
 - `ProviderInfo.from_metadata` drops an advertised `end_session_endpoint` that
   fails issuer validation (it becomes `None`) instead of raising, so login never
   depends on logout; the `ProviderInfo` constructor stays strict.

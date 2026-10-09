@@ -45,6 +45,11 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
 
    .. py:attribute:: issuer
       :type: str
+
+      Setting it re-validates every URL-typed member already in ``extra``
+      (see below) against the new issuer; on failure ``ValueError`` names the
+      member and the old issuer is kept.
+
    .. py:attribute:: authorization_endpoint
       :type: str
    .. py:attribute:: token_endpoint
@@ -106,12 +111,23 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       JSON-serializable object (known extension members must have the right
       type); reserved names raise ``ValueError``.
 
-   ``extra``, ``set_extra_field`` and ``from_dict`` only **type-check** extras;
-   they never validate URLs, so a bad advertised value cannot make ``from_dict``
-   fail. ``end_session_endpoint`` is validated against the issuer when the
-   dedicated setter is used, when a :class:`~pygrindvakt.rp.ProviderInfo` is
-   built (the constructor raises; ``from_metadata`` drops it) and when
-   :func:`~pygrindvakt.rp.end_session_url` is called.
+   Known extension members are **type-checked** on every write path
+   (``from_dict``, the ``extra`` setter, ``set_extra_field`` and the typed
+   setters). URL-typed members, that is every ``*_endpoint`` member
+   (``end_session_endpoint``, ``revocation_endpoint``,
+   ``introspection_endpoint``, ``pushed_authorization_request_endpoint``) and
+   ``check_session_iframe``, are additionally **URL-validated** against the
+   metadata's own issuer on every one of those paths: an absolute URL, https
+   (or loopback http), no fragment, no userinfo. A bad value raises
+   ``ValueError`` from all of them. ``service_documentation``,
+   ``op_policy_uri`` and ``op_tos_uri`` are informational links and are
+   type-checked only. :class:`~pygrindvakt.provider.Provider` emits a
+   ``UserWarning`` at construction when the metadata advertises logout,
+   revocation, introspection, PAR or session members the engine does not
+   implement; publishing is still allowed. Building a
+   :class:`~pygrindvakt.rp.ProviderInfo` (the constructor raises;
+   ``from_metadata`` drops an unsafe ``end_session_endpoint``) and calling
+   :func:`~pygrindvakt.rp.end_session_url` validate it again.
 
    Documents returned by :func:`~pygrindvakt.rp.discover` are not type-checked
    against the known extension members (discovery never fails over them). For a

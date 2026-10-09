@@ -7,7 +7,6 @@ use pyo3::types::PyModule;
 use grindvakt::metadata as gm;
 
 use crate::convert::{from_py, new_submodule, to_py};
-use crate::errors::err;
 
 const RESERVED_METADATA_FIELDS: &[&str] = &[
     "issuer",
@@ -85,6 +84,21 @@ const KNOWN_EXTRA: &[(&str, ExtraKind)] = &[
     ("end_session_endpoint", ExtraKind::Str),
 ];
 
+/// Members whose value is an endpoint URL the OP would publish for relying
+/// parties to call; these are validated like `end_session_endpoint`.
+/// `service_documentation`, `op_policy_uri` and `op_tos_uri` are informational
+/// links and stay type-checked only (no public upstream helper for them).
+fn is_url_member(key: &str) -> bool {
+    key.ends_with("_endpoint") || key == "check_session_iframe"
+}
+
+/// Validate an endpoint URL against the metadata's issuer (absolute, https or
+/// loopback http, no fragment, no userinfo). Always `ValueError`.
+fn validate_url_member(key: &str, url: &str, issuer: &str) -> PyResult<()> {
+    grindvakt::rp::validate_service_endpoint_for_issuer(key, url, issuer)
+        .map_err(|e| PyValueError::new_err(format!("metadata field {key:?}: {e}")))
+}
+
 fn known_kind(key: &str) -> Option<ExtraKind> {
     KNOWN_EXTRA
         .iter()
@@ -93,7 +107,7 @@ fn known_kind(key: &str) -> Option<ExtraKind> {
 }
 
 /// Check that a known extension member has its documented JSON type.
-fn validate_known_value(key: &str, value: &serde_json::Value) -> PyResult<()> {
+fn validate_known_value(key: &str, value: &serde_json::Value, issuer: &str) -> PyResult<()> {
     let Some(kind) = known_kind(key) else {
         return Ok(());
     };
@@ -105,6 +119,11 @@ fn validate_known_value(key: &str, value: &serde_json::Value) -> PyResult<()> {
         ExtraKind::Str => value.is_string(),
     };
     if ok {
+        if is_url_member(key) {
+            if let Some(url) = value.as_str() {
+                validate_url_member(key, url, issuer)?;
+            }
+        }
         return Ok(());
     }
     let want = match kind {
@@ -127,10 +146,13 @@ fn validate_extra_key(key: &str) -> PyResult<()> {
 }
 
 /// Validate the `extra` map: no reserved names, known members correctly typed.
-fn validate_extra(extra: &serde_json::Map<String, serde_json::Value>) -> PyResult<()> {
+fn validate_extra(
+    extra: &serde_json::Map<String, serde_json::Value>,
+    issuer: &str,
+) -> PyResult<()> {
     for (key, value) in extra {
         validate_extra_key(key)?;
-        validate_known_value(key, value)?;
+        validate_known_value(key, value, issuer)?;
     }
     Ok(())
 }
@@ -189,7 +211,7 @@ impl ProviderMetadata {
             return Ok(());
         }
         let value: serde_json::Value = from_py(v)?;
-        validate_known_value(key, &value)?;
+        validate_known_value(key, &value, &self.inner.issuer)?;
         self.inner.extra.insert(key.to_string(), value);
         Ok(())
     }
@@ -216,7 +238,7 @@ impl ProviderMetadata {
         let inner: gm::ProviderMetadata =
             serde_json::from_value(serde_json::Value::Object(raw.clone()))
                 .map_err(|e| PyValueError::new_err(format!("invalid ProviderMetadata: {e}")))?;
-        validate_extra(&inner.extra)?;
+        validate_extra(&inner.extra, &inner.issuer)?;
         Ok(Self::wrap_with_raw(inner, raw))
     }
 
@@ -253,7 +275,7 @@ impl ProviderMetadata {
     }
 
     /// The OIDC RP-Initiated Logout `end_session_endpoint` (stored in
-    /// `extra`), or `None`. The setter validates the URL against the issuer.
+    /// `extra`), or `None`. The setter validates the URL against the issuer (`ValueError`).
     #[getter]
     fn end_session_endpoint(&self) -> Option<String> {
         self.extra_str("end_session_endpoint")
@@ -265,12 +287,7 @@ impl ProviderMetadata {
                 self.inner.extra.remove("end_session_endpoint");
             }
             Some(url) => {
-                grindvakt::rp::validate_service_endpoint_for_issuer(
-                    "end_session_endpoint",
-                    &url,
-                    &self.inner.issuer,
-                )
-                .map_err(err)?;
+                validate_url_member("end_session_endpoint", &url, &self.inner.issuer)?;
                 self.inner
                     .extra
                     .insert("end_session_endpoint".into(), url.into());
@@ -510,8 +527,18 @@ impl ProviderMetadata {
         &self.inner.issuer
     }
     #[setter]
-    fn set_issuer(&mut self, v: String) {
+    fn set_issuer(&mut self, v: String) -> PyResult<()> {
+        // Re-validate stored URL members against the new issuer first, so a
+        // failure leaves the old issuer in place.
+        for (key, value) in &self.inner.extra {
+            if is_url_member(key) {
+                if let Some(url) = value.as_str() {
+                    validate_url_member(key, url, &v)?;
+                }
+            }
+        }
         self.inner.issuer = v;
+        Ok(())
     }
     #[getter]
     fn authorization_endpoint(&self) -> &str {
@@ -660,7 +687,7 @@ impl ProviderMetadata {
     #[setter]
     fn set_extra(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
         let extra = from_py(v)?;
-        validate_extra(&extra)?;
+        validate_extra(&extra, &self.inner.issuer)?;
         self.inner.extra = extra;
         Ok(())
     }
@@ -668,7 +695,7 @@ impl ProviderMetadata {
     fn set_extra_field(&mut self, key: String, value: &Bound<'_, PyAny>) -> PyResult<()> {
         validate_extra_key(&key)?;
         let v: serde_json::Value = from_py(value)?;
-        validate_known_value(&key, &v)?;
+        validate_known_value(&key, &v, &self.inner.issuer)?;
         self.inner.extra.insert(key, v);
         Ok(())
     }
