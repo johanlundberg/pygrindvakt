@@ -332,6 +332,32 @@ userinfo requests to ``op.handle_token_request`` / ``op.userinfo``. Those
 nested calls into pygrindvakt from inside the fake are supported; each runs
 on a helper thread (see :doc:`stores`).
 
+Logout
+------
+
+If the OP advertises an ``end_session_endpoint`` (OIDC RP-Initiated Logout
+1.0), it is available as ``info.end_session_endpoint`` after discovery. Clear
+your own session first, then redirect the browser to
+:func:`~pygrindvakt.rp.end_session_url`:
+
+.. code-block:: python
+
+   if info.end_session_endpoint is not None:
+       logout_url = rp.end_session_url(
+           info,
+           id_token_hint=session["id_token"],
+           client=me,
+           post_logout_redirect_uri="https://rp.example.com/logged-out",
+           state=util.random_token(24),
+       )
+       # redirect the browser to logout_url
+
+``post_logout_redirect_uri`` must be registered with the OP, and needs
+``id_token_hint`` or ``client`` so the OP can identify the RP. A provider
+without an ``end_session_endpoint`` makes ``end_session_url`` raise
+``ConfigError``; end only the local session in that case. The endpoint is
+validated like the other endpoints (https, no credentials or fragment).
+
 Security notes
 --------------
 

@@ -12,7 +12,11 @@
 //! trusted audiences an explicit policy input.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+use grindvakt::http::{HttpClient, HttpFetchResponse};
+use grindvakt::Error as RsError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
@@ -56,24 +60,27 @@ fn opt_repr(v: Option<&str>) -> String {
 #[derive(Clone)]
 pub struct ProviderInfo {
     pub inner: grp::ProviderInfo,
+    /// OIDC RP-Initiated Logout endpoint. Upstream `ProviderInfo` has no slot
+    /// for it, so the binding carries it alongside.
+    pub end_session_endpoint: Option<String>,
 }
 
-impl ProviderInfo {
-    pub fn wrap(inner: grp::ProviderInfo) -> Self {
-        Self { inner }
-    }
+/// Validate an `end_session_endpoint` against the provider's issuer.
+fn validate_end_session_endpoint(endpoint: &str, issuer: &str) -> PyResult<()> {
+    grp::validate_service_endpoint_for_issuer("end_session_endpoint", endpoint, issuer).map_err(err)
 }
 
 #[pymethods]
 impl ProviderInfo {
     #[new]
-    #[pyo3(signature = (issuer, authorization_endpoint, token_endpoint, userinfo_endpoint = None, jwks_uri = None))]
+    #[pyo3(signature = (issuer, authorization_endpoint, token_endpoint, userinfo_endpoint = None, jwks_uri = None, *, end_session_endpoint = None))]
     fn new(
         issuer: String,
         authorization_endpoint: String,
         token_endpoint: String,
         userinfo_endpoint: Option<String>,
         jwks_uri: Option<String>,
+        end_session_endpoint: Option<String>,
     ) -> PyResult<Self> {
         let inner = grp::ProviderInfo {
             issuer,
@@ -83,16 +90,37 @@ impl ProviderInfo {
             jwks_uri,
         };
         inner.validate().map_err(err)?;
-        Ok(Self { inner })
+        if let Some(e) = &end_session_endpoint {
+            validate_end_session_endpoint(e, &inner.issuer)?;
+        }
+        Ok(Self {
+            inner,
+            end_session_endpoint,
+        })
     }
 
     /// Build from a discovered `ProviderMetadata` document (the userinfo
-    /// endpoint is `None` if the provider does not advertise one).
+    /// endpoint is `None` if the provider does not advertise one). An
+    /// advertised `end_session_endpoint` is carried over; one that fails
+    /// issuer validation is dropped (`None`) so login never depends on logout.
     #[staticmethod]
     fn from_metadata(metadata: &ProviderMetadata) -> PyResult<Self> {
         let inner = grp::ProviderInfo::from(metadata.inner.clone());
         inner.validate().map_err(err)?;
-        Ok(Self::wrap(inner))
+        let end_session_endpoint = metadata
+            .inner
+            .extra
+            .get("end_session_endpoint")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        // Login must not depend on logout: an advertised endpoint that fails
+        // issuer validation is dropped rather than raised.
+        let end_session_endpoint = end_session_endpoint
+            .filter(|e| validate_end_session_endpoint(e, &inner.issuer).is_ok());
+        Ok(Self {
+            inner,
+            end_session_endpoint,
+        })
     }
 
     #[getter]
@@ -115,16 +143,22 @@ impl ProviderInfo {
     fn jwks_uri(&self) -> Option<&str> {
         self.inner.jwks_uri.as_deref()
     }
+    /// The OIDC RP-Initiated Logout endpoint, or `None`.
+    #[getter]
+    fn end_session_endpoint(&self) -> Option<&str> {
+        self.end_session_endpoint.as_deref()
+    }
 
     fn __repr__(&self) -> String {
         format!(
             "ProviderInfo(issuer={:?}, authorization_endpoint={:?}, token_endpoint={:?}, \
-             userinfo_endpoint={}, jwks_uri={})",
+             userinfo_endpoint={}, jwks_uri={}, end_session_endpoint={})",
             self.inner.issuer,
             self.inner.authorization_endpoint,
             self.inner.token_endpoint,
             opt_repr(self.inner.userinfo_endpoint.as_deref()),
-            opt_repr(self.inner.jwks_uri.as_deref())
+            opt_repr(self.inner.jwks_uri.as_deref()),
+            opt_repr(self.end_session_endpoint.as_deref())
         )
     }
 }
@@ -502,9 +536,194 @@ fn discover(
     issuer: String,
 ) -> PyResult<ProviderMetadata> {
     let (http, failures) = extract_http_client(http)?;
-    let r = crate::runtime::block_on(py, async move { grp::discover(&http, &issuer).await })?;
-    r.map(ProviderMetadata::wrap)
-        .map_err(|e| failures.err(py, e))
+    // `grp::discover` returns only the parsed struct. Wrap the client so the
+    // body it fetched can be kept as `raw`; all validation stays upstream.
+    let recorder = Arc::new(BodyRecorder {
+        inner: http,
+        last_ok_body: Mutex::new(None),
+    });
+    let client: Arc<dyn HttpClient> = recorder.clone();
+    let r = crate::runtime::block_on(py, async move { grp::discover(&client, &issuer).await })?;
+    let metadata = r.map_err(|e| failures.err(py, e))?;
+    let raw = recorder
+        .last_ok_body
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        });
+    Ok(match raw {
+        Some(raw) => ProviderMetadata::wrap_with_raw(metadata, raw),
+        // Unreachable in practice (upstream parsed the same body); fall back
+        // to the re-serialized document.
+        None => {
+            let raw = match metadata.to_json() {
+                serde_json::Value::Object(m) => Some(m),
+                _ => None,
+            };
+            match raw {
+                Some(raw) => ProviderMetadata::wrap_with_raw(metadata, raw),
+                None => ProviderMetadata::wrap(metadata),
+            }
+        }
+    })
+}
+
+/// `HttpClient` decorator remembering the body of the last 200 GET response.
+struct BodyRecorder {
+    inner: Arc<dyn HttpClient>,
+    last_ok_body: Mutex<Option<Vec<u8>>>,
+}
+
+#[async_trait]
+impl HttpClient for BodyRecorder {
+    async fn get(&self, url: &str) -> grindvakt::Result<HttpFetchResponse> {
+        let resp = self.inner.get(url).await?;
+        if resp.status == 200 {
+            if let Ok(mut g) = self.last_ok_body.lock() {
+                *g = Some(resp.body.clone());
+            }
+        }
+        Ok(resp)
+    }
+
+    async fn post_form(
+        &self,
+        url: &str,
+        form: &[(String, String)],
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<HttpFetchResponse> {
+        self.inner.post_form(url, form, headers).await
+    }
+
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<HttpFetchResponse> {
+        self.inner.get_with_headers(url, headers).await
+    }
+}
+
+/// Library-controlled RP-Initiated Logout parameters.
+const END_SESSION_RESERVED: &[&str] = &[
+    "id_token_hint",
+    "client_id",
+    "post_logout_redirect_uri",
+    "state",
+    "logout_hint",
+    "ui_locales",
+];
+
+fn non_empty(name: &str, v: Option<&str>) -> PyResult<()> {
+    if v == Some("") {
+        return Err(err(RsError::BadRequest(format!(
+            "{name} must not be empty"
+        ))));
+    }
+    Ok(())
+}
+
+/// Build the OIDC RP-Initiated Logout 1.0 request URL to redirect the user to.
+///
+/// Parameters are appended to the provider's `end_session_endpoint` (any
+/// existing query is preserved) with proper encoding. `client` adds
+/// `client_id`. `post_logout_redirect_uri` must be an absolute URL without a
+/// fragment and, per the specification, needs `id_token_hint` or `client` so
+/// the OP can identify the RP; it must also have been registered with the OP.
+/// `extra` (dict or list of pairs) may not contain the parameters controlled
+/// by this function. Raises `ConfigError` if the provider has no
+/// `end_session_endpoint`, `BadRequestError` for unsafe or invalid input.
+#[pyfunction]
+#[pyo3(signature = (provider, *, id_token_hint = None, client = None, post_logout_redirect_uri = None, state = None, logout_hint = None, ui_locales = None, extra = None))]
+#[allow(clippy::too_many_arguments)]
+fn end_session_url(
+    provider: &ProviderInfo,
+    id_token_hint: Option<&str>,
+    client: Option<&RpClient>,
+    post_logout_redirect_uri: Option<&str>,
+    state: Option<&str>,
+    logout_hint: Option<&str>,
+    ui_locales: Option<&str>,
+    extra: Option<&Bound<'_, PyAny>>,
+) -> PyResult<String> {
+    let endpoint = provider.end_session_endpoint.as_deref().ok_or_else(|| {
+        err(RsError::Config(
+            "provider has no usable end_session_endpoint (none advertised, or the advertised one \
+             was rejected as unsafe)"
+                .into(),
+        ))
+    })?;
+    validate_end_session_endpoint(endpoint, &provider.inner.issuer)?;
+    let mut url = url::Url::parse(endpoint).map_err(|e| {
+        err(RsError::BadRequest(format!(
+            "invalid end_session_endpoint: {e}"
+        )))
+    })?;
+    if url
+        .query_pairs()
+        .any(|(k, _)| END_SESSION_RESERVED.contains(&k.as_ref()))
+    {
+        return Err(err(RsError::BadRequest(
+            "end_session_endpoint query contains a library-controlled parameter".into(),
+        )));
+    }
+    for (name, v) in [
+        ("id_token_hint", id_token_hint),
+        ("post_logout_redirect_uri", post_logout_redirect_uri),
+        ("state", state),
+        ("logout_hint", logout_hint),
+        ("ui_locales", ui_locales),
+    ] {
+        non_empty(name, v)?;
+    }
+    if let Some(uri) = post_logout_redirect_uri {
+        grp::validate_redirect_uri_syntax(uri).map_err(err)?;
+        if id_token_hint.is_none() && client.is_none() {
+            return Err(err(RsError::BadRequest(
+                "post_logout_redirect_uri requires id_token_hint or client so the OP can \
+                 identify the RP"
+                    .into(),
+            )));
+        }
+    }
+    let extra = extra_params(extra)?;
+    if let Some((k, _)) = extra
+        .iter()
+        .find(|(k, _)| END_SESSION_RESERVED.contains(&k.as_str()))
+    {
+        return Err(err(RsError::BadRequest(format!(
+            "extra must not contain library-controlled parameter {k:?}"
+        ))));
+    }
+    {
+        let mut q = url.query_pairs_mut();
+        if let Some(v) = id_token_hint {
+            q.append_pair("id_token_hint", v);
+        }
+        if let Some(c) = client {
+            q.append_pair("client_id", &c.inner.client_id);
+        }
+        if let Some(v) = post_logout_redirect_uri {
+            q.append_pair("post_logout_redirect_uri", v);
+        }
+        if let Some(v) = state {
+            q.append_pair("state", v);
+        }
+        if let Some(v) = logout_hint {
+            q.append_pair("logout_hint", v);
+        }
+        if let Some(v) = ui_locales {
+            q.append_pair("ui_locales", v);
+        }
+        for (k, v) in &extra {
+            q.append_pair(k, v);
+        }
+    }
+    Ok(url.into())
 }
 
 /// Fetch a JWKS document from `jwks_uri` for its associated `issuer` and
@@ -811,6 +1030,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(signed_request_object, &m)?)?;
     m.add_function(wrap_pyfunction!(begin, &m)?)?;
     m.add_function(wrap_pyfunction!(discover, &m)?)?;
+    m.add_function(wrap_pyfunction!(end_session_url, &m)?)?;
     m.add_function(wrap_pyfunction!(fetch_jwks, &m)?)?;
     m.add_function(wrap_pyfunction!(exchange_code, &m)?)?;
     m.add_function(wrap_pyfunction!(verify_id_token, &m)?)?;

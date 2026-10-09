@@ -388,8 +388,14 @@ def test_non_openid_flow_omits_id_token_and_userinfo_and_claims_are_scope_filter
 def test_metadata_does_not_advertise_unimplemented_features(op, op_key):
     assert op.discovery_document()["subject_types_supported"] == ["public"]
     md = metadata.ProviderMetadata(ISSUER)
-    with pytest.raises(ValueError, match="unsupported"):
-        md.set_extra_field("end_session_endpoint", f"{ISSUER}/logout")
+    from pygrindvakt import client, tokens
+
+    # RP-Initiated Logout metadata may be advertised when set explicitly.
+    md.set_extra_field("end_session_endpoint", f"{ISSUER}/logout")
+    assert md.end_session_endpoint == f"{ISSUER}/logout"
+    advertising = provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"),
+                                    token_use_store=provider.InMemoryTokenUseStore())
+    assert advertising.discovery_document()["end_session_endpoint"] == f"{ISSUER}/logout"
     with pytest.raises(ValueError, match="reserved"):
         md.extra = {"issuer": "https://evil.example"}
 

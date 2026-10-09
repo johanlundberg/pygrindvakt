@@ -93,6 +93,19 @@ def use_all() -> None:
         pkce=False,
     )
     rp.authorization_url(info, me, state, nonce, redirect_uri=None)
+    logout: str = rp.end_session_url(
+        info, id_token_hint="t", client=me, state="s", extra={"k": "v"}
+    )
+    es: str | None = info.end_session_endpoint
+    rp.ProviderInfo("i", "a", "t", end_session_endpoint="https://x/logout")
+    acr: list[str] | None = md.acr_values_supported
+    flag: bool | None = md.backchannel_logout_supported
+    rev: str | None = md.revocation_endpoint
+    md.acr_values_supported = None
+    md.end_session_endpoint = "https://op.example.com/logout"
+    raw: dict[str, object] | None = md.raw
+    dumped: dict[str, object] = md.to_dict(exclude_defaults=True)
+    del logout, es, acr, flag, rev, raw, dumped
     rp.fetch_jwks(fetch, "https://op.example.com/jwks", "https://op.example.com")
     rp.fetch_userinfo(
         reqwest, "https://op.example.com/ui", "tok", "sub", "https://op.example.com"

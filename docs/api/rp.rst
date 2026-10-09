@@ -22,7 +22,7 @@ Networked calls block the calling thread with the GIL released.
 Provider and client
 -------------------
 
-.. py:class:: ProviderInfo(issuer: str, authorization_endpoint: str, token_endpoint: str, userinfo_endpoint: str | None = None, jwks_uri: str | None = None)
+.. py:class:: ProviderInfo(issuer: str, authorization_endpoint: str, token_endpoint: str, userinfo_endpoint: str | None = None, jwks_uri: str | None = None, *, end_session_endpoint: str | None = None)
 
    The minimal upstream-provider information the RP needs. Immutable. Build
    one by hand for a statically configured provider, or with
@@ -37,7 +37,10 @@ Provider and client
 
       Build from a :class:`pygrindvakt.metadata.ProviderMetadata` (as
       returned by :func:`discover`); the userinfo endpoint is ``None``
-      if the provider does not advertise one.
+      if the provider does not advertise one. An advertised
+      ``end_session_endpoint`` is carried over if it passes issuer validation;
+      an unsafe one is dropped (``None``) so login never depends on logout
+      (the direct constructor stays strict and raises).
 
    .. py:property:: issuer
       :type: str
@@ -49,6 +52,11 @@ Provider and client
       :type: str | None
    .. py:property:: jwks_uri
       :type: str | None
+   .. py:property:: end_session_endpoint
+      :type: str | None
+
+      OIDC RP-Initiated Logout endpoint, or ``None``. Validated like the
+      other endpoints at construction. Used by :func:`end_session_url`.
 
 .. py:class:: RpClient(client_id: str, redirect_uri: str, *, scope: str = "openid profile email", client_secret: str | None = None, auth_method: str | None = None, signing_key: SigningKey | None = None)
 
@@ -176,6 +184,25 @@ Discovery and keys
    :class:`pygrindvakt.InternalError` on a transport failure or non-200,
    :class:`pygrindvakt.AuthnError` / :class:`pygrindvakt.BadRequestError`
    on an issuer mismatch or unusable document.
+
+   The result's :attr:`~pygrindvakt.metadata.ProviderMetadata.raw` is the
+   response body as fetched (parsed to a dict), obtained by recording the body
+   handed to the upstream discovery routine; no validation is reimplemented.
+
+.. py:function:: end_session_url(provider: ProviderInfo, *, id_token_hint: str | None = None, client: RpClient | None = None, post_logout_redirect_uri: str | None = None, state: str | None = None, logout_hint: str | None = None, ui_locales: str | None = None, extra: dict[str, str] | list[tuple[str, str]] | None = None) -> str
+
+   Build the OIDC RP-Initiated Logout 1.0 URL to redirect the user to.
+   Parameters are appended to ``provider.end_session_endpoint`` (an existing
+   query is preserved) with proper percent-encoding. ``client`` adds
+   ``client_id``. ``post_logout_redirect_uri`` must be an absolute URL without
+   a fragment and requires ``id_token_hint`` or ``client`` (the OP must be able
+   to identify the RP); it must also be registered at the OP. ``extra`` may not
+   contain ``id_token_hint``, ``client_id``, ``post_logout_redirect_uri``,
+   ``state``, ``logout_hint`` or ``ui_locales``, and neither may the endpoint's
+   own query. Raises :class:`pygrindvakt.ConfigError` when the provider has no
+   ``end_session_endpoint`` and :class:`pygrindvakt.BadRequestError` for unsafe
+   or invalid input. ``state`` is echoed back to ``post_logout_redirect_uri``
+   by the OP; generate it like the login ``state`` and verify it.
 
 .. py:function:: fetch_jwks(http: HttpClientProtocol | None, jwks_uri: str, issuer: str) -> dict[str, Any]
 

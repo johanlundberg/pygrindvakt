@@ -18,6 +18,7 @@ import pytest
 from pygrindvakt import (
     AuthnError,
     BadRequestError,
+    ConfigError,
     GrindvaktError,
     InternalError,
     OAuthError,
@@ -1087,3 +1088,102 @@ def test_userinfo_jwks_must_be_a_jwks_dict(op_key):
     with pytest.raises(Exception):
         ui(_signed(op_key, _jwt_claims()), jwks="not-a-jwks", client_id=CLIENT_ID,
            allowed_algorithms=["ES256"], trust="dedicated_keys")
+
+
+# --- RP-Initiated Logout ------------------------------------------------------
+
+
+@pytest.fixture
+def lprov():
+    return rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token",
+                           end_session_endpoint=f"{ISSUER}/logout")
+
+
+def test_provider_info_carries_end_session_endpoint_from_discovery(op, op_key):
+    md = metadata.ProviderMetadata(ISSUER)
+    md.end_session_endpoint = f"{ISSUER}/logout"
+    op2 = provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"),
+                            token_use_store=provider.InMemoryTokenUseStore())
+    discovered = rp.discover(FakeHttpClient(op2), ISSUER)
+    assert discovered.end_session_endpoint == f"{ISSUER}/logout"
+    assert discovered.raw is not None and discovered.raw["end_session_endpoint"] == f"{ISSUER}/logout"
+    info = rp.ProviderInfo.from_metadata(discovered)
+    assert info.end_session_endpoint == f"{ISSUER}/logout"
+    assert "end_session_endpoint" in repr(info)
+
+
+def test_provider_info_without_end_session_endpoint(prov):
+    assert prov.end_session_endpoint is None
+    with pytest.raises(ConfigError):
+        rp.end_session_url(prov)
+
+
+def test_discover_raw_is_response_body(http):
+    md = rp.discover(http, ISSUER)
+    assert md.raw == http.op.discovery_document()
+
+
+def test_provider_info_rejects_unsafe_end_session_endpoint():
+    for bad in ["http://op.example.com/l", f"{ISSUER}/l#frag", "https://u:p@op.example.com/l"]:
+        with pytest.raises(GrindvaktError):
+            rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token", end_session_endpoint=bad)
+
+
+def test_from_metadata_drops_unsafe_end_session_endpoint():
+    """Login must not depend on logout: a bad advertised endpoint becomes None."""
+    for bad in ["http://evil.example/l", f"{ISSUER}/l#frag", "https://u:p@op.example.com/l", "not a url"]:
+        md = metadata.ProviderMetadata.from_dict(
+            metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": bad}
+        )
+        info = rp.ProviderInfo.from_metadata(md)
+        assert info.end_session_endpoint is None
+        assert info.token_endpoint == f"{ISSUER}/token"
+        with pytest.raises(ConfigError, match="no usable end_session_endpoint"):
+            rp.end_session_url(info)
+
+
+def test_end_session_url_params_and_encoding(lprov, rpc):
+    url = rp.end_session_url(
+        lprov, id_token_hint="a.b.c", client=rpc,
+        post_logout_redirect_uri="https://rp.example.com/after?x=1&y=2",
+        state="s t&", logout_hint="al ice", ui_locales="sv en", extra={"foo": "b ar"},
+    )
+    parts = urlsplit(url)
+    assert f"{parts.scheme}://{parts.netloc}{parts.path}" == f"{ISSUER}/logout"
+    q = parse_qs(parts.query)
+    assert q == {
+        "id_token_hint": ["a.b.c"], "client_id": [CLIENT_ID],
+        "post_logout_redirect_uri": ["https://rp.example.com/after?x=1&y=2"],
+        "state": ["s t&"], "logout_hint": ["al ice"], "ui_locales": ["sv en"], "foo": ["b ar"],
+    }
+    assert "x=1&y=2" not in parts.query  # the nested URL is percent-encoded
+
+
+def test_end_session_url_minimal_and_existing_query():
+    p = rp.ProviderInfo(ISSUER, f"{ISSUER}/a", f"{ISSUER}/token", end_session_endpoint=f"{ISSUER}/logout?tenant=x")
+    assert rp.end_session_url(p) == f"{ISSUER}/logout?tenant=x"
+    url = rp.end_session_url(p, id_token_hint="h")
+    assert url == f"{ISSUER}/logout?tenant=x&id_token_hint=h"
+    assert rp.end_session_url(p, extra=[("a", "1"), ("a", "2")]).endswith("?tenant=x&a=1&a=2")
+
+
+def test_end_session_url_post_logout_requires_hint_or_client(lprov, rpc):
+    with pytest.raises(BadRequestError, match="id_token_hint or client"):
+        rp.end_session_url(lprov, post_logout_redirect_uri="https://rp.example.com/after")
+    rp.end_session_url(lprov, id_token_hint="h", post_logout_redirect_uri="https://rp.example.com/after")
+    rp.end_session_url(lprov, client=rpc, post_logout_redirect_uri="https://rp.example.com/after")
+    with pytest.raises(BadRequestError):
+        rp.end_session_url(lprov, client=rpc, post_logout_redirect_uri="https://rp.example.com/after#frag")
+    with pytest.raises(BadRequestError):
+        rp.end_session_url(lprov, client=rpc, post_logout_redirect_uri="relative/path")
+
+
+def test_end_session_url_rejects_reserved_extras_and_empty(lprov):
+    for key in ["id_token_hint", "client_id", "post_logout_redirect_uri", "state", "logout_hint", "ui_locales"]:
+        with pytest.raises(BadRequestError, match="library-controlled"):
+            rp.end_session_url(lprov, extra={key: "x"})
+    with pytest.raises(BadRequestError):
+        rp.end_session_url(lprov, state="")
+    p = rp.ProviderInfo(ISSUER, f"{ISSUER}/a", f"{ISSUER}/token", end_session_endpoint=f"{ISSUER}/logout?state=x")
+    with pytest.raises(BadRequestError, match="library-controlled"):
+        rp.end_session_url(p)

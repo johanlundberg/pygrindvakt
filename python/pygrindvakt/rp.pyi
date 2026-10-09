@@ -16,6 +16,8 @@ class ProviderInfo:
         token_endpoint: str,
         userinfo_endpoint: str | None = ...,
         jwks_uri: str | None = ...,
+        *,
+        end_session_endpoint: str | None = ...,
     ) -> None: ...
     @staticmethod
     def from_metadata(metadata: ProviderMetadata) -> ProviderInfo: ...
@@ -29,6 +31,8 @@ class ProviderInfo:
     def userinfo_endpoint(self) -> str | None: ...
     @property
     def jwks_uri(self) -> str | None: ...
+    @property
+    def end_session_endpoint(self) -> str | None: ...
     def __repr__(self) -> str: ...
 
 class RpClient:
@@ -103,6 +107,18 @@ def begin(
     request_object_key: SigningKey | None = ...,
 ) -> tuple[str, str, str, str | None]: ...
 def discover(http: _HttpArg, issuer: str) -> ProviderMetadata: ...
+def end_session_url(
+    provider: ProviderInfo,
+    *,
+    id_token_hint: str | None = ...,
+    client: RpClient | None = ...,
+    post_logout_redirect_uri: str | None = ...,
+    state: str | None = ...,
+    logout_hint: str | None = ...,
+    ui_locales: str | None = ...,
+    extra: dict[str, str] | list[tuple[str, str]] | None = ...,
+) -> str:
+    """OIDC RP-Initiated Logout 1.0 request URL."""
 def fetch_jwks(http: _HttpArg, jwks_uri: str, issuer: str) -> dict[str, Any]: ...
 def exchange_code(
     http: _HttpArg,

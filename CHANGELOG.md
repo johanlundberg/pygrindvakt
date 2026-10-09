@@ -11,6 +11,24 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Added
 
+- RP-Initiated Logout (OIDC 1.0): `rp.end_session_url(provider, *, id_token_hint,
+  client, post_logout_redirect_uri, state, logout_hint, ui_locales, extra)`;
+  `ProviderInfo(..., *, end_session_endpoint=None)` and a read-only
+  `ProviderInfo.end_session_endpoint` (copied by `from_metadata`, validated
+  like other endpoints); `ProviderMetadata.end_session_endpoint` (validated
+  setter). A `Provider` advertises it when the caller sets it; no logout
+  endpoint is implemented on the OP side.
+- `ProviderInfo.from_metadata` drops an advertised `end_session_endpoint` that
+  fails issuer validation (it becomes `None`) instead of raising, so login never
+  depends on logout; the `ProviderInfo` constructor stays strict.
+- `ProviderMetadata.raw` (source document snapshot; for `rp.discover` it is the
+  fetched body) and `to_dict(*, exclude_defaults=False)`.
+- Typed accessors (`None` when absent) for known extension members stored in
+  `extra`: `acr_values_supported`, `claim_types_supported`,
+  `revocation_endpoint`, `introspection_endpoint`,
+  `pushed_authorization_request_endpoint`, `backchannel_logout_supported`,
+  `request_uri_parameter_supported` and others (see the metadata API docs).
+
 - Every pygrindvakt exception has a machine-readable `code` attribute (class
   default, overridden per instance where known, e.g. the upstream OAuth
   `error` such as `invalid_client`, `transport`, `response_too_large`);
@@ -50,6 +68,13 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Changed
 
+- **Breaking:** known extension members in `ProviderMetadata.extra` are now
+  type-checked: a wrong-typed `acr_values_supported`, `backchannel_logout_supported`,
+  `revocation_endpoint`, etc. raises `ValueError` from `from_dict`,
+  `extra = ...` and `set_extra_field` (previously accepted silently).
+- `ProviderMetadata.extra` may now contain `end_session_endpoint`, fixing
+  `from_dict(md.to_dict())` raising `ValueError` for discovered documents that
+  carry it. `from_dict(md.to_dict()).to_dict() == md.to_dict()` now holds.
 - **Breaking:** `rp.fetch_userinfo` now takes `userinfo_endpoint: str | None`
   and raises `ConfigError` for `None`; a signed (`application/jwt`) UserInfo
   response that previously failed generically now raises `AuthnError` with a
