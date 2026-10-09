@@ -86,3 +86,12 @@ def test_oauth_error_rejects_unknown_code():
 def test_oauth_error_with_state_copies():
     e = OAuthError("invalid_request", "bad").with_state("s1")
     assert e.state == "s1" and e.description == "bad"
+
+
+def test_py_typed_is_not_partial():
+    """The package is fully typed: py.typed must not carry the ``partial`` marker."""
+    import pathlib
+
+    marker = pathlib.Path(pygrindvakt.__file__).parent / "py.typed"
+    assert marker.exists()
+    assert "partial" not in marker.read_text()

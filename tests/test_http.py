@@ -1,7 +1,11 @@
 """Framework-agnostic request/response types and the built-in HTTP client."""
 
-import pytest
+import os
+import signal
+import sys
+import time
 
+import pytest
 from pygrindvakt import http
 
 
@@ -116,5 +120,65 @@ def test_reqwest_client_against_local_server():
 
         with pytest.raises(InternalError, match="byte limit"):
             c.get(f"{base}/big")
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fork test is Linux-only")
+@pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
+def test_reqwest_client_usable_after_fork():
+    """A client used (and its pool warmed) before ``fork`` keeps working in the
+    child: the PID-keyed pool is rebuilt lazily and the runtime is per process.
+
+    The fork is quiescent (no other thread is inside a pygrindvakt call). Fork
+    while another thread holds an internal lock is documented as unsupported,
+    so it is deliberately not tested."""
+    import http.server as hs
+    import threading
+
+    class H(hs.BaseHTTPRequestHandler):
+        # HTTP/1.1 + Content-Length => keep-alive, so the parent really leaves a
+        # live pooled connection behind at fork time.
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "4")
+            self.end_headers()
+            self.wfile.write(b"pong")
+
+    srv = hs.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/"
+    try:
+        c = http.ReqwestClient()
+        assert c.get(url)[:2] == (200, b"pong")  # warm the pool in the parent
+        pid = os.fork()
+        if pid == 0:  # child
+            code = 1
+            try:
+                ok = c.get(url)[:2] == (200, b"pong")
+                ok = ok and c.post_form(url, [("a", "b")])[0] in (200, 501)
+                code = 0 if ok else 2
+            finally:
+                os._exit(code)
+        # A stale lock or runtime in the child hangs forever: poll with a
+        # deadline, then kill and reap so the test fails instead of the job.
+        deadline = time.monotonic() + 30
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail("forked child hung (30 s)")
+            time.sleep(0.05)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+        assert c.get(url)[:2] == (200, b"pong")  # parent unaffected
     finally:
         srv.shutdown()

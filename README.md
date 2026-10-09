@@ -77,6 +77,10 @@ userinfo = rp.fetch_userinfo(
 )
 ```
 
+> **Note:** `from pygrindvakt import http` shadows the standard-library `http`
+> package in that module. If you also need `http.HTTPStatus` and friends, use
+> `from pygrindvakt import http as gv_http` or `import pygrindvakt.http`.
+
 > **Security:** `verify_id_token` requires the expected nonce and an explicit
 > signing-algorithm allowlist. Passing `None`
 > raises unless you also pass `unsafe_skip_nonce_check=True`, which emits a
@@ -92,7 +96,21 @@ userinfo = rp.fetch_userinfo(
 grindvakt is `async` Rust; the Python API is synchronous. Each call runs on a
 process-wide tokio runtime with the GIL released, so threads (gunicorn `gthread`,
 FastAPI's threadpool) run in parallel. The runtime is rebuilt lazily after
-`fork`, so a `Provider` built in a gunicorn master keeps working in workers.
+`fork`, so a `Provider` built in a gunicorn master keeps working in workers,
+unless it uses a `RedisStore`, which is process-bound and fails closed in a
+forked child (build it and its `Provider` in each worker).
+
+`http.ReqwestClient` is frozen and safe to share across threads (the GIL is
+released during I/O, so calls run in parallel); `http=None` uses a process-wide
+default instance with the same properties. Its connection pool is keyed by PID
+and rebuilt lazily in a forked child, inherited connections are never reused,
+and a fork while another thread has a request in flight is not supported. Fork only while no other thread is inside a pygrindvakt call: an
+internal lock held by another thread at fork time stays locked in the child
+and can deadlock it. Create the `ReqwestClient` before or after fork, but a `RedisStore`
+*after*. A Python HTTP client runs on the calling thread holding the GIL, so if
+you share one across threads it must be thread-safe itself; re-entrant calls
+into pygrindvakt from it cost a helper thread. See
+[ADR 0001](docs/adr/0001-sync-api-over-embedded-tokio-runtime.md).
 
 State that must be shared across processes:
 
@@ -139,7 +157,7 @@ Design decisions live in `docs/adr/`.
 
 ## Type stubs
 
-The package ships `.pyi` stubs for every submodule (`py.typed` is `partial`).
+The package ships `.pyi` stubs for every submodule (`py.typed` marks the package as fully typed).
 
 ## License
 

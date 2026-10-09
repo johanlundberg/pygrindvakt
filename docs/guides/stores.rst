@@ -103,10 +103,14 @@ Fork semantics
 Prefork servers (gunicorn, uwsgi) import the application in a master
 process and ``fork`` workers. The rules:
 
-* **The** ``Provider`` **survives fork.** The tokio runtime backing the API is
+* **The runtime and HTTP client survive fork.** The tokio runtime backing the API is
   keyed by process id and rebuilt lazily in each child; the built-in HTTP
   client rebuilds its connection pool the same way. A ``Provider`` built in
-  the master keeps working in every worker.
+  the master keeps working in every worker, unless it uses a ``RedisStore``
+  (below). This holds only if the fork
+  happens while no other thread is inside a pygrindvakt call. An internal
+  lock held by another thread at fork time stays locked in the child and can
+  deadlock it. Forking concurrently with active calls is not supported.
 * **In-memory stores are copied, not shared.** After fork each worker has a
   private copy of an ``InMemoryTokenUseStore``. That is exactly the
   multi-process problem above; it is not a crash, it is a silent security

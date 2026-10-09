@@ -21,6 +21,12 @@
 //!   workers. We detect that and build a fresh one; the stale runtime is leaked
 //!   on purpose because dropping it would try to join threads that do not exist
 //!   in the child.
+//! * `fork` is supported only while no other thread is inside a pygrindvakt
+//!   call. `SLOT` (and `ReqwestHttpClient::inner`) are `std::sync::RwLock`s: a
+//!   lock held by another thread at fork time stays locked in the child with
+//!   no owner, and the PID check never runs because `handle()` blocks on the
+//!   lock first. No at-fork reset is attempted; it would not cover the locks
+//!   inside tokio, hyper and the allocator anyway.
 
 use std::future::Future;
 use std::sync::RwLock;

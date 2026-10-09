@@ -9,6 +9,29 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## Unreleased
 
+### Changed
+
+- `py.typed` is now empty (the package is fully typed) instead of `partial`.
+- The `http` argument of `rp`, `federation` and `discovery` functions is typed
+  as `HttpClientProtocol | ReqwestClient | None` instead of `Any | None`, and
+  `HttpClientProtocol` methods are typed as returning a
+  `(status, body, content_type)` tuple or an `HttpFetchResponse`.
+
+### Documentation
+
+- Documented that `from pygrindvakt import http` shadows the standard-library
+  `http` package, with `from pygrindvakt import http as gv_http` /
+  `import pygrindvakt.http` as alternatives.
+- Documented `ReqwestClient` thread safety and fork behaviour (PID-keyed pool,
+  per-process runtime, `RedisStore` after fork), and the threading contract of
+  Python HTTP clients. Fork is supported only while no other thread is inside
+  a pygrindvakt call; a lock held by another thread at fork time is inherited
+  locked by the child and can deadlock it.
+
+### Added
+
+- CI job running `mypy --strict` over `tests/typecheck_usage.py`.
+
 ## [0.1.0] - 2026-09-15
 
 Initial release, binding `grindvakt` 0.8.0 with the `pkcs11` and `redis`

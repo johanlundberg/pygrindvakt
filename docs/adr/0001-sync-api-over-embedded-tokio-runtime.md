@@ -48,6 +48,11 @@ Python thread), created lazily and stored in a PID-keyed slot.
   its pool on PID change; `RedisStore` records its creating PID and fails closed
   afterwards (see ADR 0002). `os.register_at_fork` was rejected because it only
   covers forks initiated through Python and still needs the Rust-side reset.
+  The PID check cannot help if another thread holds `SLOT` (or a client's
+  pool lock) at fork time: the child inherits the lock held with no owner and
+  blocks before comparing PIDs. An at-fork reset of our own locks was
+  rejected because tokio, hyper and the allocator hold locks we cannot reset.
+  Supported: fork while no other thread is inside a pygrindvakt call.
 - A `current_thread` runtime was rejected: spawned tasks (redis reconnects,
   hyper connections) must be polled between Python calls, and concurrent
   `block_on`s from gunicorn `gthread` workers would serialize.
@@ -60,5 +65,10 @@ Python thread), created lazily and stored in a PID-keyed slot.
   HTTP client timeouts (30 s total by default) and Redis command timeouts.
 - Worker threads never touch Python, so interpreter shutdown cannot hang on
   them. Rule: never `tokio::spawn` a future that calls `Python::attach`.
+- `ReqwestClient` is frozen and `Arc`-shared: one instance is safe across
+  threads, the GIL is released during I/O, and `http=None` uses a process-wide
+  default with the same properties. User-facing summary: the `ReqwestClient`
+  section of `docs/api/http.rst` and the deployment note in
+  `docs/guides/rp.rst`.
 - A `RedisStore` must be constructed after fork (gunicorn `post_fork` hook or
   lazily in the worker).

@@ -99,6 +99,26 @@ jobs:
       run: |
         .venv/bin/python -m pytest tests/ -vvv
 
+  # Static typing check of the shipped stubs. No native build is needed: mypy
+  # reads python/pygrindvakt/*.pyi directly via MYPYPATH.
+  typecheck:
+    name: mypy --strict (stubs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install UV
+      run: |
+        python3 -m pip install --user "uv==${UV_VERSION}"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Run mypy
+      run: |
+        uv venv
+        uv pip install mypy
+        MYPYPATH=python .venv/bin/mypy --strict tests/typecheck_usage.py
+
   #manylinux_aarch64:
     #runs-on: ubuntu-24-arm
     #timeout-minutes: 10

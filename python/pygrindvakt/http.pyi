@@ -5,25 +5,48 @@ SECURITY: an injected ``HttpClientProtocol`` implementation is responsible for
 timeouts, for *not* following redirects (a 307/308 would re-send token-endpoint
 form bodies cross-origin), and for bounding response sizes. The built-in
 ``ReqwestClient`` does all three.
+
+NAME SHADOWING: ``from pygrindvakt import http`` rebinds the name ``http`` in
+the importing module and shadows the standard-library ``http`` package there
+(``http.HTTPStatus``, ``http.client``, ``http.server`` ...). Prefer
+``from pygrindvakt import http as gv_http`` or ``import pygrindvakt.http``.
+
+THREADING: see ``ReqwestClient`` for the thread-safety and fork semantics of
+the built-in client. A Python ``HttpClientProtocol`` implementation runs on the
+calling thread while it holds the GIL, so one shared across threads must be
+thread-safe itself.
 """
 
 from typing import Any, Protocol
 
+# Stub-only aliases (underscore-prefixed so they are not expected at runtime).
+# What a client method may return: the ``(status, body, content_type)`` tuple or
+# an ``HttpFetchResponse`` (see ``extract_fetch`` in ``src/http.rs``).
+_FetchResult = tuple[int, bytes, str | None] | HttpFetchResponse
+# What every networked function accepts as ``http``: any protocol client, the
+# built-in ``ReqwestClient``, or ``None`` for the process-wide default client.
+_HttpArg = HttpClientProtocol | ReqwestClient | None
+
 class HttpClientProtocol(Protocol):
     """Outbound HTTP client protocol accepted wherever ``http=`` is taken.
 
-    Either method may also return an ``HttpFetchResponse`` instead of the
+    Either method may return an ``HttpFetchResponse`` or the
     ``(status, body, content_type)`` tuple. Exceptions are logged via
     ``sys.unraisablehook`` and reported as ``InternalError``.
+
+    The implementation runs on the thread driving the pygrindvakt call, holding
+    the GIL. An instance shared across threads must be thread-safe itself.
+    Calling back into pygrindvakt from inside a method is supported; each such
+    nested call runs on a helper thread.
     """
 
-    def get(self, url: str) -> tuple[int, bytes, str | None]: ...
+    def get(self, url: str) -> _FetchResult: ...
     def post_form(
         self,
         url: str,
         form: list[tuple[str, str]],
         headers: list[tuple[str, str]],
-    ) -> tuple[int, bytes, str | None]: ...
+    ) -> _FetchResult: ...
 
 class HttpRequestData:
     """A parsed inbound HTTP request, normalized for grindvakt.
@@ -153,6 +176,20 @@ class ReqwestClient:
     Never follows redirects, enforces connect/read/total timeouts and a
     streaming response-size cap. Also exposes ``get`` / ``post_form`` so it
     satisfies the Python ``HttpClientProtocol`` itself.
+
+    Thread safety: instances are frozen and share their state behind an
+    ``Arc``, so one instance may be used from many threads. The GIL is released
+    during I/O, so concurrent calls run in parallel. ``http=None`` selects a
+    process-wide default instance with the same properties.
+
+    Fork safety: the connection pool is keyed by PID and rebuilt lazily in a
+    child after ``fork``; inherited connections are never reused and the tokio
+    runtime is rebuilt per process (ADR 0001). Forking while another thread has a
+    request in flight is not supported. Fork only while no other
+    thread is inside a pygrindvakt call: an internal lock held by another
+    thread at fork time stays locked in the child and can deadlock it. A
+    ``ReqwestClient`` may be created before ``fork``; a ``RedisStore`` must be
+    created after.
     """
 
     def __init__(
