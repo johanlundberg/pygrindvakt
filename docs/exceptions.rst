@@ -145,6 +145,12 @@ Instance-level overrides:
   ``invalid_grant`` (also available as ``upstream_error``). Without one the
   class default ``authn`` applies. Code values from the upstream are
   arbitrary strings; compare against known values, do not assume a closed set.
+* ``userinfo_unverifiable`` (``AuthnError``): :func:`pygrindvakt.rp.fetch_userinfo`
+  received a signed (``application/jwt``) UserInfo response but was not given
+  everything needed to verify it (``jwks``, ``client_id``,
+  ``allowed_algorithms``, ``trust``); it refuses rather than trusting it.
+* ``userinfo_encrypted`` (``AuthnError``): the UserInfo response is an
+  encrypted JWT (JWE), which is not supported.
 * ``transport`` (``InternalError``): an outbound request failed before a
   response was obtained (connection refused, timeout, a Python ``HttpClient``
   that raised). The original failure is chained as ``__cause__``.

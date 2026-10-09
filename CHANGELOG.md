@@ -31,7 +31,30 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `rp.signed_request_object` and `rp.exchange_code` (absolute URL, no
   fragment; the same value must be passed to `exchange_code`).
 
+- `rp.fetch_userinfo(..., method="GET")` sends the access token on a GET, and
+  signed `application/jwt` UserInfo responses are verified with new keyword
+  arguments `jwks`, `client_id`, `allowed_algorithms`, `trust`
+  (`"typed"` / `"dedicated_keys"` / `"untyped_shared_key_compat"`), `typ`,
+  `max_age` (default 300; `None` disables the age bound and makes replay
+  unbounded) and `require_exp`. A signed response without the verification
+  inputs raises `AuthnError` with `code == "userinfo_unverifiable"`; JWE is
+  rejected (`userinfo_encrypted`). Defaults (POST, JSON) are unchanged.
+- `ReqwestClient.get(url, headers=None)` accepts request headers (invalid
+  names or values raise `BadRequestError`). Python `HttpClient`s may support
+  headers on GET via a `headers` parameter / `**kwargs` on `get`, or a
+  `get_with_headers(url, headers)` method (preferred); the capability is
+  decided once, never by catching `TypeError`. Stub-only
+  `HttpClientWithHeadersProtocol` / `HttpClientGetWithHeadersProtocol`.
+- Tests (two local servers) that credentials and form bodies are never
+  forwarded on cross-origin 301/302/303/307/308 redirects.
+
 ### Changed
+
+- **Breaking:** `rp.fetch_userinfo` now takes `userinfo_endpoint: str | None`
+  and raises `ConfigError` for `None`; a signed (`application/jwt`) UserInfo
+  response that previously failed generically now raises `AuthnError` with a
+  precise code unless verification inputs are supplied. A GET with a Python
+  client that supports no headers raises `ConfigError`.
 
 - **Breaking:** exception instances now always have `code` and `upstream_*`
   attributes; code that set or relied on the absence of an attribute named

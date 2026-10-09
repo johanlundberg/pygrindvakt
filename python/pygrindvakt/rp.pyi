@@ -1,8 +1,8 @@
 """Type stubs for ``pygrindvakt.rp`` - the relying-party (client) side of OIDC."""
 
-from typing import Any
+from typing import Any, Literal, overload
 
-from .http import _HttpArg
+from .http import _HttpArg, _HttpHeadersArg
 from .keys import SigningKey
 from .metadata import ProviderMetadata
 
@@ -123,12 +123,57 @@ def verify_id_token(
     trusted_additional_audiences: list[str] | None = ...,
     unsafe_skip_nonce_check: bool = ...,
 ) -> dict[str, Any]: ...
+@overload
 def fetch_userinfo(
     http: _HttpArg,
-    userinfo_endpoint: str,
+    userinfo_endpoint: str | None,
     access_token: str,
     expected_sub: str,
     issuer: str,
+    *,
+    method: Literal["POST"] = ...,
+    jwks: dict[str, Any] | None = ...,
+    client_id: str | None = ...,
+    allowed_algorithms: list[str] | None = ...,
+    trust: Literal["typed", "dedicated_keys", "untyped_shared_key_compat"] | None = ...,
+    typ: str | None = ...,
+    max_age: int | None = ...,
+    require_exp: bool = ...,
+) -> dict[str, Any]:
+    """Fetch UserInfo with a Bearer ``access_token`` and return its claims.
+
+    ``method="GET"`` needs an ``http`` client that supports request headers on
+    GET (see ``pygrindvakt.http``); otherwise ``ConfigError``. ``userinfo_endpoint=None``
+    (the OP advertises none) raises ``ConfigError``.
+
+    A signed ``application/jwt`` response is verified only when ``jwks``,
+    ``client_id``, ``allowed_algorithms`` and ``trust`` are all given;
+    otherwise ``AuthnError`` with ``code == "userinfo_unverifiable"``.
+    ``trust`` is how the JWT is proven to be UserInfo: ``"typed"`` (needs
+    ``typ``; safe), ``"dedicated_keys"`` (safe if ``jwks`` holds only UserInfo
+    signing keys) or ``"untyped_shared_key_compat"`` (weakest: a fresh
+    id_token without nonce/at_hash/c_hash is accepted). ``max_age`` bounds the
+    token age from ``iat`` (default 300 s); ``None`` removes the bound and
+    replay becomes unbounded. Encrypted (JWE) responses are rejected
+    (``code == "userinfo_encrypted"``).
+    """
+
+@overload
+def fetch_userinfo(
+    http: _HttpHeadersArg,
+    userinfo_endpoint: str | None,
+    access_token: str,
+    expected_sub: str,
+    issuer: str,
+    *,
+    method: Literal["GET"],
+    jwks: dict[str, Any] | None = ...,
+    client_id: str | None = ...,
+    allowed_algorithms: list[str] | None = ...,
+    trust: Literal["typed", "dedicated_keys", "untyped_shared_key_compat"] | None = ...,
+    typ: str | None = ...,
+    max_age: int | None = ...,
+    require_exp: bool = ...,
 ) -> dict[str, Any]: ...
 def build_client_assertion(key: SigningKey, client_id: str, audience: str) -> str: ...
 def claims_to_attributes(claims: dict[str, Any]) -> dict[str, list[str]]: ...

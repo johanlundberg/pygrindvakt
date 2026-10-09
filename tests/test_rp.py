@@ -835,3 +835,255 @@ def test_claims_to_attributes_shape():
     )
     assert out == {"a": ["x"], "b": ["y", "z"], "n": ["3"], "t": ["true"]}
     assert rp.claims_to_attributes({}) == {}
+
+
+# --- userinfo: GET, signed JWT, endpoint policy --------------------------------
+
+UI_URL = f"{ISSUER}/userinfo"
+
+
+class UserinfoRecorder:
+    """Python client with header support on ``get``; records every request."""
+
+    def __init__(self, status=200, body=b'{"sub":"alice","name":"A"}', ctype="application/json"):
+        self.calls = []
+        self.resp = (status, body, ctype)
+
+    def get(self, url, headers=None):
+        self.calls.append(("GET", url, headers))
+        return self.resp
+
+    def post_form(self, url, form, headers):
+        self.calls.append(("POST", url, form, headers))
+        return self.resp
+
+
+def ui(http, **kw):
+    return rp.fetch_userinfo(http, UI_URL, "tok", "alice", ISSUER, **kw)
+
+
+def test_userinfo_post_default_unchanged():
+    c = UserinfoRecorder()
+    assert ui(c)["name"] == "A"
+    assert c.calls == [("POST", UI_URL, [], [("authorization", "Bearer tok")])]
+
+
+def test_userinfo_get_sends_authorization_header():
+    c = UserinfoRecorder()
+    assert ui(c, method="GET")["sub"] == "alice"
+    assert c.calls == [("GET", UI_URL, [("authorization", "Bearer tok")])]
+
+
+def test_userinfo_get_with_get_with_headers_preferred():
+    class Both(UserinfoRecorder):
+        def get_with_headers(self, url, headers):
+            self.calls.append(("GWH", url, headers))
+            return self.resp
+
+    c = Both()
+    ui(c, method="GET")
+    assert c.calls == [("GWH", UI_URL, [("authorization", "Bearer tok")])]
+
+
+def test_userinfo_get_with_kwargs_get():
+    class Kw:
+        def get(self, url, **kwargs):
+            self.kw = kwargs
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    c = Kw()
+    ui(c, method="GET")
+    assert c.kw == {"headers": [("authorization", "Bearer tok")]}
+
+
+def test_userinfo_get_client_without_header_support_is_config_error():
+    from pygrindvakt import ConfigError
+
+    class Plain:
+        called = False
+
+        def get(self, url):
+            Plain.called = True
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, url, form, headers):
+            return 200, b'{"sub":"alice"}', "application/json"
+
+    with pytest.raises(ConfigError, match="request headers"):
+        ui(Plain(), method="GET")
+    assert not Plain.called  # decided up front, never call-and-fall-back
+    assert ui(Plain())["sub"] == "alice"  # POST still fine
+
+
+def test_userinfo_get_typeerror_inside_client_is_not_swallowed():
+    class Boom:
+        def get(self, url, headers=None):
+            raise TypeError("inside client")
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    with pytest.raises(InternalError) as e:
+        ui(Boom(), method="GET")
+    assert e.value.code == "transport"
+
+
+def test_userinfo_invalid_method_and_trust_values():
+    c = UserinfoRecorder()
+    with pytest.raises(ValueError, match="method"):
+        ui(c, method="PUT")
+    with pytest.raises(ValueError, match="trust"):
+        ui(c, trust="bogus")
+    with pytest.raises(ValueError, match="requires typ"):
+        ui(c, trust="typed")
+    with pytest.raises(ValueError, match="only used"):
+        ui(c, trust="dedicated_keys", typ="userinfo+jwt")
+
+
+def test_userinfo_endpoint_none_is_config_error():
+    from pygrindvakt import ConfigError
+
+    with pytest.raises(ConfigError, match="does not advertise a userinfo_endpoint"):
+        rp.fetch_userinfo(UserinfoRecorder(), None, "tok", "alice", ISSUER)
+
+
+def test_userinfo_get_real_server_sends_authorization():
+    import http.server as hs
+
+    seen = []
+
+    class H(hs.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"sub":"alice"}')
+
+    srv = hs.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    try:
+        out = rp.fetch_userinfo(None, f"{base}/userinfo", "tok", "alice", base, method="GET")
+        assert out == {"sub": "alice"} and seen == ["Bearer tok"]
+    finally:
+        srv.shutdown()
+
+
+def _jwt_claims(**over):
+    now = int(time.time())
+    claims = {"iss": ISSUER, "sub": "alice", "aud": CLIENT_ID, "iat": now, "name": "A"}
+    claims.update(over)
+    return {k: v for k, v in claims.items() if v is not None}
+
+
+def _signed(op_key, claims, typ=None):
+    return UserinfoRecorder(body=jwt.sign(op_key, claims, typ).encode(), ctype="application/jwt")
+
+
+def _verify(c, op_key, trust="dedicated_keys", typ=None, **kw):
+    return ui(c, jwks=op_key.to_public_jwks(), client_id=CLIENT_ID, allowed_algorithms=["ES256"],
+              trust=trust, typ=typ, **kw)
+
+
+def test_userinfo_signed_jwt_accepted_per_trust_mode(op_key):
+    claims = _jwt_claims()
+    for method in ("POST", "GET"):
+        out = _verify(_signed(op_key, claims), op_key, "dedicated_keys", method=method)
+        assert out["name"] == "A" and out["sub"] == "alice"
+    assert _verify(_signed(op_key, claims), op_key, "untyped_shared_key_compat")["sub"] == "alice"
+    typed = _signed(op_key, claims, "userinfo+jwt")
+    assert _verify(typed, op_key, "typed", "userinfo+jwt")["sub"] == "alice"
+
+
+def test_userinfo_typed_rejects_wrong_or_missing_typ(op_key):
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims(), "other+jwt"), op_key, "typed", "userinfo+jwt")
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims()), op_key, "typed", "userinfo+jwt")
+    # typ must identify UserInfo specifically
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims(), "JWT"), op_key, "typed", "JWT")
+
+
+@pytest.mark.parametrize("missing", ["jwks", "client_id", "allowed_algorithms", "trust"])
+def test_userinfo_signed_jwt_fails_closed_without_verification_inputs(op_key, missing):
+    kw = dict(jwks=op_key.to_public_jwks(), client_id=CLIENT_ID,
+              allowed_algorithms=["ES256"], trust="dedicated_keys")
+    del kw[missing]
+    with pytest.raises(AuthnError) as e:
+        ui(_signed(op_key, _jwt_claims()), **kw)
+    assert e.value.code == "userinfo_unverifiable"
+    assert missing in str(e.value)
+    # an empty algorithm list is also unverifiable
+    if missing == "allowed_algorithms":
+        with pytest.raises(AuthnError) as e:
+            ui(_signed(op_key, _jwt_claims()), allowed_algorithms=[], jwks=kw["jwks"],
+               client_id=CLIENT_ID, trust="dedicated_keys")
+        assert e.value.code == "userinfo_unverifiable"
+
+
+def test_userinfo_signed_jwt_rejections(op_key):
+    other = keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid="op-1")
+    cases = {
+        "bad signature": _signed(other, _jwt_claims()),
+        "wrong iss": _signed(op_key, _jwt_claims(iss="https://evil.example")),
+        "wrong aud": _signed(op_key, _jwt_claims(aud="someone-else")),
+        "multi aud": _signed(op_key, _jwt_claims(aud=[CLIENT_ID, "api"])),
+        "sub mismatch": _signed(op_key, _jwt_claims(sub="mallory")),
+        "expired": _signed(op_key, _jwt_claims(exp=int(time.time()) - 3600)),
+        "stale iat": _signed(op_key, _jwt_claims(iat=int(time.time()) - 3600)),
+        "no iat": _signed(op_key, _jwt_claims(iat=None)),
+        "nonce": _signed(op_key, _jwt_claims(nonce="n")),
+        "at_hash": _signed(op_key, _jwt_claims(at_hash="h")),
+        "c_hash": _signed(op_key, _jwt_claims(c_hash="h")),
+        "id_token typ": _signed(op_key, _jwt_claims(), "id_token+jwt"),
+    }
+    for name, c in cases.items():
+        with pytest.raises(GrindvaktError):
+            _verify(c, op_key, "untyped_shared_key_compat")
+            pytest.fail(f"{name} was accepted")
+    # require_exp: a token without exp is refused only when asked
+    assert _verify(_signed(op_key, _jwt_claims()), op_key)["sub"] == "alice"
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims()), op_key, require_exp=True)
+    ok_exp = _jwt_claims(exp=int(time.time()) + 300)
+    assert _verify(_signed(op_key, ok_exp), op_key, require_exp=True)["sub"] == "alice"
+
+
+def test_userinfo_wrong_content_type_for_signed_body_is_not_trusted(op_key):
+    """A JWT served as JSON is not accepted as claims (no sub in the body)."""
+    body = jwt.sign(op_key, _jwt_claims()).encode()
+    with pytest.raises(GrindvaktError):
+        ui(UserinfoRecorder(body=body, ctype="application/json"))
+
+
+def test_userinfo_max_age_default_and_disabled(op_key):
+    old = _jwt_claims(iat=int(time.time()) - 3600)
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, old), op_key)
+    assert _verify(_signed(op_key, old), op_key, max_age=7200)["sub"] == "alice"
+    undated = _jwt_claims(iat=None)
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, undated), op_key)
+    assert _verify(_signed(op_key, undated), op_key, max_age=None)["sub"] == "alice"
+    assert _verify(_signed(op_key, old), op_key, max_age=None)["sub"] == "alice"
+
+
+def test_userinfo_jwe_rejected():
+    jwe = b"eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.a.b.c.d"
+    with pytest.raises(AuthnError, match="encrypted") as e:
+        ui(UserinfoRecorder(body=jwe, ctype="application/jwt"))
+    assert e.value.code == "userinfo_encrypted"
+
+
+def test_userinfo_jwks_must_be_a_jwks_dict(op_key):
+    with pytest.raises(Exception):
+        ui(_signed(op_key, _jwt_claims()), jwks="not-a-jwks", client_id=CLIENT_ID,
+           allowed_algorithms=["ES256"], trust="dedicated_keys")

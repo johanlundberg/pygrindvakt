@@ -15,10 +15,17 @@
 //!     -> tuple[int, bytes, str | None]
 //! ```
 //!
+//! A client may additionally support request headers on GET (needed for
+//! `fetch_userinfo(method="GET")`), decided once when the client is first
+//! used: either `get(url, headers=...)` (a `headers` parameter or `**kwargs`)
+//! or a callable `get_with_headers(url, headers)`, which is preferred when
+//! present. There is no call-and-retry fallback.
+//!
 //! SECURITY: an injected client is responsible for timeouts, for *not*
-//! following redirects (a 307/308 would re-send token-endpoint form bodies
-//! cross-origin), and for bounding response sizes. The built-in client does all
-//! three.
+//! following redirects (a 307/308 would re-send token-endpoint form bodies and
+//! Bearer tokens cross-origin; at minimum `Authorization` must be stripped on
+//! a cross-origin redirect), and for bounding response sizes. The built-in
+//! client never follows redirects, for any request type, and does all three.
 //!
 //! A Python client runs on the thread driving the call, holding the GIL, so an
 //! instance shared across threads must be thread-safe itself; calling back into
@@ -615,10 +622,15 @@ async fn into_fetch(
 }
 
 impl ReqwestHttpClient {
-    async fn get_raw(&self, url: &str) -> Result<RsFetch, RawFailure> {
+    async fn get_raw(
+        &self,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<RsFetch, RawFailure> {
         let resp = self
             .client()
             .get(url)
+            .headers(headers)
             .send()
             .await
             .map_err(|e| send_failure("GET", url, &e))?;
@@ -672,10 +684,42 @@ impl ReqwestCall {
     }
 }
 
+/// Validate caller-supplied header pairs; a bad name or value is a
+/// `BadRequest`, never a panic.
+fn header_map(headers: &[(String, String)]) -> grindvakt::Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let mut map = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .map_err(|_| RsError::BadRequest(format!("invalid HTTP header name: {k:?}")))?;
+        let mut value = HeaderValue::from_str(v)
+            .map_err(|_| RsError::BadRequest(format!("invalid HTTP header value for {k:?}")))?;
+        // Keep credentials out of reqwest's Debug output and HPACK indexes.
+        if name == reqwest::header::AUTHORIZATION || name == reqwest::header::COOKIE {
+            value.set_sensitive(true);
+        }
+        map.append(name, value);
+    }
+    Ok(map)
+}
+
 #[async_trait]
 impl HttpClient for ReqwestCall {
     async fn get(&self, url: &str) -> grindvakt::Result<RsFetch> {
-        self.finish(self.client.get_raw(url).await)
+        self.finish(
+            self.client
+                .get_raw(url, reqwest::header::HeaderMap::new())
+                .await,
+        )
+    }
+
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<RsFetch> {
+        let map = header_map(headers)?;
+        self.finish(self.client.get_raw(url, map).await)
     }
 
     async fn post_form(
@@ -748,19 +792,28 @@ impl ReqwestClient {
         })
     }
 
-    /// Issue a GET. Returns `(status, body, content_type)`.
+    /// Issue a GET, optionally with request headers. Returns
+    /// `(status, body, content_type)`. Redirects are never followed, so the
+    /// headers (for example `Authorization`) are only ever sent to `url`.
+    #[pyo3(signature = (url, headers = None))]
     fn get<'py>(
         &self,
         py: Python<'py>,
         url: String,
+        headers: Option<Vec<(String, String)>>,
     ) -> PyResult<(u16, Bound<'py, PyBytes>, Option<String>)> {
         let failures = Failures::default();
         let client = ReqwestCall {
             client: self.inner.clone(),
             failures: failures.clone(),
         };
-        let r = crate::runtime::block_on(py, async move { client.get(&url).await })?
-            .map_err(|e| failures.err(py, e))?;
+        let r = crate::runtime::block_on(py, async move {
+            match headers {
+                Some(h) => client.get_with_headers(&url, &h).await,
+                None => client.get(&url).await,
+            }
+        })?
+        .map_err(|e| failures.err(py, e))?;
         Ok((r.status, PyBytes::new(py, &r.body), r.content_type))
     }
 
@@ -826,6 +879,56 @@ fn default_http_client() -> Arc<ReqwestHttpClient> {
 pub struct PyHttpClient {
     obj: Py<PyAny>,
     failures: Failures,
+    headers_mode: HeadersMode,
+}
+
+/// How (whether) a Python client accepts request headers on GET, decided once
+/// when the adapter is built.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadersMode {
+    Unsupported,
+    /// `get_with_headers(url, headers)`.
+    GetWithHeaders,
+    /// `get(url, headers=headers)`.
+    GetKeyword,
+}
+
+/// `get` accepts a `headers` parameter or `**kwargs`. Introspection failure
+/// (for example a builtin without a signature) counts as unsupported.
+fn get_accepts_headers(py: Python<'_>, obj: &Bound<'_, PyAny>) -> bool {
+    let probe = || -> PyResult<bool> {
+        let get = obj.getattr("get")?;
+        let sig = py.import("inspect")?.call_method1("signature", (get,))?;
+        let params = sig.getattr("parameters")?;
+        if params.contains("headers")? {
+            return Ok(true);
+        }
+        let var_kw = py
+            .import("inspect")?
+            .getattr("Parameter")?
+            .getattr("VAR_KEYWORD")?;
+        for p in params.call_method0("values")?.try_iter()? {
+            if p?.getattr("kind")?.eq(&var_kw)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    probe().unwrap_or(false)
+}
+
+fn headers_mode(py: Python<'_>, obj: &Bound<'_, PyAny>) -> HeadersMode {
+    if obj
+        .getattr("get_with_headers")
+        .map(|a| a.is_callable())
+        .unwrap_or(false)
+    {
+        HeadersMode::GetWithHeaders
+    } else if get_accepts_headers(py, obj) {
+        HeadersMode::GetKeyword
+    } else {
+        HeadersMode::Unsupported
+    }
 }
 
 impl PyHttpClient {
@@ -877,6 +980,41 @@ impl HttpClient for PyHttpClient {
         })
     }
 
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<RsFetch> {
+        Python::attach(|py| {
+            let obj = self.obj.bind(py);
+            let (what, result) = match self.headers_mode {
+                HeadersMode::Unsupported => {
+                    return Err(RsError::Config(
+                        "this HttpClient does not support request headers on GET: its `get` \
+                         must accept a `headers` parameter (or **kwargs), or it must provide \
+                         `get_with_headers(url, headers)`"
+                            .into(),
+                    ))
+                }
+                HeadersMode::GetWithHeaders => (
+                    "HttpClient.get_with_headers",
+                    obj.call_method1("get_with_headers", (url, headers.to_vec())),
+                ),
+                HeadersMode::GetKeyword => {
+                    let kwargs = pyo3::types::PyDict::new(py);
+                    let call = kwargs
+                        .set_item("headers", headers.to_vec())
+                        .and_then(|_| obj.call_method("get", (url,), Some(&kwargs)));
+                    ("HttpClient.get", call)
+                }
+            };
+            result
+                .and_then(|r| extract_fetch(&r))
+                .map(|f| self.ok(f))
+                .map_err(|e| self.fail(py, obj, what, e))
+        })
+    }
+
     async fn post_form(
         &self,
         url: &str,
@@ -920,6 +1058,7 @@ pub fn extract_http_client(
                 Arc::new(PyHttpClient {
                     obj: o.clone().unbind(),
                     failures: failures.clone(),
+                    headers_mode: headers_mode(o.py(), o),
                 })
             }
         }

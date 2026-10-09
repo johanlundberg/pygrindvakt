@@ -182,3 +182,103 @@ def test_reqwest_client_usable_after_fork():
         assert c.get(url)[:2] == (200, b"pong")  # parent unaffected
     finally:
         srv.shutdown()
+
+
+def _recording_servers():
+    """Two local servers on different ports. A redirects (status taken from the
+    path, e.g. /307) to B; B records every request it receives."""
+    import http.server as hs
+    import threading
+
+    received = []
+
+    class B(hs.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _record(self):
+            n = int(self.headers.get("Content-Length", 0))
+            received.append((self.command, self.headers.get("Authorization"), self.rfile.read(n)))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"b")
+
+        do_GET = do_POST = _record
+
+    b = hs.ThreadingHTTPServer(("127.0.0.1", 0), B)
+
+    class A(hs.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _redirect(self):
+            n = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(n)
+            self.send_response(int(self.path.strip("/")))
+            self.send_header("Location", f"http://127.0.0.1:{b.server_port}/steal")
+            self.end_headers()
+
+        do_GET = do_POST = _redirect
+
+    a = hs.ThreadingHTTPServer(("127.0.0.1", 0), A)
+    for s in (a, b):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    return a, b, received
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_credentials_never_forwarded_on_cross_origin_redirect(status):
+    a, b, received = _recording_servers()
+    try:
+        c = http.ReqwestClient()
+        base = f"http://127.0.0.1:{a.server_port}/{status}"
+        st, _, _ = c.get(base, [("Authorization", "Bearer secret-token")])
+        assert st == status
+        st, _, _ = c.post_form(base, [("client_secret", "hunter2")], [("Authorization", "Basic abc")])
+        assert st == status
+        st, _, _ = c.get(base)
+        assert st == status
+        assert received == []  # B was never contacted
+    finally:
+        a.shutdown()
+        b.shutdown()
+
+
+def test_reqwest_get_sends_headers():
+    import http.server as hs
+    import threading
+
+    seen = {}
+
+    class H(hs.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen["auth"] = self.headers.get("Authorization")
+            seen["x"] = self.headers.get_all("X-Multi")
+            self.send_response(200)
+            self.end_headers()
+
+    srv = hs.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c = http.ReqwestClient()
+        url = f"http://127.0.0.1:{srv.server_port}/"
+        assert c.get(url, headers=[("Authorization", "Bearer t"), ("X-Multi", "1"), ("X-Multi", "2")])[0] == 200
+        assert seen == {"auth": "Bearer t", "x": ["1", "2"]}
+        assert c.get(url, None)[0] == 200 and seen["auth"] is None
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [[("bad name", "v")], [("", "v")], [("X-Ok", "line\nbreak")], [("X-Ok", "café\x00")]],
+)
+def test_reqwest_get_invalid_header_is_bad_request(headers):
+    from pygrindvakt import BadRequestError
+
+    with pytest.raises(BadRequestError):
+        http.ReqwestClient().get("http://127.0.0.1:9/", headers)

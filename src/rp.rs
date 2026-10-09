@@ -22,7 +22,7 @@ use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
 use crate::convert::{from_py, new_submodule, to_py, warn};
-use crate::errors::{err, AuthnError};
+use crate::errors::{err, with_code, AuthnError, ConfigError};
 use crate::http::extract_http_client;
 use crate::jwt::jwks_from_py;
 use crate::keys::SigningKey;
@@ -629,33 +629,159 @@ fn verify_id_token<'py>(
     to_py(py, &claims)
 }
 
-/// Fetch the userinfo document with a Bearer `access_token` and return it as
-/// a dict. The response `sub` must exactly match the validated ID-token
-/// subject supplied as `expected_sub`. Raises `AuthnError` on a non-200 or
-/// subject mismatch.
+/// Fetch the UserInfo document with a Bearer `access_token` and return its
+/// claims as a dict, bound to `expected_sub` (the validated id_token subject).
+///
+/// `userinfo_endpoint` may be `None` (the OP did not advertise one), which
+/// raises `ConfigError`. `method` is `"POST"` (default; empty form body) or
+/// `"GET"` (needs an `http` client that supports request headers on GET, see
+/// `pygrindvakt.http`).
+///
+/// A JSON response is parsed directly. A signed (`application/jwt`) response
+/// fails closed unless `jwks`, `client_id`, `allowed_algorithms` and `trust`
+/// are all given (`AuthnError`, `code == "userinfo_unverifiable"`). `trust`
+/// states how the JWT is proven to be UserInfo and not a replayed id_token:
+/// `"typed"` (needs `typ`), `"dedicated_keys"` or
+/// `"untyped_shared_key_compat"` (weakest). `max_age` bounds the token age
+/// from `iat` (default 300 s); `None` removes the bound, leaving replay
+/// unbounded. Encrypted (JWE) responses are not supported.
 #[pyfunction]
-#[pyo3(signature = (http, userinfo_endpoint, access_token, expected_sub, issuer))]
+#[pyo3(signature = (http, userinfo_endpoint, access_token, expected_sub, issuer, *,
+                    method = "POST", jwks = None, client_id = None,
+                    allowed_algorithms = None, trust = None, typ = None,
+                    max_age = Some(grp::DEFAULT_USERINFO_JWT_MAX_AGE), require_exp = false))]
+#[allow(clippy::too_many_arguments)]
 fn fetch_userinfo<'py>(
     py: Python<'py>,
     http: Option<&Bound<'py, PyAny>>,
-    userinfo_endpoint: String,
+    userinfo_endpoint: Option<String>,
     access_token: String,
     expected_sub: String,
     issuer: String,
+    method: &str,
+    jwks: Option<&Bound<'py, PyAny>>,
+    client_id: Option<String>,
+    allowed_algorithms: Option<Vec<String>>,
+    trust: Option<&str>,
+    typ: Option<String>,
+    max_age: Option<u64>,
+    require_exp: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let method = match method {
+        "POST" => grp::UserinfoMethod::Post,
+        "GET" => grp::UserinfoMethod::Get,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "method must be \"POST\" or \"GET\", got {other:?}"
+            )))
+        }
+    };
+    if let Some(other) =
+        trust.filter(|t| !matches!(*t, "typed" | "dedicated_keys" | "untyped_shared_key_compat"))
+    {
+        return Err(PyValueError::new_err(format!(
+            "trust must be \"typed\", \"dedicated_keys\" or \"untyped_shared_key_compat\", \
+             got {other:?}"
+        )));
+    }
+    if trust == Some("typed") && typ.is_none() {
+        return Err(PyValueError::new_err("trust=\"typed\" requires typ"));
+    }
+    if typ.is_some() && trust != Some("typed") {
+        return Err(PyValueError::new_err(
+            "typ is only used with trust=\"typed\"",
+        ));
+    }
+    let jwks = jwks.map(jwks_from_py).transpose()?;
+    let algs = allowed_algorithms
+        .map(|algs| {
+            algs.iter()
+                .map(|alg| {
+                    JwsAlgorithm::from_str(alg).map_err(|e| {
+                        PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}"))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()?;
+    let Some(userinfo_endpoint) = userinfo_endpoint else {
+        return Err(ConfigError::new_err(
+            "provider does not advertise a userinfo_endpoint",
+        ));
+    };
+
     let (http, failures) = extract_http_client(http)?;
-    let r = crate::runtime::block_on(py, async move {
-        grp::fetch_userinfo(
-            &http,
-            &userinfo_endpoint,
-            &access_token,
-            &expected_sub,
-            &issuer,
-        )
-        .await
+    let resp = crate::runtime::block_on(py, async move {
+        grp::fetch_userinfo_response(&http, &userinfo_endpoint, &access_token, &issuer, method)
+            .await
+            .map(|resp| (resp, issuer))
     })?;
-    let v = r.map_err(|e| failures.err(py, e))?;
-    to_py(py, &v)
+    let (resp, issuer) = resp.map_err(|e| failures.err(py, e))?;
+
+    let content_type = resp
+        .content_type
+        .as_deref()
+        .or(resp.header("content-type"))
+        .unwrap_or("");
+    let is_jwt = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/jwt");
+    let claims = if !is_jwt {
+        grp::userinfo_json_claims(&resp, &expected_sub).map_err(err)?
+    } else {
+        // Five dot-separated segments is a compact JWE.
+        if resp.text().trim().split('.').count() == 5 {
+            return Err(with_code(
+                py,
+                AuthnError::new_err(
+                    "userinfo is an encrypted JWT (JWE); encrypted UserInfo responses are not supported",
+                ),
+                "userinfo_encrypted",
+            ));
+        }
+        let unverifiable = |what: &str| {
+            with_code(
+                py,
+                AuthnError::new_err(format!(
+                    "userinfo is a signed JWT but cannot be verified: {what} required \
+                     (refusing to trust an unverified response)"
+                )),
+                "userinfo_unverifiable",
+            )
+        };
+        let jwks = jwks.as_ref().ok_or_else(|| unverifiable("jwks"))?;
+        let client_id = client_id.ok_or_else(|| unverifiable("client_id"))?;
+        let algs = algs
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| unverifiable("allowed_algorithms"))?;
+        let mut options = match trust {
+            Some("typed") => grp::UserinfoJwtOptions::typed(typ.as_deref().unwrap_or_default()),
+            Some("dedicated_keys") => grp::UserinfoJwtOptions::dedicated_keys(),
+            Some(_) => grp::UserinfoJwtOptions::untyped_shared_key_compat(),
+            None => return Err(unverifiable("trust")),
+        };
+        options = match max_age {
+            Some(secs) => options.with_max_age(secs),
+            None => options.without_max_age(),
+        };
+        if require_exp {
+            options = options.with_require_exp();
+        }
+        grp::userinfo_signed_claims(
+            jwks,
+            &resp,
+            &issuer,
+            &client_id,
+            &expected_sub,
+            &algs,
+            &options,
+        )
+        .map_err(err)?
+    };
+    to_py(py, &claims)
 }
 
 /// Build a `private_key_jwt` client assertion (RFC 7523) signed with `key`:

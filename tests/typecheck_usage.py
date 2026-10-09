@@ -48,6 +48,24 @@ class FetchResponseClient:
         return pygrindvakt.http.HttpFetchResponse(200, b"{}")
 
 
+class HeadersClient(TupleClient):
+    """``get`` accepts request headers (``HttpClientWithHeadersProtocol``)."""
+
+    def get(
+        self, url: str, headers: list[tuple[str, str]] | None = None
+    ) -> tuple[int, bytes, str | None]:
+        return 200, b"{}", "application/json"
+
+
+class GetWithHeadersClient(TupleClient):
+    """Provides ``get_with_headers`` (``HttpClientGetWithHeadersProtocol``)."""
+
+    def get_with_headers(
+        self, url: str, headers: list[tuple[str, str]]
+    ) -> tuple[int, bytes, str | None]:
+        return 200, b"{}", "application/json"
+
+
 def use_all() -> None:
     reqwest = pygrindvakt.http.ReqwestClient(request_timeout=5)
     custom = TupleClient()
@@ -79,6 +97,43 @@ def use_all() -> None:
     rp.fetch_userinfo(
         reqwest, "https://op.example.com/ui", "tok", "sub", "https://op.example.com"
     )
+
+    rp.fetch_userinfo(
+        reqwest,
+        None,
+        "tok",
+        "sub",
+        "https://op.example.com",
+        method="GET",
+        jwks={"keys": []},
+        client_id="demo",
+        allowed_algorithms=["ES256"],
+        trust="typed",
+        typ="userinfo+jwt",
+        max_age=None,
+        require_exp=True,
+    )
+    rp.fetch_userinfo(
+        custom, "https://op.example.com/ui", "tok", "sub", "https://op.example.com"
+    )
+    rp.fetch_userinfo(
+        HeadersClient(),
+        "https://op.example.com/ui",
+        "tok",
+        "sub",
+        "https://op.example.com",
+        method="GET",
+        trust="dedicated_keys",
+    )
+    rp.fetch_userinfo(
+        GetWithHeadersClient(),
+        "https://op.example.com/ui",
+        "tok",
+        "sub",
+        "https://op.example.com",
+        method="GET",
+    )
+    reqwest.get("https://op.example.com", [("Authorization", "Bearer t")])
 
     federation.fetch_entity_configuration(reqwest, "https://ta.example.com")
     federation.fetch_entity_configuration(custom, "https://ta.example.com")

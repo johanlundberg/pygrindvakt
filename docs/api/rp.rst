@@ -230,18 +230,91 @@ Finishing the flow
       (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
       it for the standard code flow allows id_token replay.
 
-.. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str, access_token: str, expected_sub: str, issuer: str) -> dict[str, Any]
+.. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str | None, access_token: str, expected_sub: str, issuer: str, *, method: Literal["POST", "GET"] = "POST", jwks: dict[str, Any] | None = None, client_id: str | None = None, allowed_algorithms: list[str] | None = None, trust: str | None = None, typ: str | None = None, max_age: int | None = 300, require_exp: bool = False) -> dict[str, Any]
 
-   Fetch the userinfo document with a Bearer ``access_token`` and return it
-   as a dict. The response must contain a string ``sub`` exactly equal to
-   ``expected_sub`` from the validated ID token. The associated ``issuer``
-   is mandatory to scope the loopback HTTP development exception. Raises
-   :class:`pygrindvakt.AuthnError` on a non-200 or subject mismatch.
+   Fetch the UserInfo response with a Bearer ``access_token`` and return its
+   claims as a dict. The ``sub`` must exactly equal ``expected_sub`` from the
+   validated ID token. The associated ``issuer`` is mandatory to scope the
+   loopback HTTP development exception. Raises :class:`pygrindvakt.AuthnError`
+   on a non-200 or subject mismatch.
 
-   The request is a **POST** with an empty form body and the token in the
-   ``Authorization`` header (the ``HttpClient`` protocol has no per-request
-   headers on GET). OIDC Core section 5.3 allows either method; an OP built
-   with pygrindvakt should accept both at its userinfo endpoint.
+   ``userinfo_endpoint`` is ``None`` when the OP does not advertise one (see
+   :attr:`ProviderInfo.userinfo_endpoint`); that raises
+   :class:`pygrindvakt.ConfigError` (``provider does not advertise a
+   userinfo_endpoint``).
+
+   **Method.** ``method="POST"`` (the default) sends an empty form body with
+   the token in the ``Authorization`` header and works with every HTTP client.
+   ``method="GET"`` (OIDC Core 5.3.1 allows both) sends the token in the
+   ``Authorization`` header of a GET and needs a client that supports request
+   headers on GET: the built-in :class:`~pygrindvakt.http.ReqwestClient`, or a
+   Python client with ``get(url, headers=...)`` or ``get_with_headers(url,
+   headers)`` (see :doc:`http`). Otherwise :class:`pygrindvakt.ConfigError`.
+   The built-in client never follows redirects, so the token is never sent to
+   a redirect target; an injected client must do the same, or strip
+   ``Authorization`` on a cross-origin redirect.
+
+   **JSON responses** (any content type except ``application/jwt``) are parsed
+   directly; none of the keyword arguments below is used.
+
+   **Signed responses** (``application/jwt``) are verified, never trusted
+   as-is, and fail closed: unless ``jwks``, ``client_id``,
+   ``allowed_algorithms`` (non-empty) **and** ``trust`` are all given, an
+   :class:`pygrindvakt.AuthnError` with ``code == "userinfo_unverifiable"`` is
+   raised. ``jwks`` is a JWK Set dict in the same form as for
+   :func:`verify_id_token`. The JWS must be signed by a key in ``jwks`` with an
+   allowed algorithm and carry a ``kid`` naming it, ``iss`` must equal
+   ``issuer``, ``aud`` must be exactly ``client_id`` (multi-audience tokens are
+   refused), and ``sub`` must equal ``expected_sub``. A token carrying
+   ``nonce``, ``at_hash`` or ``c_hash``, or a ``typ`` of ``id_token+jwt`` /
+   ``at+jwt``, is refused as an id_token or access token presented as
+   UserInfo. ``exp`` is checked when present; ``require_exp=True`` demands it.
+
+   ``trust`` states how the JWT is proven to be UserInfo rather than an
+   id_token the OP signed with the same key and replayed here (the ``iss``,
+   ``aud`` and ``sub`` of both are identical):
+
+   * ``"typed"`` (safe): requires the exact JOSE ``typ`` header given as
+     ``typ``. For OPs that type their UserInfo JWTs. ``typ`` must identify
+     UserInfo specifically; ``JWT``, ``id_token+jwt`` and ``at+jwt`` are
+     refused.
+   * ``"dedicated_keys"`` (safe, as far as your attestation holds): you assert
+     that ``jwks`` contains only keys the OP uses to sign UserInfo, never
+     id_tokens, so a token that verifies cannot be an id_token. It does not
+     prove the token is UserInfo rather than some other JWT signed by those
+     keys.
+   * ``"untyped_shared_key_compat"`` (**weakest**; compatibility only): for OPs
+     that sign UserInfo and id_tokens with the same keys and set no ``typ``. A
+     fresh id_token that omits ``nonce``, ``at_hash`` and ``c_hash`` is
+     indistinguishable from UserInfo and **will be accepted** for up to
+     ``max_age`` seconds. Prefer ``"typed"`` or ``"dedicated_keys"``.
+
+   ``typ`` is only valid with ``trust="typed"``, and ``trust="typed"``
+   requires it (``ValueError`` otherwise, as for an unknown ``trust`` or
+   ``method``).
+
+   ``max_age`` (default 300 seconds) requires an ``iat`` claim and rejects a
+   token older than that (plus the library's 60 second clock-skew leeway), so
+   a captured token cannot be replayed indefinitely even without ``exp``.
+
+   .. warning::
+
+      ``max_age=None`` removes both the ``iat`` requirement and the age bound.
+      A token without ``exp`` can then be **replayed without limit**. Use it
+      only for an OP that emits neither ``iat`` nor ``exp``.
+
+   Encrypted (JWE) responses are not supported and raise
+   :class:`pygrindvakt.AuthnError` with ``code == "userinfo_encrypted"``.
+
+   .. code-block:: python
+
+      profile = rp.fetch_userinfo(
+          http_client, info.userinfo_endpoint, ts.access_token, claims["sub"],
+          info.issuer,
+          method="GET",
+          jwks=jwks, client_id="demo", allowed_algorithms=["ES256"],
+          trust="typed", typ="userinfo+jwt",   # only used if the OP signs it
+      )
 
 Client assertions and attribute mapping
 ---------------------------------------

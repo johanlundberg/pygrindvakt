@@ -177,13 +177,41 @@ Userinfo
            http_client, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer
        )
 
-The request is a POST with the token in the ``Authorization`` header, which
-OIDC Core permits and every OP built with pygrindvakt accepts. A non-200
-raises :class:`pygrindvakt.AuthnError`. The response must contain a string
-``sub`` exactly equal to the validated ID-token subject. The result is a dict;
-:func:`~pygrindvakt.rp.claims_to_attributes` flattens it (or the id_token
+By default the request is a POST with the token in the ``Authorization``
+header, which OIDC Core permits and every OP built with pygrindvakt accepts. A
+non-200 raises :class:`pygrindvakt.AuthnError`. The response must contain a
+string ``sub`` exactly equal to the validated ID-token subject. The result is a
+dict; :func:`~pygrindvakt.rp.claims_to_attributes` flattens it (or the id_token
 claims) into the ``{name: [values]}`` shape an attribute-based backend or a
 SAML proxy expects.
+
+Some OPs only accept GET, or answer with a signed ``application/jwt`` response.
+Pass ``method="GET"`` (the HTTP client must support request headers on GET; the
+built-in one does and never follows redirects), and for a signed response also
+say how to verify it:
+
+.. code-block:: python
+
+   if info.userinfo_endpoint is not None:
+       profile = rp.fetch_userinfo(
+           http_client, info.userinfo_endpoint, ts.access_token, claims["sub"],
+           info.issuer,
+           method="GET",
+           jwks=jwks, client_id="demo", allowed_algorithms=["ES256"],
+           trust="dedicated_keys",
+       )
+
+A signed response is never accepted without ``jwks``, ``client_id``,
+``allowed_algorithms`` and ``trust`` (``AuthnError``, ``code ==
+"userinfo_unverifiable"``). ``trust`` matters because OPs often sign UserInfo
+with the same key as id_tokens, so a replayed id_token could pass as UserInfo:
+``"typed"`` (the OP sets a UserInfo-specific JOSE ``typ``; pass it as ``typ``)
+and ``"dedicated_keys"`` (``jwks`` holds only UserInfo signing keys) are safe;
+``"untyped_shared_key_compat"`` is the weakest and accepts a fresh id_token
+that lacks ``nonce``, ``at_hash`` and ``c_hash``. The token must also be no
+more than ``max_age`` (300) seconds old by ``iat``; ``max_age=None`` disables
+that and makes replay unbounded. Encrypted (JWE) UserInfo is not supported. See
+:func:`~pygrindvakt.rp.fetch_userinfo` for the full rules.
 
 The rest of the token response (``refresh_token``, ``expires_in``,
 ``scope``) is available as ``ts.raw``.
