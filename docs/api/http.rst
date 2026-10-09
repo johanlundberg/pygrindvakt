@@ -273,8 +273,18 @@ Built-in client
    reused, and the tokio runtime is rebuilt per process (see
    `ADR 0001 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0001-sync-api-over-embedded-tokio-runtime.md>`_).
    A client created in a gunicorn master therefore keeps working in the
-   workers. A request that was in flight in another thread at the moment of
-   ``fork`` does not exist in the child. A ``ReqwestClient`` may be created
+   workers, provided the fork is quiescent (see below).
+
+   .. warning::
+
+      Fork only while no other thread is inside a pygrindvakt call (for
+      example in a gunicorn master before any worker thread exists, or in
+      ``post_fork``). The pool and runtime are guarded by internal locks. If
+      another thread holds one at the moment of ``fork``, the child inherits
+      it locked with no owner and can block forever, before the process id
+      check runs. Forking concurrently with active calls is not supported.
+
+   A ``ReqwestClient`` may be created
    before ``fork``; a :class:`~pygrindvakt.provider.RedisStore` must be created
    after it (see :doc:`../guides/stores`).
 

@@ -27,7 +27,7 @@ binding turns that into something a Python web application can call directly:
 * **A synchronous API over an embedded tokio runtime.** Every networked or
   store-backed call is driven to completion on a process-wide runtime with the
   GIL released, so threads run in parallel and the same objects keep working
-  after ``fork`` (gunicorn, uwsgi, ``multiprocessing``). See
+  after a quiescent ``fork`` (gunicorn, uwsgi, ``multiprocessing``). See
   :doc:`guides/stores`.
 * **Framework agnosticism.** Requests come in as plain dicts and strings,
   responses go out as a :class:`pygrindvakt.http.Response` (``status``,

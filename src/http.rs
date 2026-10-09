@@ -536,8 +536,11 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// Fork safety: the connection pool is keyed by PID and rebuilt lazily in the
 /// child after `fork`; inherited connections are never reused and the tokio
-/// runtime is rebuilt per process (see ADR 0001). A request in flight in
-/// another thread at fork time does not exist in the child. Create a
+/// runtime is rebuilt per process (see ADR 0001). Forking while another
+/// thread has a request in flight is not supported. Fork only while no
+/// other thread is inside a pygrindvakt call (for example the gunicorn master
+/// before worker threads start): an internal lock held by another thread at
+/// fork time stays locked in the child and can deadlock it. Create a
 /// `RedisStore` after fork; a `ReqwestClient` may be created before it.
 #[pyclass(module = "pygrindvakt.http", name = "ReqwestClient", frozen)]
 pub struct ReqwestClient {

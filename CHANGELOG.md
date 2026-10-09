@@ -24,7 +24,9 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `import pygrindvakt.http` as alternatives.
 - Documented `ReqwestClient` thread safety and fork behaviour (PID-keyed pool,
   per-process runtime, `RedisStore` after fork), and the threading contract of
-  Python HTTP clients.
+  Python HTTP clients. Fork is supported only while no other thread is inside
+  a pygrindvakt call; a lock held by another thread at fork time is inherited
+  locked by the child and can deadlock it.
 
 ### Added
 

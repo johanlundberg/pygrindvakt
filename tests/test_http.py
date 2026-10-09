@@ -127,7 +127,11 @@ def test_reqwest_client_against_local_server():
 @pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
 def test_reqwest_client_usable_after_fork():
     """A client used (and its pool warmed) before ``fork`` keeps working in the
-    child: the PID-keyed pool is rebuilt lazily and the runtime is per process."""
+    child: the PID-keyed pool is rebuilt lazily and the runtime is per process.
+
+    The fork is quiescent (no other thread is inside a pygrindvakt call). Fork
+    while another thread holds an internal lock is documented as unsupported,
+    so it is deliberately not tested."""
     import http.server as hs
     import threading
 

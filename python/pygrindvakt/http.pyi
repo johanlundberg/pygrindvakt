@@ -184,9 +184,12 @@ class ReqwestClient:
 
     Fork safety: the connection pool is keyed by PID and rebuilt lazily in a
     child after ``fork``; inherited connections are never reused and the tokio
-    runtime is rebuilt per process (ADR 0001). A request in flight in another
-    thread at fork time does not exist in the child. A ``ReqwestClient`` may be
-    created before ``fork``; a ``RedisStore`` must be created after.
+    runtime is rebuilt per process (ADR 0001). Forking while another thread has a
+    request in flight is not supported. Fork only while no other
+    thread is inside a pygrindvakt call: an internal lock held by another
+    thread at fork time stays locked in the child and can deadlock it. A
+    ``ReqwestClient`` may be created before ``fork``; a ``RedisStore`` must be
+    created after.
     """
 
     def __init__(

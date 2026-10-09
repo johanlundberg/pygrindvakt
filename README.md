@@ -102,8 +102,9 @@ FastAPI's threadpool) run in parallel. The runtime is rebuilt lazily after
 released during I/O, so calls run in parallel); `http=None` uses a process-wide
 default instance with the same properties. Its connection pool is keyed by PID
 and rebuilt lazily in a forked child, inherited connections are never reused,
-and a request in flight in another thread at fork time is not visible in the
-child. Create the `ReqwestClient` before or after fork, but a `RedisStore`
+and a fork while another thread has a request in flight is not supported. Fork only while no other thread is inside a pygrindvakt call: an
+internal lock held by another thread at fork time stays locked in the child
+and can deadlock it. Create the `ReqwestClient` before or after fork, but a `RedisStore`
 *after*. A Python HTTP client runs on the calling thread holding the GIL, so if
 you share one across threads it must be thread-safe itself; re-entrant calls
 into pygrindvakt from it cost a helper thread. See

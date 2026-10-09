@@ -255,8 +255,10 @@ can be shared by every thread of a worker; the GIL is released during I/O, so
 requests run in parallel. After ``fork`` (gunicorn ``--preload``, ``post_fork``,
 ``multiprocessing``) the child rebuilds the connection pool and the tokio
 runtime lazily, so a client created in the master before the fork is fine.
-A request in flight in another master thread at fork time is not visible in
-the child. A custom Python client runs on the calling thread with the GIL held
+Fork only while no other thread is inside a pygrindvakt call: a lock held by
+another thread at fork time stays locked in the child and can deadlock it.
+Forking while another master thread has a request in flight is not
+supported. A custom Python client runs on the calling thread with the GIL held
 and must be thread-safe if shared. Create a ``RedisStore`` *after* fork. See
 :ref:`ReqwestClient <reqwest-client-fork>` and :doc:`stores`.
 
