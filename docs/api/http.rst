@@ -210,8 +210,15 @@ Outbound HTTP client protocol
    methods is accepted, and the methods are checked for existence when the
    object is first passed (``TypeError`` otherwise).
 
-   Both methods may return either a ``(status, body, content_type)`` tuple or
-   an :class:`HttpFetchResponse`. ``body`` must be ``bytes`` (not
+   Both methods may return either a ``(status, body, content_type)`` tuple, a
+   ``(status, body, content_type, headers)`` tuple, or an
+   :class:`HttpFetchResponse`. ``headers`` is an optional list of response
+   ``(name, value)`` string pairs (or ``None``); names are lower-cased, order
+   and repeated headers are kept, and a wrongly shaped value is reported like
+   any other bad return (:class:`pygrindvakt.InternalError`). Report headers
+   whenever the underlying library exposes them: :class:`pygrindvakt.rp.JwksCache`
+   reads ``Cache-Control`` and ``Age`` from them, and without any it warns
+   and falls back to ``default_ttl``. ``body`` must be ``bytes`` (not
    ``bytearray`` or ``memoryview``). An exception raised by either method is
    logged through ``sys.unraisablehook`` and reported to the caller as
    :class:`pygrindvakt.InternalError`.
@@ -261,7 +268,7 @@ Outbound HTTP client protocol
 
       md = rp.discover(HttpxClient("/etc/ssl/private-ca.pem"), "https://op.example.com")
 
-.. py:class:: HttpFetchResponse(status: int, body: bytes, content_type: str | None = None)
+.. py:class:: HttpFetchResponse(status: int, body: bytes, content_type: str | None = None, headers: list[tuple[str, str]] | None = None)
 
    The result of an outbound fetch made through an ``HttpClient``. A Python
    client may return one of these instead of the tuple.
@@ -272,6 +279,11 @@ Outbound HTTP client protocol
       :type: bytes
    .. py:attribute:: content_type
       :type: str | None
+   .. py:attribute:: headers
+      :type: list[tuple[str, str]]
+
+      Read-only response ``(name, value)`` pairs; names are lower-cased,
+      order and repeats kept. Empty when none were given.
 
    .. py:method:: text() -> str
 

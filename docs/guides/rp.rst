@@ -176,7 +176,8 @@ Do not call :func:`~pygrindvakt.rp.fetch_jwks` per login: it costs a request
 each time and gives no rotation handling. A
 :class:`~pygrindvakt.rp.JwksCache` fetches the set on first use, reuses it for
 the lifetime the OP advertises (``Cache-Control: max-age``, bounded by
-``min_ttl`` / ``max_ttl``, else ``default_ttl``), and shares one fetch between
+``min_ttl`` / ``max_ttl``, else ``default_ttl``; ``no-store`` / ``no-cache`` are
+floored to ``min_ttl``, and ``min_ttl=0`` leaves them uncached), and shares one fetch between
 concurrent requests. When an id_token names a ``kid`` it does not have, it
 refetches once (at most every ``min_refresh_interval`` seconds, so garbage
 ``kid`` values cannot flood the OP) and either verifies with the rotated key
@@ -184,6 +185,13 @@ or raises :class:`~pygrindvakt.UnknownKeyError`. It never serves an expired
 set: if the OP is unreachable when the set expires, verification fails with an
 :class:`~pygrindvakt.InternalError` (``code == "transport"``) instead of
 trusting possibly revoked keys.
+
+``Cache-Control`` is honoured only when the HTTP client reports response
+headers. The built-in client (``http=None`` or a
+:class:`~pygrindvakt.http.ReqwestClient`) always does; a Python adapter must
+return them (a ``(status, body, content_type, headers)`` tuple or
+:class:`~pygrindvakt.http.HttpFetchResponse` with ``headers``). Without them
+``default_ttl`` applies and a ``UserWarning`` is emitted on the first fetch.
 
 .. code-block:: python
 

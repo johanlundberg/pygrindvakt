@@ -234,11 +234,17 @@ Discovery and keys
 
    .. note::
 
-      A Python :class:`~pygrindvakt.http.HttpClientProtocol` returns no
-      response headers, so with such a client the lifetime is always
-      ``default_ttl`` (clamped). The built-in
-      :class:`~pygrindvakt.http.ReqwestClient` (or ``None``) reports
-      ``Cache-Control`` and ``Age``.
+      ``Cache-Control`` and ``Age`` are honoured only when the HTTP client
+      reports response headers. The built-in
+      :class:`~pygrindvakt.http.ReqwestClient` (or ``None``) always does; a
+      Python :class:`~pygrindvakt.http.HttpClientProtocol` must return them
+      (a 4-tuple, or :class:`~pygrindvakt.http.HttpFetchResponse` with
+      ``headers``). Otherwise the lifetime is ``default_ttl`` (clamped) and a
+      ``UserWarning`` is emitted on the cache's first fetch, so a revoked key
+      can stay trusted for up to ``default_ttl``: return headers, or lower
+      ``default_ttl`` / ``max_ttl``. ``no-store``, ``no-cache`` and
+      ``max-age=0`` are floored to ``min_ttl``; ``min_ttl=0`` makes them
+      uncached.
 
    **Never stale.** An expired set is not served. If the refetch fails,
    :meth:`jwks` and the verification methods raise the fetch error (transport

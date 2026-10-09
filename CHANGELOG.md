@@ -11,6 +11,14 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Changed
 
+- `JwksCache` now emits one `UserWarning` (per cache, on its first fetch) when
+  the `HttpClient` returns a response with no headers at all. Such a client
+  cannot report `Cache-Control` / `Age`, so the cache silently used
+  `default_ttl` and a revoked key could stay trusted for that long. The
+  built-in client is unaffected. Docs now state that `Cache-Control` is
+  honoured only when the client reports response headers, and that
+  `no-store` / `no-cache` / `max-age=0` are floored to `min_ttl`.
+
 - **Breaking:** `end_session_endpoint` and related OIDC extension members
   (`revocation_endpoint`, `introspection_endpoint`,
   `pushed_authorization_request_endpoint`, `check_session_iframe`,
@@ -38,6 +46,12 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   of them. Publishing is still allowed; `ProviderMetadata` setters stay silent.
 
 ### Added
+
+- Python `HttpClient` adapters can report response headers: the tuple form
+  accepts an optional 4th element `headers: list[tuple[str, str]]` (3-tuples
+  keep working) and `HttpFetchResponse` takes an optional `headers` argument
+  and exposes a read-only `headers` attribute (names lower-cased, order and
+  repeats kept). `JwksCache` uses them for `Cache-Control` / `Age`.
 
 - `rp.JwksCache(http, jwks_uri, issuer, *, default_ttl=3600, min_ttl=60,
   max_ttl=86400, min_refresh_interval=30)`: thread-safe, single-flight JWK Set

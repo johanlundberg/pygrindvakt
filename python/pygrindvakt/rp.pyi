@@ -170,8 +170,12 @@ class JwksCache:
 
     The set is refetched on expiry: ``Cache-Control: max-age`` minus ``Age``
     when present, else ``default_ttl``, clamped to ``[min_ttl, max_ttl]``
-    (``no-store`` / ``no-cache`` / ``max-age=0`` therefore still cache for
-    ``min_ttl``; use ``min_ttl=0`` to always refetch). An expired set is never
+    (``no-store`` / ``no-cache`` / ``max-age=0`` are floored to ``min_ttl``;
+    ``min_ttl=0`` leaves them uncached). ``Cache-Control`` is honoured only when
+    the ``HttpClient`` reports response headers: the built-in client (``None`` /
+    ``ReqwestClient``) always does, a Python adapter must return them (4-tuple
+    or ``HttpFetchResponse(headers=...)``); otherwise ``default_ttl`` applies
+    and a ``UserWarning`` is emitted on the first fetch. An expired set is never
     served: a failed refetch raises. Concurrent callers share one fetch.
     The cache is in-process memory; it stays valid after ``fork``.
     """

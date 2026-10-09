@@ -1080,6 +1080,62 @@ struct CacheState {
     last_attempt: Option<f64>,
 }
 
+/// Wraps the fetch client to note whether any response carried headers.
+struct HeaderProbe {
+    inner: Arc<dyn HttpClient>,
+    saw_response: std::sync::atomic::AtomicBool,
+    saw_headers: std::sync::atomic::AtomicBool,
+}
+
+impl HeaderProbe {
+    fn note(
+        &self,
+        r: grindvakt::Result<HttpFetchResponse>,
+    ) -> grindvakt::Result<HttpFetchResponse> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Ok(resp) = &r {
+            self.saw_response.store(true, Relaxed);
+            if !resp.headers.is_empty() {
+                self.saw_headers.store(true, Relaxed);
+            }
+        }
+        r
+    }
+
+    /// A response arrived and none of them had any header.
+    fn headerless(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.saw_response.load(Relaxed) && !self.saw_headers.load(Relaxed)
+    }
+}
+
+#[async_trait]
+impl HttpClient for HeaderProbe {
+    async fn get(&self, url: &str) -> grindvakt::Result<HttpFetchResponse> {
+        let r = self.inner.get(url).await;
+        self.note(r)
+    }
+
+    async fn post_form(
+        &self,
+        url: &str,
+        form: &[(String, String)],
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<HttpFetchResponse> {
+        let r = self.inner.post_form(url, form, headers).await;
+        self.note(r)
+    }
+
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<HttpFetchResponse> {
+        let r = self.inner.get_with_headers(url, headers).await;
+        self.note(r)
+    }
+}
+
 /// RAII token for the single in-flight fetch; see `JwksCache::begin_flight`.
 struct Flight<'a> {
     cache: &'a JwksCache,
@@ -1098,8 +1154,12 @@ impl Drop for Flight<'_> {
 /// Holds the key set fetched from `jwks_uri` and refetches it when it
 /// expires. The lifetime is the response's `Cache-Control: max-age` minus
 /// `Age` when present, else `default_ttl`, clamped to `[min_ttl, max_ttl]`
-/// (so `no-store` / `no-cache` / `max-age=0` still cache for `min_ttl`; set
-/// `min_ttl=0` to refetch every time). An expired set is never served: a
+/// (so `no-store` / `no-cache` / `max-age=0` are floored to `min_ttl`; set
+/// `min_ttl=0` to leave them uncached). Cache-Control is honoured only when
+/// the `HttpClient` reports response headers: the built-in client (`None` /
+/// `ReqwestClient`) always does, a Python adapter must return them (see
+/// `HttpFetchResponse`); otherwise `default_ttl` applies and a `UserWarning`
+/// is emitted on the first fetch. An expired set is never served: a
 /// failed refetch raises. Concurrent callers share a single fetch.
 ///
 /// `verify_id_token` refreshes the set at most once when the token's `kid` is
@@ -1124,6 +1184,8 @@ pub struct JwksCache {
     state: RwLock<CacheState>,
     flight: Mutex<bool>,
     flight_done: Condvar,
+    /// The no-response-headers warning is emitted once per cache.
+    warned_no_headers: std::sync::atomic::AtomicBool,
 }
 
 impl JwksCache {
@@ -1184,10 +1246,31 @@ impl JwksCache {
         // error is chained to this call's failure only.
         let (http, failures) = extract_http_client(self.http.as_ref().map(|h| h.bind(py)))?;
         let (uri, issuer) = (self.jwks_uri.clone(), self.issuer.clone());
+        let probe = Arc::new(HeaderProbe {
+            inner: http,
+            saw_response: Default::default(),
+            saw_headers: Default::default(),
+        });
+        let client: Arc<dyn HttpClient> = probe.clone();
         let r = crate::runtime::block_on(py, async move {
-            grp::fetch_jwks_response(&http, &uri, &issuer).await
+            grp::fetch_jwks_response(&client, &uri, &issuer).await
         })?;
         let resp = r.map_err(|e| failures.err(py, e))?;
+        if probe.headerless()
+            && !self
+                .warned_no_headers
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn(
+                py,
+                &format!(
+                    "this HttpClient reports no response headers; Cache-Control is ignored and \
+                     default_ttl ({}s) applies; return headers from your HttpClient or lower \
+                     default_ttl/max_ttl",
+                    self.default_ttl
+                ),
+            );
+        }
         let ttl = resp
             .cache_ttl_secs()
             .unwrap_or(self.default_ttl)
@@ -1285,6 +1368,7 @@ impl JwksCache {
             state: RwLock::default(),
             flight: Mutex::new(false),
             flight_done: Condvar::new(),
+            warned_no_headers: Default::default(),
         })
     }
 

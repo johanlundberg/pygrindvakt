@@ -341,6 +341,14 @@ impl Response {
 // HttpFetchResponse
 // ---------------------------------------------------------------------------
 
+/// Lower-case header names (ASCII), keeping order and repeats.
+fn lower_names(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+        .collect()
+}
+
 /// The result of an outbound fetch made through an `HttpClient`.
 #[pyclass(
     module = "pygrindvakt.http",
@@ -356,16 +364,27 @@ pub struct HttpFetchResponse {
 #[pymethods]
 impl HttpFetchResponse {
     #[new]
-    #[pyo3(signature = (status, body, content_type = None))]
-    fn new(status: u16, body: &[u8], content_type: Option<String>) -> Self {
+    #[pyo3(signature = (status, body, content_type = None, headers = None))]
+    fn new(
+        status: u16,
+        body: &[u8],
+        content_type: Option<String>,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Self {
         Self {
             inner: RsFetch {
                 status,
                 body: body.to_vec(),
                 content_type,
-                headers: Vec::new(),
+                headers: lower_names(headers.unwrap_or_default()),
             },
         }
+    }
+    /// Response headers as `(name, value)` pairs: names lower-cased, order
+    /// and repeated headers preserved. Empty when the client reports none.
+    #[getter]
+    fn headers(&self) -> Vec<(String, String)> {
+        self.inner.headers.clone()
     }
     #[getter]
     fn status(&self) -> u16 {
@@ -389,9 +408,10 @@ impl HttpFetchResponse {
     }
     fn __repr__(&self) -> String {
         format!(
-            "HttpFetchResponse(status={}, content_type={:?}, body=<{} bytes>)",
+            "HttpFetchResponse(status={}, content_type={:?}, headers={}, body=<{} bytes>)",
             self.inner.status,
             self.inner.content_type,
+            self.inner.headers.len(),
             self.inner.body.len()
         )
     }
@@ -953,18 +973,28 @@ fn extract_fetch(r: &Bound<'_, PyAny>) -> PyResult<RsFetch> {
     if let Ok(f) = r.extract::<HttpFetchResponse>() {
         return Ok(f.inner);
     }
-    let (status, body, content_type): (u16, Vec<u8>, Option<String>) =
-        r.extract().map_err(|e| {
-            internal_err(format!(
-                "HttpClient method must return (status: int, body: bytes, content_type: str | None) \
-                 or an HttpFetchResponse: {e}"
-            ))
-        })?;
+    let shape_err = |e: PyErr| {
+        internal_err(format!(
+            "HttpClient method must return (status: int, body: bytes, content_type: str | None \
+             [, headers: list[tuple[str, str]] | None]) or an HttpFetchResponse: {e}"
+        ))
+    };
+    // A 4-tuple carries response headers; a 3-tuple does not.
+    let is_four = r.cast::<pyo3::types::PyTuple>().is_ok_and(|t| t.len() == 4);
+    type Headers = Vec<(String, String)>;
+    type Four = (u16, Vec<u8>, Option<String>, Option<Headers>);
+    let (status, body, content_type, headers) = if is_four {
+        let (s, b, c, h): Four = r.extract().map_err(shape_err)?;
+        (s, b, c, h.unwrap_or_default())
+    } else {
+        let (s, b, c): (u16, Vec<u8>, Option<String>) = r.extract().map_err(shape_err)?;
+        (s, b, c, Headers::new())
+    };
     Ok(RsFetch {
         status,
         body,
         content_type,
-        headers: Vec::new(),
+        headers: lower_names(headers),
     })
 }
 

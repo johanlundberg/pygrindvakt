@@ -2,8 +2,9 @@
 
 Most tests use a scripted Python ``HttpClient`` and an injected clock (the
 private ``_now`` constructor hook). A Python client cannot report response
-headers, so the ``Cache-Control`` / ``Age`` tests run against a loopback HTTP
-server through the built-in client.
+headers unless it returns them; the ``Cache-Control`` / ``Age`` tests run both
+against a loopback HTTP server through the built-in client and against a
+scripted client that reports headers.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -26,6 +28,7 @@ from pygrindvakt import (
     keys,
     rp,
 )
+from pygrindvakt import http as rp_http
 from pygrindvakt.http import ReqwestClient
 
 ISSUER = "https://op.example.com"
@@ -71,6 +74,8 @@ class ScriptedHttp:
         self.delay = delay
         self.status = 200
         self.error = None
+        self.headers = None  # None -> 3-tuple (no headers)
+        self.as_response = False
         self.calls = 0
         self._lock = threading.Lock()
 
@@ -83,7 +88,14 @@ class ScriptedHttp:
             raise self.error
         if url != JWKS_URI:
             return 404, b"", "text/plain"
-        return self.status, json.dumps(self.doc).encode(), "application/json"
+        body = json.dumps(self.doc).encode()
+        if self.as_response:
+            return rp_http.HttpFetchResponse(
+                self.status, body, "application/json", self.headers
+            )
+        if self.headers is not None:
+            return self.status, body, "application/json", self.headers
+        return self.status, body, "application/json"
 
     def post_form(self, url, form, headers):
         return 404, b"", "text/plain"
@@ -274,14 +286,90 @@ def test_no_store_with_zero_min_ttl_never_caches(jwks_server, header):
     assert jwks_server.hits == 3
 
 
-def test_python_client_cannot_report_cache_control():
-    """A protocol client's responses carry no headers: default_ttl applies."""
+def test_python_client_without_headers_warns_once_and_uses_default_ttl():
     http = ScriptedHttp({"keys": []})
     cache, clock = make_cache(http, default_ttl=100, min_ttl=1)
-    cache.jwks()
+    with pytest.warns(UserWarning, match=r"reports no response headers.*default_ttl \(100s\)"):
+        cache.jwks()
     clock.advance(99)
     cache.jwks()
     assert http.calls == 1
+    clock.advance(2)  # expired: refetch must not warn again
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cache.jwks()
+    assert http.calls == 2
+    # Another cache warns for itself.
+    other, _ = make_cache(ScriptedHttp({"keys": []}))
+    with pytest.warns(UserWarning):
+        other.jwks()
+
+
+def test_builtin_client_does_not_warn(jwks_server):
+    cache, _ = server_cache(jwks_server)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cache.jwks()
+
+
+@pytest.mark.parametrize("as_response", [False, True])
+def test_python_client_with_headers_honours_cache_control(as_response):
+    http = ScriptedHttp({"keys": []})
+    http.as_response = as_response
+    http.headers = [("Cache-Control", "public, max-age=120"), ("Age", "100")]
+    cache, clock = make_cache(http, min_ttl=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cache.jwks()
+        clock.advance(19)
+        cache.jwks()
+        assert http.calls == 1
+        clock.advance(2)  # 120 - 100 = 20s lifetime
+        cache.jwks()
+    assert http.calls == 2
+
+
+def test_python_client_headers_clamped_and_no_store_floored():
+    http = ScriptedHttp({"keys": []})
+    http.headers = [("cache-control", "max-age=31536000")]
+    cache, clock = make_cache(http, max_ttl=300)
+    cache.jwks()
+    clock.advance(301)
+    cache.jwks()
+    assert http.calls == 2
+
+    http2 = ScriptedHttp({"keys": []})
+    http2.headers = [("Cache-Control", "no-store")]
+    cache2, clock2 = make_cache(http2, min_ttl=60)
+    cache2.jwks()
+    clock2.advance(59)
+    cache2.jwks()
+    assert http2.calls == 1
+    clock2.advance(2)
+    cache2.jwks()
+    assert http2.calls == 2
+
+    http3 = ScriptedHttp({"keys": []})
+    http3.headers = [("Cache-Control", "no-store")]
+    cache3, _ = make_cache(http3, min_ttl=0)
+    cache3.jwks()
+    cache3.jwks()
+    assert http3.calls == 2
+
+
+def test_fetch_response_headers_attribute():
+    r = rp_http.HttpFetchResponse(200, b"", None, [("Cache-Control", "x"), ("Set-Cookie", "a"), ("set-cookie", "b")])
+    assert r.headers == [("cache-control", "x"), ("set-cookie", "a"), ("set-cookie", "b")]
+    assert rp_http.HttpFetchResponse(200, b"").headers == []
+
+
+@pytest.mark.parametrize("bad", [[("a",)], "x", [1, 2], [("a", 1)]])
+def test_bad_headers_shape_is_an_adapter_error(bad):
+    http = ScriptedHttp({"keys": []})
+    http.headers = bad
+    cache, _ = make_cache(http)
+    with pytest.raises(InternalError):
+        cache.jwks()
 
 
 # --- failures -------------------------------------------------------------------

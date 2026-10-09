@@ -30,9 +30,16 @@ thread-safe itself.
 from typing import Any, Protocol
 
 # Stub-only aliases (underscore-prefixed so they are not expected at runtime).
-# What a client method may return: the ``(status, body, content_type)`` tuple or
-# an ``HttpFetchResponse`` (see ``extract_fetch`` in ``src/http.rs``).
-_FetchResult = tuple[int, bytes, str | None] | HttpFetchResponse
+# What a client method may return: the ``(status, body, content_type)`` tuple,
+# the same with an optional 4th ``headers`` element (response ``(name, value)``
+# pairs), or an ``HttpFetchResponse`` (see ``extract_fetch`` in
+# ``src/http.rs``). Report headers if you can: ``rp.JwksCache`` needs
+# ``Cache-Control`` / ``Age`` to honour the OP's cache lifetime.
+_FetchResult = (
+    tuple[int, bytes, str | None]
+    | tuple[int, bytes, str | None, list[tuple[str, str]] | None]
+    | HttpFetchResponse
+)
 # What every networked function accepts as ``http``: any protocol client, the
 # built-in ``ReqwestClient``, or ``None`` for the process-wide default client.
 _HttpArg = HttpClientProtocol | ReqwestClient | None
@@ -49,7 +56,10 @@ class HttpClientProtocol(Protocol):
     """Outbound HTTP client protocol accepted wherever ``http=`` is taken.
 
     Either method may return an ``HttpFetchResponse`` or the
-    ``(status, body, content_type)`` tuple. Exceptions are logged via
+    ``(status, body, content_type[, headers])`` tuple, where ``headers`` is a
+    list of response ``(name, value)`` pairs (names are lower-cased, order and
+    repeats kept). Return them when you can: without response headers
+    ``rp.JwksCache`` cannot see ``Cache-Control`` and warns. Exceptions are logged via
     ``sys.unraisablehook`` and reported as ``InternalError``.
 
     The implementation runs on the thread driving the pygrindvakt call, holding
@@ -204,7 +214,16 @@ class Response:
 class HttpFetchResponse:
     """The result of an outbound fetch made through an ``HttpClient``."""
 
-    def __init__(self, status: int, body: bytes, content_type: str | None = ...) -> None: ...
+    def __init__(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str | None = ...,
+        headers: list[tuple[str, str]] | None = ...,
+    ) -> None: ...
+    @property
+    def headers(self) -> list[tuple[str, str]]:
+        """Response ``(name, value)`` pairs, names lower-cased; empty if none."""
     @property
     def status(self) -> int: ...
     @property
