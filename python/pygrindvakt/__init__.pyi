@@ -28,9 +28,22 @@ from .errors import OAuthError as OAuthError
 __version__: str
 
 class GrindvaktError(Exception):
-    """Base class for all pygrindvakt errors."""
+    """Base class for all pygrindvakt errors.
+
+    ``code`` is a short machine-readable identifier: a class-level default
+    that an instance may override with a more precise value (for example the
+    upstream OAuth ``error`` code). The ``upstream_*`` attributes are set only
+    for errors that came from an upstream HTTP response and are otherwise
+    ``None``; ``upstream_error_description`` and ``upstream_body`` may echo
+    secrets and must not be logged or shown to end users.
+    """
 
     status_hint: int
+    code: str
+    upstream_status: int | None
+    upstream_error: str | None
+    upstream_error_description: str | None
+    upstream_body: str | None
 
 class BadRequestError(GrindvaktError):
     """The request was malformed (400)."""

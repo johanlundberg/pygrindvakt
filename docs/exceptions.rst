@@ -48,6 +48,130 @@ Base class
 
    Base class for every pygrindvakt error.
 
+   .. py:attribute:: code
+      :type: str
+
+      A short machine-readable identifier. Every class has a class-level
+      default (see :ref:`error-codes`); an instance may override it with a
+      more precise value. :attr:`OAuthError.code` has the same meaning.
+
+   .. py:attribute:: upstream_status
+      :type: int | None
+
+      HTTP status of the upstream response that caused this error, else
+      ``None``.
+
+   .. py:attribute:: upstream_error
+      :type: str | None
+
+      The upstream's OAuth ``error`` code (capped at 64 characters), else
+      ``None``.
+
+   .. py:attribute:: upstream_error_description
+      :type: str | None
+
+      The upstream's ``error_description``, else ``None``.
+
+   .. py:attribute:: upstream_body
+      :type: str | None
+
+      The upstream response body, else ``None``. Control and bidirectional
+      characters are escaped and the length is capped.
+
+   .. danger::
+
+      ``upstream_error_description`` and ``upstream_body`` are free text from
+      the upstream and may echo secrets (credentials, codes, tokens) or
+      personal data. Escaping makes them safe to *print*, not safe to
+      *disclose*: never log them verbatim and never return them to end users.
+      ``upstream_status`` and ``upstream_error`` are not redacted.
+
+   The ``upstream_*`` attributes are ``None`` unless the error was raised
+   because an upstream endpoint (token, UserInfo, JWKS, discovery, federation)
+   answered with a failure. ``str(exc)`` stays generic and does not contain
+   the body, for example ``authentication error: token endpoint returned 400``.
+
+.. _error-codes:
+
+Error codes
+-----------
+
+``exc.code`` is the class default unless noted. These values are stable:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Class
+     - Default ``code``
+   * - ``GrindvaktError`` / ``InternalError``
+     - ``internal``
+   * - ``BadRequestError``
+     - ``bad_request``
+   * - ``AuthnError``
+     - ``authn``
+   * - ``StateError``
+     - ``state``
+   * - ``ConfigError``
+     - ``config``
+   * - ``CryptoError``
+     - ``crypto``
+   * - ``AttributeMappingError``
+     - ``attribute``
+   * - ``JoseError``
+     - ``jose``
+   * - ``JsonError``
+     - ``json``
+   * - ``NoBoundEndpointError``
+     - ``no_bound_endpoint``
+   * - ``UnknownModuleError``
+     - ``unknown_module``
+   * - ``DpopError``
+     - ``dpop``
+   * - ``DpopInvalidError``
+     - ``invalid_dpop_proof``
+   * - ``DpopReplayError``
+     - ``dpop_replay``
+   * - ``DpopNonceRequiredError``
+     - ``use_dpop_nonce``
+   * - ``DpopServerError``
+     - ``dpop_server``
+   * - ``OAuthError``
+     - the OAuth error string given at construction
+
+Instance-level overrides:
+
+* A failed token or UserInfo request (``AuthnError``) carries the upstream's
+  OAuth ``error`` value when it sent one, for example ``invalid_client`` or
+  ``invalid_grant`` (also available as ``upstream_error``). Without one the
+  class default ``authn`` applies. Code values from the upstream are
+  arbitrary strings; compare against known values, do not assume a closed set.
+* ``transport`` (``InternalError``): an outbound request failed before a
+  response was obtained (connection refused, timeout, a Python ``HttpClient``
+  that raised). The original failure is chained as ``__cause__``.
+* ``response_too_large`` (``InternalError``): an outbound response exceeded the
+  client's size cap.
+* ``upstream_http`` (``InternalError``): a discovery, JWKS or federation
+  fetch got a failing status. Always this value for such non-auth failures,
+  even if the upstream sent an OAuth ``error`` (that stays in
+  ``upstream_error``).
+
+Transport causes
+----------------
+
+When an outbound fetch fails, the raised ``InternalError`` has ``code ==
+"transport"`` and the underlying exception as ``__cause__``:
+
+* the exception raised by your Python ``HttpClient`` (the very same object);
+* for the built-in ``ReqwestClient``: ``TimeoutError`` for connect, read or
+  total timeouts, ``ConnectionError`` for connection failures and ``OSError``
+  for other transport or body-read failures. ``response_too_large`` has no
+  cause.
+
+The cause is captured per call, so concurrent and nested calls never see each
+other's failures, and it is attached only to the error that the failed fetch
+itself produced (a tolerated earlier failure is not blamed for an unrelated
+error).
+
    .. py:attribute:: status_hint
       :type: int
 

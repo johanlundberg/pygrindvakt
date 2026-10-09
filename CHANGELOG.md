@@ -11,6 +11,18 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Added
 
+- Every pygrindvakt exception has a machine-readable `code` attribute (class
+  default, overridden per instance where known, e.g. the upstream OAuth
+  `error` such as `invalid_client`, `transport`, `response_too_large`);
+  `OAuthError.code` is unchanged. See "Error codes" in the exceptions docs.
+- Upstream HTTP failures expose `upstream_status`, `upstream_error`,
+  `upstream_error_description` and `upstream_body` (all `None` otherwise).
+  The description and body may echo secrets: do not log them or show them to
+  end users. `str(exc)` stays generic.
+- Outbound transport failures are chained as `__cause__` on the raised
+  `InternalError` (`code == "transport"`): the original exception from a
+  Python `HttpClient`, or `TimeoutError` / `ConnectionError` / `OSError` from
+  `ReqwestClient`. Captured per call, so concurrent calls never mix causes.
 - `rp.begin(provider, client, *, extra, redirect_uri, pkce, request_object_key)`
   generates `state`, `nonce` and a PKCE verifier, and returns
   `(url, state, nonce, verifier)`. `pkce=False` is refused for public clients;
@@ -21,6 +33,10 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Changed
 
+- **Breaking:** exception instances now always have `code` and `upstream_*`
+  attributes; code that set or relied on the absence of an attribute named
+  `code` on non-`OAuthError` exceptions is affected. `InternalError` raised
+  for transport failures now has a `__cause__` where it previously had none.
 - Updated to `grindvakt` 0.9 (see its changelog for the full list; notable
   effects for Python users below).
 - **Breaking:** `ProviderMetadata.userinfo_endpoint` is now `str | None`

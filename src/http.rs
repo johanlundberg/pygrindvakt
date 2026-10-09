@@ -26,7 +26,7 @@
 //! call (see `runtime::block_on`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,7 +40,7 @@ use grindvakt::Error as RsError;
 use crate::convert::{
     from_py, log_unraisable, new_submodule, parameter_pairs, require_methods, to_py,
 };
-use crate::errors::{err, internal_err};
+use crate::errors::{err, internal_err, with_code, InternalError};
 
 // ---------------------------------------------------------------------------
 // HttpRequestData
@@ -391,6 +391,100 @@ impl HttpFetchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Transport failure capture
+// ---------------------------------------------------------------------------
+
+/// Why an outbound fetch failed before an HTTP response was obtained.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportKind {
+    Timeout,
+    Connect,
+    TooLarge,
+    Body,
+}
+
+/// The original cause of a failed outbound fetch, kept so it can be chained
+/// as `__cause__` (grindvakt itself only sees `Error::Internal(String)`).
+pub enum TransportFailure {
+    /// The Python `HttpClient` raised this exception.
+    Python(PyErr),
+    /// The built-in client failed.
+    Reqwest { kind: TransportKind, detail: String },
+}
+
+/// Per-call slot for the latest [`TransportFailure`]. Every call to
+/// [`extract_http_client`] creates a fresh slot, so concurrent and nested
+/// calls never see each other's failures.
+#[derive(Clone, Default)]
+pub struct Failures(Arc<Mutex<Option<(String, TransportFailure)>>>);
+
+impl Failures {
+    /// `message` is the exact `Error::Internal` text returned to grindvakt
+    /// for this failure; `err` only attributes the failure to an error that
+    /// carries the same text.
+    fn record(&self, message: String, f: TransportFailure) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((message, f));
+    }
+
+    /// A later successful fetch supersedes an earlier failure (multi-fetch
+    /// flows such as federation resolution may retry other endpoints).
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn take(&self) -> Option<(String, TransportFailure)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Map an error returned by a grindvakt call that used this call's
+    /// client. If it is an `Internal` error and a transport failure was
+    /// captured, raise `InternalError(code="transport")` (or
+    /// `"response_too_large"`) chained to the original exception.
+    pub fn err(&self, py: Python<'_>, e: RsError) -> PyErr {
+        // Always consume the slot. Only attribute the failure to an Internal
+        // error that is the one the failed fetch returned: a tolerated earlier
+        // fetch failure must not be blamed for an unrelated Internal error.
+        let captured = self.take();
+        let RsError::Internal(emitted) = &e else {
+            return err(e);
+        };
+        let Some((_, failure)) = captured.filter(|(m, _)| m == emitted) else {
+            return err(e);
+        };
+        let msg = e.to_string();
+        match failure {
+            TransportFailure::Python(cause) => {
+                let exc = with_code(py, InternalError::new_err(msg), "transport");
+                exc.set_cause(py, Some(cause));
+                exc
+            }
+            TransportFailure::Reqwest { kind, detail } => {
+                let (code, cause): (&str, Option<PyErr>) = match kind {
+                    TransportKind::Timeout => (
+                        "transport",
+                        Some(pyo3::exceptions::PyTimeoutError::new_err(detail)),
+                    ),
+                    TransportKind::Connect => (
+                        "transport",
+                        Some(pyo3::exceptions::PyConnectionError::new_err(detail)),
+                    ),
+                    TransportKind::Body => (
+                        "transport",
+                        Some(pyo3::exceptions::PyOSError::new_err(detail)),
+                    ),
+                    TransportKind::TooLarge => ("response_too_large", None),
+                };
+                let exc = with_code(py, InternalError::new_err(msg), code);
+                if let Some(c) = cause {
+                    exc.set_cause(py, Some(c));
+                }
+                exc
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Built-in reqwest client
 // ---------------------------------------------------------------------------
 
@@ -447,11 +541,35 @@ impl ReqwestHttpClient {
     }
 }
 
-fn request_error(method: &str, url: &str, error: RsError) -> RsError {
-    RsError::Internal(format!("{method} {url}: {error}"))
+struct RawFailure {
+    kind: TransportKind,
+    detail: String,
 }
 
-async fn into_fetch(mut resp: reqwest::Response, max: usize) -> grindvakt::Result<RsFetch> {
+fn send_failure(method: &str, url: &str, e: &reqwest::Error) -> RawFailure {
+    let kind = if e.is_timeout() {
+        TransportKind::Timeout
+    } else if e.is_connect() {
+        TransportKind::Connect
+    } else {
+        TransportKind::Body
+    };
+    RawFailure {
+        kind,
+        detail: format!("{method} {url}: {e}"),
+    }
+}
+
+async fn into_fetch(
+    method: &str,
+    url: &str,
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<RsFetch, RawFailure> {
+    let too_large = || RawFailure {
+        kind: TransportKind::TooLarge,
+        detail: format!("{method} {url}: outbound response exceeds {max} byte limit"),
+    };
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
@@ -470,25 +588,21 @@ async fn into_fetch(mut resp: reqwest::Response, max: usize) -> grindvakt::Resul
         })
         .collect();
     if resp.content_length().is_some_and(|l| l > max as u64) {
-        return Err(RsError::Internal(format!(
-            "outbound response exceeds {max} byte limit"
-        )));
+        return Err(too_large());
     }
     // Content-Length is optional and cannot be trusted on its own: stream the
     // body and check before every extension.
     let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| RsError::Internal(format!("reading body: {e}")))?
-    {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        let mut f = send_failure(method, url, &e);
+        f.detail = format!("{method} {url}: reading body: {e}");
+        f
+    })? {
         let new_len = body
             .len()
             .checked_add(chunk.len())
             .filter(|l| *l <= max)
-            .ok_or_else(|| {
-                RsError::Internal(format!("outbound response exceeds {max} byte limit"))
-            })?;
+            .ok_or_else(too_large)?;
         body.reserve(new_len - body.len());
         body.extend_from_slice(&chunk);
     }
@@ -500,18 +614,68 @@ async fn into_fetch(mut resp: reqwest::Response, max: usize) -> grindvakt::Resul
     })
 }
 
-#[async_trait]
-impl HttpClient for ReqwestHttpClient {
-    async fn get(&self, url: &str) -> grindvakt::Result<RsFetch> {
+impl ReqwestHttpClient {
+    async fn get_raw(&self, url: &str) -> Result<RsFetch, RawFailure> {
         let resp = self
             .client()
             .get(url)
             .send()
             .await
-            .map_err(|e| RsError::Internal(format!("GET {url}: {e}")))?;
-        into_fetch(resp, self.max_response_bytes)
+            .map_err(|e| send_failure("GET", url, &e))?;
+        into_fetch("GET", url, resp, self.max_response_bytes).await
+    }
+
+    async fn post_form_raw(
+        &self,
+        url: &str,
+        form: &[(String, String)],
+        headers: &[(String, String)],
+    ) -> Result<RsFetch, RawFailure> {
+        let mut req = self.client().post(url).form(form);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req
+            .send()
             .await
-            .map_err(|e| request_error("GET", url, e))
+            .map_err(|e| send_failure("POST", url, &e))?;
+        into_fetch("POST", url, resp, self.max_response_bytes).await
+    }
+}
+
+/// Per-call view of the built-in client that records why a fetch failed (see
+/// [`Failures`]). Cheap: one `Arc` clone and one fresh slot per call.
+struct ReqwestCall {
+    client: Arc<ReqwestHttpClient>,
+    failures: Failures,
+}
+
+impl ReqwestCall {
+    fn finish(&self, r: Result<RsFetch, RawFailure>) -> grindvakt::Result<RsFetch> {
+        match r {
+            Ok(f) => {
+                self.failures.clear();
+                Ok(f)
+            }
+            Err(f) => {
+                let msg = f.detail.clone();
+                self.failures.record(
+                    msg.clone(),
+                    TransportFailure::Reqwest {
+                        kind: f.kind,
+                        detail: f.detail,
+                    },
+                );
+                Err(RsError::Internal(msg))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl HttpClient for ReqwestCall {
+    async fn get(&self, url: &str) -> grindvakt::Result<RsFetch> {
+        self.finish(self.client.get_raw(url).await)
     }
 
     async fn post_form(
@@ -520,17 +684,7 @@ impl HttpClient for ReqwestHttpClient {
         form: &[(String, String)],
         headers: &[(String, String)],
     ) -> grindvakt::Result<RsFetch> {
-        let mut req = self.client().post(url).form(form);
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| RsError::Internal(format!("POST {url}: {e}")))?;
-        into_fetch(resp, self.max_response_bytes)
-            .await
-            .map_err(|e| request_error("POST", url, e))
+        self.finish(self.client.post_form_raw(url, form, headers).await)
     }
 }
 
@@ -600,9 +754,13 @@ impl ReqwestClient {
         py: Python<'py>,
         url: String,
     ) -> PyResult<(u16, Bound<'py, PyBytes>, Option<String>)> {
-        let client = self.inner.clone();
-        let r =
-            crate::runtime::block_on(py, async move { client.get(&url).await })?.map_err(err)?;
+        let failures = Failures::default();
+        let client = ReqwestCall {
+            client: self.inner.clone(),
+            failures: failures.clone(),
+        };
+        let r = crate::runtime::block_on(py, async move { client.get(&url).await })?
+            .map_err(|e| failures.err(py, e))?;
         Ok((r.status, PyBytes::new(py, &r.body), r.content_type))
     }
 
@@ -615,14 +773,18 @@ impl ReqwestClient {
         form: Vec<(String, String)>,
         headers: Option<Vec<(String, String)>>,
     ) -> PyResult<(u16, Bound<'py, PyBytes>, Option<String>)> {
-        let client = self.inner.clone();
+        let failures = Failures::default();
+        let client = ReqwestCall {
+            client: self.inner.clone(),
+            failures: failures.clone(),
+        };
         let headers = headers.unwrap_or_default();
         let r =
             crate::runtime::block_on(
                 py,
                 async move { client.post_form(&url, &form, &headers).await },
             )?
-            .map_err(err)?;
+            .map_err(|e| failures.err(py, e))?;
         Ok((r.status, PyBytes::new(py, &r.body), r.content_type))
     }
 
@@ -663,10 +825,25 @@ fn default_http_client() -> Arc<ReqwestHttpClient> {
 /// already inside `runtime::block_on`, so it re-acquires the GIL briefly.
 pub struct PyHttpClient {
     obj: Py<PyAny>,
+    failures: Failures,
 }
 
-fn py_http_err(e: PyErr) -> RsError {
-    RsError::Internal(format!("python http client: {e}"))
+impl PyHttpClient {
+    /// Log the adapter failure (ADR 0002: fail closed, report via the
+    /// unraisable hook), keep the original exception for `__cause__` chaining
+    /// and return the opaque grindvakt error.
+    fn fail(&self, py: Python<'_>, obj: &Bound<'_, PyAny>, what: &str, e: PyErr) -> RsError {
+        let msg = format!("python http client: {e}");
+        log_unraisable(py, e.clone_ref(py), obj, what);
+        self.failures
+            .record(msg.clone(), TransportFailure::Python(e));
+        RsError::Internal(msg)
+    }
+
+    fn ok(&self, f: RsFetch) -> RsFetch {
+        self.failures.clear();
+        f
+    }
 }
 
 fn extract_fetch(r: &Bound<'_, PyAny>) -> PyResult<RsFetch> {
@@ -695,10 +872,8 @@ impl HttpClient for PyHttpClient {
             let obj = self.obj.bind(py);
             obj.call_method1("get", (url,))
                 .and_then(|r| extract_fetch(&r))
-                .map_err(|e| {
-                    log_unraisable(py, e.clone_ref(py), obj, "HttpClient.get");
-                    py_http_err(e)
-                })
+                .map(|f| self.ok(f))
+                .map_err(|e| self.fail(py, obj, "HttpClient.get", e))
         })
     }
 
@@ -712,10 +887,8 @@ impl HttpClient for PyHttpClient {
             let obj = self.obj.bind(py);
             obj.call_method1("post_form", (url, form.to_vec(), headers.to_vec()))
                 .and_then(|r| extract_fetch(&r))
-                .map_err(|e| {
-                    log_unraisable(py, e.clone_ref(py), obj, "HttpClient.post_form");
-                    py_http_err(e)
-                })
+                .map(|f| self.ok(f))
+                .map_err(|e| self.fail(py, obj, "HttpClient.post_form", e))
         })
     }
 }
@@ -723,20 +896,35 @@ impl HttpClient for PyHttpClient {
 /// Resolve the `http` argument of networked functions: `None` -> the shared
 /// built-in client, a `ReqwestClient` -> its inner client, anything else ->
 /// a Python protocol adapter (validated to have `get` and `post_form`).
-pub fn extract_http_client(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Arc<dyn HttpClient>> {
-    match obj {
-        None => Ok(default_http_client()),
-        Some(o) if o.is_none() => Ok(default_http_client()),
+///
+/// Returns the client together with this call's [`Failures`] slot; pass failed
+/// results through `Failures::err` so transport causes are chained.
+pub fn extract_http_client(
+    obj: Option<&Bound<'_, PyAny>>,
+) -> PyResult<(Arc<dyn HttpClient>, Failures)> {
+    let failures = Failures::default();
+    let reqwest_call = |client: Arc<ReqwestHttpClient>| -> Arc<dyn HttpClient> {
+        Arc::new(ReqwestCall {
+            client,
+            failures: failures.clone(),
+        })
+    };
+    let client = match obj {
+        None => reqwest_call(default_http_client()),
+        Some(o) if o.is_none() => reqwest_call(default_http_client()),
         Some(o) => {
             if let Ok(h) = o.cast::<ReqwestClient>() {
-                return Ok(h.get().inner.clone());
+                reqwest_call(h.get().inner.clone())
+            } else {
+                require_methods(o, &["get", "post_form"], "HttpClient")?;
+                Arc::new(PyHttpClient {
+                    obj: o.clone().unbind(),
+                    failures: failures.clone(),
+                })
             }
-            require_methods(o, &["get", "post_form"], "HttpClient")?;
-            Ok(Arc::new(PyHttpClient {
-                obj: o.clone().unbind(),
-            }))
         }
-    }
+    };
+    Ok((client, failures))
 }
 
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {

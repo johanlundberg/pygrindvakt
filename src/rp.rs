@@ -501,9 +501,10 @@ fn discover(
     http: Option<&Bound<'_, PyAny>>,
     issuer: String,
 ) -> PyResult<ProviderMetadata> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let r = crate::runtime::block_on(py, async move { grp::discover(&http, &issuer).await })?;
-    r.map(ProviderMetadata::wrap).map_err(err)
+    r.map(ProviderMetadata::wrap)
+        .map_err(|e| failures.err(py, e))
 }
 
 /// Fetch a JWKS document from `jwks_uri` for its associated `issuer` and
@@ -519,11 +520,11 @@ fn fetch_jwks<'py>(
     jwks_uri: String,
     issuer: String,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let r = crate::runtime::block_on(py, async move {
         grp::fetch_jwks(&http, &jwks_uri, &issuer).await
     })?;
-    let jwks = r.map_err(err)?;
+    let jwks = r.map_err(|e| failures.err(py, e))?;
     to_py(py, &jwks)
 }
 
@@ -535,8 +536,8 @@ fn fetch_jwks<'py>(
 /// same value here (RFC 6749 section 4.1.3); store it in the session with
 /// the state, nonce and verifier.
 ///
-/// A non-200 response raises `AuthnError` carrying a sanitized, truncated
-/// copy of the upstream error body.
+/// A non-200 response raises `AuthnError` (generic message) with the
+/// sanitized upstream details in `code` / `upstream_*`.
 #[pyfunction]
 #[pyo3(signature = (http, provider, client, code, code_verifier = None, *, redirect_uri = None))]
 fn exchange_code(
@@ -548,13 +549,14 @@ fn exchange_code(
     code_verifier: Option<String>,
     redirect_uri: Option<String>,
 ) -> PyResult<TokenSet> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let provider = provider.inner.clone();
     let client = effective_client(client, redirect_uri);
     let r = crate::runtime::block_on(py, async move {
         grp::exchange_code(&http, &provider, &client, &code, code_verifier.as_deref()).await
     })?;
-    r.map(|inner| TokenSet { inner }).map_err(err)
+    r.map(|inner| TokenSet { inner })
+        .map_err(|e| failures.err(py, e))
 }
 
 /// Verify an `id_token` against the provider JWKS (a dict `{"keys": [...]}`),
@@ -641,7 +643,7 @@ fn fetch_userinfo<'py>(
     expected_sub: String,
     issuer: String,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let r = crate::runtime::block_on(py, async move {
         grp::fetch_userinfo(
             &http,
@@ -652,7 +654,7 @@ fn fetch_userinfo<'py>(
         )
         .await
     })?;
-    let v = r.map_err(err)?;
+    let v = r.map_err(|e| failures.err(py, e))?;
     to_py(py, &v)
 }
 

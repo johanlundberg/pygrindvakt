@@ -42,6 +42,12 @@ Implementation rules:
     as a replay and misleads operators.
   - `ClientStore.get` returns `None` (unknown client -> `invalid_client`).
   - `HttpClient.*` return `Error::Internal` (surfaces as `InternalError`).
+    The original exception is also kept in a per-call slot (`http::Failures`,
+    created by `extract_http_client`) and chained as `__cause__` with
+    `code == "transport"` when the error is raised to Python. The
+    unraisable-hook report is retained: it gives operators the traceback at the
+    moment of failure even when the caller catches `InternalError`. The kept `PyErr` holds its
+    traceback alive only until the call returns.
 - `InMemoryReplayStore` is a newtype over grindvakt's `InMemoryTokenUseStore`,
   whose `consume` already has `record`'s contract (true iff newly recorded, TTL,
   periodic purge), plus a `MAX_JTI_LEN` guard.

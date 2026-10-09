@@ -198,9 +198,12 @@ Finishing the flow
    the challenge sent in :func:`authorization_url`. If the authorization
    request overrode ``redirect_uri``, pass the same ``redirect_uri`` here.
 
-   A non-200 response raises :class:`pygrindvakt.AuthnError` carrying a
-   sanitized, truncated copy of the upstream error body (for example
-   ``invalid_client`` or ``invalid_grant``). That message is for logs.
+   A non-200 response raises :class:`pygrindvakt.AuthnError` with a generic
+   message; ``exc.code`` / ``exc.upstream_error`` hold the upstream OAuth error
+   (for example ``invalid_client`` or ``invalid_grant``) and ``exc.upstream_status``,
+   ``exc.upstream_error_description`` and ``exc.upstream_body`` the sanitized
+   details. The description and body may echo secrets: never log them
+   verbatim or show them to users.
 
 .. py:function:: verify_id_token(jwks: dict[str, Any], id_token: str, issuer: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False) -> dict[str, Any]
 

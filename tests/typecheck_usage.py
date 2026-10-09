@@ -7,7 +7,15 @@ the built-in ``ReqwestClient``, ``None`` and a custom protocol client.
 from __future__ import annotations
 
 import pygrindvakt.http
-from pygrindvakt import discovery, federation, rp
+from pygrindvakt import (
+    AuthnError,
+    GrindvaktError,
+    InternalError,
+    OAuthError,
+    discovery,
+    federation,
+    rp,
+)
 
 
 class TupleClient:
@@ -53,11 +61,19 @@ def use_all() -> None:
     me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
     rp.exchange_code(reqwest, info, me, "code")
     rp.exchange_code(custom, info, me, "code", code_verifier="v")
-    rp.exchange_code(reqwest, info, me, "code", "v", redirect_uri="https://rp.example.com/alt")
+    rp.exchange_code(
+        reqwest, info, me, "code", "v", redirect_uri="https://rp.example.com/alt"
+    )
     url, state, nonce, verifier = rp.begin(info, me)
     check: tuple[str, str, str, str | None] = (url, state, nonce, verifier)
     del check
-    rp.begin(info, me, extra={"prompt": "login"}, redirect_uri="https://rp.example.com/alt", pkce=False)
+    rp.begin(
+        info,
+        me,
+        extra={"prompt": "login"},
+        redirect_uri="https://rp.example.com/alt",
+        pkce=False,
+    )
     rp.authorization_url(info, me, state, nonce, redirect_uri=None)
     rp.fetch_jwks(fetch, "https://op.example.com/jwks", "https://op.example.com")
     rp.fetch_userinfo(
@@ -77,3 +93,23 @@ def use_all() -> None:
     status, body, content_type = reqwest.get("https://op.example.com")
     reveal: tuple[int, bytes, str | None] = (status, body, content_type)
     del reveal
+
+
+def use_errors() -> None:
+    try:
+        rp.exchange_code(
+            None,
+            rp.ProviderInfo("i", "a", "t"),
+            rp.RpClient("c", "https://x/cb"),
+            "code",
+        )
+    except GrindvaktError as e:
+        code: str = e.code
+        status: int | None = e.upstream_status
+        upstream_error: str | None = e.upstream_error
+        description: str | None = e.upstream_error_description
+        body: str | None = e.upstream_body
+        cause: BaseException | None = e.__cause__
+        del code, status, upstream_error, description, body, cause
+    except (AuthnError, InternalError, OAuthError) as e:
+        print(e.code)

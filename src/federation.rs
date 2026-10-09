@@ -306,11 +306,11 @@ fn fetch_entity_configuration(
     http: Option<&Bound<'_, PyAny>>,
     entity_id: String,
 ) -> PyResult<String> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     crate::runtime::block_on(py, async move {
         gf::fetch_entity_configuration(&http, &entity_id).await
     })?
-    .map_err(err)
+    .map_err(|e| failures.err(py, e))
 }
 
 /// Resolve `sub`'s metadata by delegating to each configured trust anchor's
@@ -330,13 +330,13 @@ fn resolve_via_trust_anchors(
     sub: String,
     trust_anchors: &Bound<'_, PyAny>,
 ) -> PyResult<ResolvedEntity> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let trust_anchors: HashMap<String, JwkSet> = from_py(trust_anchors)?;
     crate::runtime::block_on(py, async move {
         gf::resolve_via_trust_anchors(&http, &sub, &trust_anchors).await
     })?
     .map(ResolvedEntity::wrap)
-    .map_err(err)
+    .map_err(|e| failures.err(py, e))
 }
 
 /// Resolve an entity type's key set from its metadata (OpenID Federation 1.1
@@ -351,13 +351,13 @@ fn entity_metadata_jwks<'py>(
     subject_entity_id: String,
     subject_fed_jwks: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let metadata: Value = from_py(metadata)?;
     let subject_fed_jwks = jwks_from_py(subject_fed_jwks)?;
     let jwks = crate::runtime::block_on(py, async move {
         gf::entity_metadata_jwks(&http, &metadata, &subject_entity_id, &subject_fed_jwks).await
     })?
-    .map_err(err)?;
+    .map_err(|e| failures.err(py, e))?;
     to_py(py, &jwks)
 }
 
@@ -374,7 +374,7 @@ fn fetch_signed_jwks<'py>(
     subject_entity_id: String,
     subject_fed_jwks: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let subject_fed_jwks = jwks_from_py(subject_fed_jwks)?;
     let jwks = crate::runtime::block_on(py, async move {
         gf::fetch_signed_jwks(
@@ -385,7 +385,7 @@ fn fetch_signed_jwks<'py>(
         )
         .await
     })?
-    .map_err(err)?;
+    .map_err(|e| failures.err(py, e))?;
     to_py(py, &jwks)
 }
 
@@ -400,11 +400,11 @@ fn fetch_collection(
     collection_endpoint: String,
     entity_type: String,
 ) -> PyResult<Vec<CollectionEntity>> {
-    let http = extract_http_client(http)?;
+    let (http, failures) = extract_http_client(http)?;
     let entities = crate::runtime::block_on(py, async move {
         gf::fetch_collection(&http, &collection_endpoint, &entity_type).await
     })?
-    .map_err(err)?;
+    .map_err(|e| failures.err(py, e))?;
     Ok(entities.into_iter().map(CollectionEntity::wrap).collect())
 }
 

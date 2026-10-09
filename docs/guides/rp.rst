@@ -151,8 +151,10 @@ stored nonce.
 JWKS, the explicit signing-algorithm allowlist, ``iss``, ``sub``, every
 ``aud`` value, ``azp`` when applicable, ``exp``, ``iat`` and the nonce, and
 returns the claims as a dict. A non-200 from the token endpoint raises
-:class:`pygrindvakt.AuthnError` with a sanitized, truncated copy of the
-upstream error body; treat it as log material, never show it to the user.
+:class:`pygrindvakt.AuthnError` (generic message; the upstream OAuth error is
+in ``exc.code`` and the sanitized details in ``exc.upstream_*``). Treat
+``upstream_error_description`` and ``upstream_body`` as secret-bearing: never
+log them verbatim or show them to the user.
 
 .. important:: The nonce is required.
 
