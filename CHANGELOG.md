@@ -17,7 +17,9 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `no-cache` are floored by `min_ttl`), never serving an expired set, with
   `jwks()`, `refresh()` and `verify_id_token(...)`. An unknown `kid` triggers
   one rate-limited refresh, then `UnknownKeyError`. A cache is accepted as
-  `jwks=` by `rp.verify_id_token` and `rp.fetch_userinfo`. A Python
+  `jwks=` by `rp.verify_id_token` and `rp.fetch_userinfo`; the `issuer`
+  argument must equal the cache's issuer (`BadRequestError` otherwise, before
+  any request), so one provider's keys cannot vouch for another's `iss`. A Python
   `HttpClient` cannot report response headers, so it always gets `default_ttl`.
 - `UnknownKeyError(JoseError)`, `code == "unknown_kid"`, `status_hint` 401.
 - `rp.verify_id_token` keyword-only options `leeway` (<= 300), `max_age`

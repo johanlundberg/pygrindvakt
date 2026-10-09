@@ -1013,7 +1013,7 @@ fn verify_id_token<'py>(
     );
     let set = JwksSource::from_py(jwks)?;
     let policy = policy?;
-    let set = set.resolve(py, id_token)?;
+    let set = set.resolve(py, id_token, issuer)?;
     Ok(policy
         .verify(py, &set, id_token, issuer, client_id, expected_nonce)?
         .into_bound(py))
@@ -1037,9 +1037,23 @@ impl<'py> JwksSource<'py> {
         Ok(Self::Set(Arc::new(jwks_from_py(obj)?)))
     }
 
+    /// A cache is bound to one issuer. `issuer` is the issuer the caller will
+    /// verify against, and it must equal the cache's issuer, so keys of one
+    /// provider can never vouch for another provider's `iss`. Call this
+    /// before any network request.
+    fn check_issuer(&self, issuer: &str) -> PyResult<()> {
+        match self {
+            Self::Cache(cache) if cache.get().issuer != issuer => Err(err(RsError::BadRequest(
+                "JwksCache issuer does not match the issuer argument".into(),
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// The key set to verify `token` against (for a cache: refreshed once if
-    /// the token's `kid` is unknown).
-    fn resolve(&self, py: Python<'py>, token: &str) -> PyResult<Arc<JwkSet>> {
+    /// the token's `kid` is unknown). Rejects an issuer mismatch first.
+    fn resolve(&self, py: Python<'py>, token: &str, issuer: &str) -> PyResult<Arc<JwkSet>> {
+        self.check_issuer(issuer)?;
         match self {
             Self::Set(set) => Ok(set.clone()),
             Self::Cache(cache) => cache.get().resolve_for_token(py, token),
@@ -1421,6 +1435,9 @@ fn fetch_userinfo<'py>(
         ));
     }
     let jwks = jwks.map(JwksSource::from_py).transpose()?;
+    if let Some(jwks) = &jwks {
+        jwks.check_issuer(&issuer)?;
+    }
     let algs = allowed_algorithms
         .map(|algs| {
             algs.iter()
@@ -1499,7 +1516,7 @@ fn fetch_userinfo<'py>(
             options = options.with_require_exp();
         }
         // A cache refreshes once if the response's `kid` is unknown.
-        let jwks = jwks.resolve(py, resp.text().trim())?;
+        let jwks = jwks.resolve(py, resp.text().trim(), &issuer)?;
         grp::userinfo_signed_claims(
             &jwks,
             &resp,

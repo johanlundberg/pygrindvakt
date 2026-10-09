@@ -194,8 +194,10 @@ trusting possibly revoked keys.
    except UnknownKeyError:
        ...  # token signed by a key the issuer does not publish: reject
 
-``rp.verify_id_token(jwks_cache, id_token, issuer, ...)`` is equivalent, and
-the cache is accepted as ``jwks=`` by :func:`~pygrindvakt.rp.fetch_userinfo`
+``rp.verify_id_token(jwks_cache, id_token, issuer, ...)`` is equivalent, but
+``issuer`` must equal the cache's own issuer: a mismatch raises
+:class:`pygrindvakt.BadRequestError` before any fetch, so one provider's keys
+can never vouch for another provider's ``iss``. The cache is accepted as ``jwks=`` by :func:`~pygrindvakt.rp.fetch_userinfo`
 for signed UserInfo responses. Extra checks are keyword options on both:
 ``max_age`` (against ``auth_time``), ``acr_values``, ``access_token`` /
 ``require_at_hash``, ``authorization_code`` / ``require_c_hash``, ``leeway``

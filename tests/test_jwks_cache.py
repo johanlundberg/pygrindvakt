@@ -574,11 +574,24 @@ def test_rp_verify_id_token_accepts_cache():
         rp.verify_id_token(cache, id_token(make_key("zzz")), ISSUER, CLIENT_ID, "n", ["ES256"])
 
 
-def test_rp_verify_id_token_with_cache_checks_issuer_argument():
+def test_rp_verify_id_token_with_cache_rejects_issuer_mismatch():
+    """A cache is bound to its issuer: keys of A must not vouch for issuer B."""
+    k1 = make_key("k1")
+    http = ScriptedHttp(jwks_doc(k1))
+    cache, _ = make_cache(http)
+    other = "https://other.example.com"
+    # Token claims iss == other and is signed by the cache's key.
+    with pytest.raises(BadRequestError, match="issuer"):
+        rp.verify_id_token(cache, id_token(k1, issuer=other), other, CLIENT_ID, "n", ["ES256"])
+    # Rejected before any fetch.
+    assert http.calls == 0
+
+
+def test_rp_verify_id_token_with_cache_checks_iss_claim():
     k1 = make_key("k1")
     cache, _ = make_cache(ScriptedHttp(jwks_doc(k1)))
     with pytest.raises(GrindvaktError):
-        rp.verify_id_token(cache, id_token(k1), "https://other.example.com", CLIENT_ID, "n", ["ES256"])
+        rp.verify_id_token(cache, id_token(k1, issuer="https://other.example.com"), ISSUER, CLIENT_ID, "n", ["ES256"])
 
 
 def test_cache_verify_options_are_forwarded():
@@ -659,3 +672,19 @@ def test_fetch_userinfo_json_does_not_touch_cache():
     out = rp.fetch_userinfo(http, f"{ISSUER}/userinfo", "tok", "alice", ISSUER, jwks=cache)
     assert out["sub"] == "alice"
     assert http.calls == 0
+
+
+def test_fetch_userinfo_with_cache_rejects_issuer_mismatch():
+    """The cache's issuer must equal the issuer argument, before any fetch."""
+    k1 = make_key("k1")
+    now = int(time.time())
+    other = "https://other.example.com"
+    claims = {"iss": other, "sub": "alice", "aud": CLIENT_ID, "iat": now}
+    http = UserinfoHttp(jwks_doc(k1), jwt.sign(k1, claims))
+    cache, _ = make_cache(http)
+    with pytest.raises(BadRequestError, match="issuer"):
+        rp.fetch_userinfo(
+            http, f"{other}/userinfo", "tok", "alice", other, jwks=cache,
+            client_id=CLIENT_ID, allowed_algorithms=["ES256"], trust="dedicated_keys",
+        )
+    assert http.calls == 0  # rejected before any request
