@@ -1,10 +1,11 @@
 """Framework-agnostic request/response types and the built-in HTTP client."""
 
 import os
+import signal
 import sys
+import time
 
 import pytest
-
 from pygrindvakt import http
 
 
@@ -165,7 +166,18 @@ def test_reqwest_client_usable_after_fork():
                 code = 0 if ok else 2
             finally:
                 os._exit(code)
-        _, status = os.waitpid(pid, 0)
+        # A stale lock or runtime in the child hangs forever: poll with a
+        # deadline, then kill and reap so the test fails instead of the job.
+        deadline = time.monotonic() + 30
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail("forked child hung (30 s)")
+            time.sleep(0.05)
         assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
         assert c.get(url)[:2] == (200, b"pong")  # parent unaffected
     finally:
