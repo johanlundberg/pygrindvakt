@@ -278,8 +278,9 @@ Built-in client
    .. warning::
 
       Fork only while no other thread is inside a pygrindvakt call (for
-      example in a gunicorn master before any worker thread exists, or in
-      ``post_fork``). The pool and runtime are guarded by internal locks. If
+      example in a gunicorn master before it starts any thread that calls
+      pygrindvakt). A ``post_fork`` hook does not help: it runs in the child,
+      after the fork has already happened. The pool and runtime are guarded by internal locks. If
       another thread holds one at the moment of ``fork``, the child inherits
       it locked with no owner and can block forever, before the process id
       check runs. Forking concurrently with active calls is not supported.

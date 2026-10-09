@@ -252,7 +252,7 @@ Deployment: threads and fork
 
 One :class:`~pygrindvakt.http.ReqwestClient` (or the ``http=None`` default)
 can be shared by every thread of a worker; the GIL is released during I/O, so
-requests run in parallel. After ``fork`` (gunicorn ``--preload``, ``post_fork``,
+requests run in parallel. After ``fork`` (gunicorn ``--preload``,
 ``multiprocessing``) the child rebuilds the connection pool and the tokio
 runtime lazily, so a client created in the master before the fork is fine.
 Fork only while no other thread is inside a pygrindvakt call: a lock held by
