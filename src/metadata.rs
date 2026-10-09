@@ -116,11 +116,11 @@ impl ProviderMetadata {
         self.inner.token_endpoint = v;
     }
     #[getter]
-    fn userinfo_endpoint(&self) -> &str {
-        &self.inner.userinfo_endpoint
+    fn userinfo_endpoint(&self) -> Option<&str> {
+        self.inner.userinfo_endpoint.as_deref()
     }
     #[setter]
-    fn set_userinfo_endpoint(&mut self, v: String) {
+    fn set_userinfo_endpoint(&mut self, v: Option<String>) {
         self.inner.userinfo_endpoint = v;
     }
     #[getter]

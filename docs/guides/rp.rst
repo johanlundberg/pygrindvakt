@@ -170,9 +170,10 @@ Userinfo
 
 .. code-block:: python
 
-   profile = rp.fetch_userinfo(
-       http_client, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer
-   )
+   if info.userinfo_endpoint is not None:  # OPs may omit UserInfo
+       profile = rp.fetch_userinfo(
+           http_client, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer
+       )
 
 The request is a POST with the token in the ``Authorization`` header, which
 OIDC Core permits and every OP built with pygrindvakt accepts. A non-200

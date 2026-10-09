@@ -87,7 +87,7 @@ impl ProviderInfo {
     }
 
     /// Build from a discovered `ProviderMetadata` document (the userinfo
-    /// endpoint and JWKS URI are always set in that case).
+    /// endpoint is `None` if the provider does not advertise one).
     #[staticmethod]
     fn from_metadata(metadata: &ProviderMetadata) -> PyResult<Self> {
         let inner = grp::ProviderInfo::from(metadata.inner.clone());

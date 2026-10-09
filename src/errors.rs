@@ -3,14 +3,17 @@
 //! ```text
 //! GrindvaktError(Exception)            status_hint: int (class attribute)
 //! ├── BadRequestError (400)            grindvakt::Error::BadRequest
-//! ├── AuthnError (401)                 grindvakt::Error::Authn
+//! ├── AuthnError (401)                 grindvakt::Error::Authn, and
+//! │                                    Error::UpstreamHttp from token/UserInfo
 //! ├── StateError (500)                 grindvakt::Error::State
 //! ├── ConfigError (500)                grindvakt::Error::Config
 //! ├── CryptoError (500)                grindvakt::Error::Crypto
 //! ├── AttributeMappingError (500)      grindvakt::Error::Attribute
 //! ├── JoseError (500)                  grindvakt::Error::Jose
 //! ├── JsonError (500)                  grindvakt::Error::Json
-//! ├── InternalError (500)              grindvakt::Error::Internal
+//! ├── InternalError (500)              grindvakt::Error::Internal, and
+//! │                                    other Error::UpstreamHttp (JWKS, discovery,
+//! │                                    federation fetches)
 //! ├── NoBoundEndpointError (404)       grindvakt::Error::NoBoundEndpoint
 //! ├── UnknownModuleError (404)         grindvakt::Error::UnknownModule
 //! ├── OAuthError                       grindvakt::OAuthError (defined in Python,
@@ -147,6 +150,15 @@ create_exception!(
 /// Map a `grindvakt::Error` onto the typed exception hierarchy.
 pub fn err(e: RsError) -> PyErr {
     let msg = e.to_string();
+    // Upstream HTTP failures (token, UserInfo, JWKS, discovery, federation
+    // fetches) used to surface as `Authn` or `Internal`; keep that mapping.
+    if matches!(e, RsError::UpstreamHttp(_)) {
+        return if e.is_auth_failure() {
+            AuthnError::new_err(msg)
+        } else {
+            InternalError::new_err(msg)
+        };
+    }
     match e {
         RsError::NoBoundEndpoint(_) => NoBoundEndpointError::new_err(msg),
         RsError::UnknownModule(_) => UnknownModuleError::new_err(msg),
@@ -158,7 +170,9 @@ pub fn err(e: RsError) -> PyErr {
         RsError::Attribute(_) => AttributeMappingError::new_err(msg),
         RsError::Jose(_) => JoseError::new_err(msg),
         RsError::Json(_) => JsonError::new_err(msg),
-        RsError::Internal(_) => InternalError::new_err(msg),
+        // `UpstreamHttp` is handled above; `Error` is `#[non_exhaustive]`, so
+        // any future variant maps to the generic internal error.
+        _ => InternalError::new_err(msg),
     }
 }
 

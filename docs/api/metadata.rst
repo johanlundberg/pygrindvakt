@@ -37,7 +37,7 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
    .. py:attribute:: token_endpoint
       :type: str
    .. py:attribute:: userinfo_endpoint
-      :type: str
+      :type: str | None
    .. py:attribute:: jwks_uri
       :type: str
    .. py:attribute:: registration_endpoint

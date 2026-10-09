@@ -356,6 +356,7 @@ impl HttpFetchResponse {
                 status,
                 body: body.to_vec(),
                 content_type,
+                headers: Vec::new(),
             },
         }
     }
@@ -457,6 +458,17 @@ async fn into_fetch(mut resp: reqwest::Response, max: usize) -> grindvakt::Resul
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    // Lower-cased names, in order, repeated headers kept; non-UTF-8 values
+    // are skipped.
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
     if resp.content_length().is_some_and(|l| l > max as u64) {
         return Err(RsError::Internal(format!(
             "outbound response exceeds {max} byte limit"
@@ -484,6 +496,7 @@ async fn into_fetch(mut resp: reqwest::Response, max: usize) -> grindvakt::Resul
         status,
         body,
         content_type,
+        headers,
     })
 }
 
@@ -671,6 +684,7 @@ fn extract_fetch(r: &Bound<'_, PyAny>) -> PyResult<RsFetch> {
         status,
         body,
         content_type,
+        headers: Vec::new(),
     })
 }
 

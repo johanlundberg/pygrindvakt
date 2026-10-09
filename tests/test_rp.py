@@ -579,7 +579,7 @@ def test_exchange_code_method_mismatch_is_refused(op, http, prov):
     rpc = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET, auth_method="client_secret_post")
     verifier = util.random_token(48)
     code = run_authorization(op, prov, rpc, "st", "n", verifier)
-    with pytest.raises(AuthnError, match="invalid_client"):
+    with pytest.raises(AuthnError, match="token endpoint returned 401"):
         rp.exchange_code(http, prov, rpc, code, verifier)
 
 

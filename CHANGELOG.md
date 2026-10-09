@@ -21,6 +21,27 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Changed
 
+- Updated to `grindvakt` 0.9 (see its changelog for the full list; notable
+  effects for Python users below).
+- **Breaking:** `ProviderMetadata.userinfo_endpoint` is now `str | None`
+  (and settable to `None`); providers that do not advertise UserInfo are
+  accepted by `rp.discover`, and `ProviderInfo.from_metadata` then yields
+  `userinfo_endpoint = None`.
+- **Breaking:** `rp.verify_id_token` requires the id_token to carry a `kid`
+  when the JWK Set has more than one key (OIDC Core 10.1).
+- Failures from the token, UserInfo, JWKS, discovery and federation
+  endpoints are reported upstream as `Error::UpstreamHttp`; the binding maps
+  token/UserInfo failures to `AuthnError` and the rest to `InternalError`,
+  as before. Messages are unchanged except that the token-endpoint message
+  no longer embeds the upstream body (`token endpoint returned 400`), and
+  the federation resolve failure now reads `resolve endpoint returned N ...`
+  under `InternalError`.
+- State parameters over 1024 characters or outside printable ASCII are
+  rejected, and `OAuthError` wire descriptions are normalized (upstream
+  hardening).
+- The built-in `ReqwestClient` now records lower-cased response headers on
+  the internal fetch response; Python HTTP clients supply none. Headers are
+  not exposed on the Python `HttpFetchResponse`.
 - `py.typed` is now empty (the package is fully typed) instead of `partial`.
 - The `http` argument of `rp`, `federation` and `discovery` functions is typed
   as `HttpClientProtocol | ReqwestClient | None` instead of `Any | None`, and

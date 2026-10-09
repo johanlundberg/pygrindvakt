@@ -36,8 +36,8 @@ Provider and client
    .. py:staticmethod:: from_metadata(metadata: ProviderMetadata) -> ProviderInfo
 
       Build from a :class:`pygrindvakt.metadata.ProviderMetadata` (as
-      returned by :func:`discover`); the userinfo endpoint and JWKS URI are
-      always set in that case.
+      returned by :func:`discover`); the userinfo endpoint is ``None``
+      if the provider does not advertise one.
 
    .. py:property:: issuer
       :type: str
