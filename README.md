@@ -96,7 +96,9 @@ userinfo = rp.fetch_userinfo(
 grindvakt is `async` Rust; the Python API is synchronous. Each call runs on a
 process-wide tokio runtime with the GIL released, so threads (gunicorn `gthread`,
 FastAPI's threadpool) run in parallel. The runtime is rebuilt lazily after
-`fork`, so a `Provider` built in a gunicorn master keeps working in workers.
+`fork`, so a `Provider` built in a gunicorn master keeps working in workers,
+unless it uses a `RedisStore`, which is process-bound and fails closed in a
+forked child (build it and its `Provider` in each worker).
 
 `http.ReqwestClient` is frozen and safe to share across threads (the GIL is
 released during I/O, so calls run in parallel); `http=None` uses a process-wide
