@@ -151,16 +151,33 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
 
    Known extension members are **type-checked** on every write path
    (``from_dict``, the ``extra`` setter, ``set_extra_field`` and the typed
-   setters). URL-typed members, that is every ``*_endpoint`` member
-   (``end_session_endpoint``, ``revocation_endpoint``,
-   ``introspection_endpoint``, ``pushed_authorization_request_endpoint``) and
-   ``check_session_iframe``, are additionally **URL-validated** on every one of those paths: an absolute
-   https URL (loopback http only for a loopback issuer), no userinfo, no
-   fragment, no control characters. A bad value raises ``ValueError`` from all
-   of them. The host is **not** compared with the issuer: an OP may publish
-   any host, so ``ProviderMetadata`` stays origin-permissive. An RP that
-   consumes metadata from anything other than its own TLS discovery of the
-   issuer must pin the host itself. The RP side binds only
+   setters). The following members are additionally **URL-validated** on
+   every one of those paths, and in the constructor for the modelled ones:
+   the five modelled fields (``authorization_endpoint``, ``token_endpoint``,
+   ``jwks_uri``, ``userinfo_endpoint``, ``registration_endpoint``), every known
+   extension ``*_endpoint`` member (``end_session_endpoint``,
+   ``revocation_endpoint``, ``introspection_endpoint``,
+   ``pushed_authorization_request_endpoint``, ...) and
+   ``check_session_iframe``. The check is: an absolute https URL (http only
+   for a loopback URL under a loopback issuer), no userinfo, no fragment, no
+   control characters. A bad value raises ``ValueError`` naming the member.
+   The ``issuer`` itself is validated too (constructor, ``from_dict`` and
+   the setter; ``ValueError``), since it decides whether loopback http is
+   allowed. ``authorization_endpoint`` query parameters are not checked by
+   ``ProviderMetadata`` (the upstream query check is not public). Strictness
+   note: an empty-string optional endpoint (``"registration_endpoint": ""``
+   or ``"userinfo_endpoint": ""``, which some OPs emit) is rejected by
+   ``from_dict``; drop the key before calling ``from_dict`` (``rp.discover``
+   does not apply this check). A trailing ``/`` on ``base`` is ignored.
+   Assigning ``issuer`` re-validates all of these against the new issuer and
+   keeps the old issuer on failure. ``ProviderMetadata(issuer, base)``
+   validates the endpoints it builds from ``base``. The host is **not**
+   compared with the issuer: an OP may publish any https host (``base`` may
+   be on another host), so ``ProviderMetadata`` stays origin-permissive. An RP
+   that consumes metadata from anything other than its own TLS discovery of
+   the issuer must pin the host itself. ``rp.discover`` does not run these
+   checks at the binding level (upstream validates the modelled endpoints
+   itself). The RP side binds only
    ``end_session_endpoint``, in :class:`~pygrindvakt.rp.ProviderInfo` (same
    origin as the issuer unless ``allow_cross_origin_end_session=True``), because
    ``id_token_hint`` is sent there. ``revocation_endpoint``,

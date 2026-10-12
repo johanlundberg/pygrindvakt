@@ -15,11 +15,22 @@ class ProviderMetadata:
     documented JSON type (``ValueError`` otherwise). Their typed properties
     return ``None`` when the member is absent (not an empty list / ``False``).
     ``extra`` / ``set_extra_field`` / ``from_dict`` and the typed setters
-    type-check these members, and additionally validate URL-typed ones (every
-    ``*_endpoint`` and ``check_session_iframe``): absolute https URL (loopback
+    type-check these members, and additionally validate URL-typed ones: the
+    five modelled fields (``authorization_endpoint``, ``token_endpoint``,
+    ``jwks_uri``, ``userinfo_endpoint``, ``registration_endpoint``; also in
+    the constructor, for the endpoints built from ``base``), every extension
+    ``*_endpoint`` and ``check_session_iframe``: absolute https URL (loopback
     http for a loopback issuer), no userinfo, no fragment, no control
-    characters (``ValueError``). The host is NOT compared with the issuer
-    here; an OP may publish any host. The RP-side decision is made by
+    characters (``ValueError`` naming the member). Assigning ``issuer``
+    re-validates all of them against the new issuer (old issuer kept on
+    failure). The issuer itself must be a valid issuer URL (constructor,
+    ``from_dict`` and the ``issuer`` setter raise ``ValueError`` otherwise);
+    a constructor ``base`` whose derived endpoints are invalid raises
+    ``ValueError`` (``base "..." yields an invalid endpoint: ...``). An
+    empty-string ``userinfo_endpoint`` / ``registration_endpoint`` makes
+    ``from_dict`` raise; ``authorization_endpoint`` query parameters are not
+    checked. The host is NOT compared with the issuer here; an OP may
+    publish any https host, and ``base`` may be on another host. The RP-side decision is made by
     ``rp.ProviderInfo``, which binds ``end_session_endpoint`` to the issuer's
     origin unless ``allow_cross_origin_end_session=True``. The other URL
     members (revocation, introspection, PAR, ``check_session_iframe``) are not

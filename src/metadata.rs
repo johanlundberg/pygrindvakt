@@ -99,6 +99,26 @@ fn validate_url_member(key: &str, url: &str, issuer: &str) -> PyResult<()> {
         .map_err(|e| PyValueError::new_err(format!("metadata field {key:?}: {e}")))
 }
 
+/// Validate the issuer itself (it decides whether loopback http is allowed).
+fn validate_issuer_value(issuer: &str) -> PyResult<()> {
+    grindvakt::rp::validate_issuer(issuer)
+        .map_err(|e| PyValueError::new_err(format!("metadata field \"issuer\": {e}")))
+}
+
+/// Validate every modelled URL member of `md` against `issuer`.
+fn validate_modelled_urls(md: &gm::ProviderMetadata, issuer: &str) -> PyResult<()> {
+    validate_url_member("authorization_endpoint", &md.authorization_endpoint, issuer)?;
+    validate_url_member("token_endpoint", &md.token_endpoint, issuer)?;
+    validate_url_member("jwks_uri", &md.jwks_uri, issuer)?;
+    if let Some(u) = &md.userinfo_endpoint {
+        validate_url_member("userinfo_endpoint", u, issuer)?;
+    }
+    if let Some(u) = &md.registration_endpoint {
+        validate_url_member("registration_endpoint", u, issuer)?;
+    }
+    Ok(())
+}
+
 fn known_kind(key: &str) -> Option<ExtraKind> {
     KNOWN_EXTRA
         .iter()
@@ -302,13 +322,18 @@ impl ProviderMetadata {
 impl ProviderMetadata {
     #[new]
     #[pyo3(signature = (issuer, base = None))]
-    fn new(issuer: String, base: Option<String>) -> Self {
+    fn new(issuer: String, base: Option<String>) -> PyResult<Self> {
         let base = base.unwrap_or_else(|| issuer.clone());
-        Self {
-            inner: gm::ProviderMetadata::new(issuer, &base),
+        validate_issuer_value(&issuer)?;
+        let inner = gm::ProviderMetadata::new(issuer, &base);
+        validate_modelled_urls(&inner, &inner.issuer).map_err(|e| {
+            PyValueError::new_err(format!("base {base:?} yields an invalid endpoint: {e}"))
+        })?;
+        Ok(Self {
+            inner,
             raw: None,
             touched: Default::default(),
-        }
+        })
     }
 
     /// Build from a discovery-document dict. The source dict is kept
@@ -320,6 +345,8 @@ impl ProviderMetadata {
         let inner: gm::ProviderMetadata =
             serde_json::from_value(serde_json::Value::Object(raw.clone()))
                 .map_err(|e| PyValueError::new_err(format!("invalid ProviderMetadata: {e}")))?;
+        validate_issuer_value(&inner.issuer)?;
+        validate_modelled_urls(&inner, &inner.issuer)?;
         validate_extra(&inner.extra, &inner.issuer)?;
         Ok(Self::wrap_with_raw(inner, raw))
     }
@@ -618,13 +645,9 @@ impl ProviderMetadata {
     fn set_issuer(&mut self, v: String) -> PyResult<()> {
         // Re-validate stored URL members against the new issuer first, so a
         // failure leaves the old issuer in place.
-        for (key, value) in &self.inner.extra {
-            if is_url_member(key) {
-                if let Some(url) = value.as_str() {
-                    validate_url_member(key, url, &v)?;
-                }
-            }
-        }
+        validate_issuer_value(&v)?;
+        validate_modelled_urls(&self.inner, &v)?;
+        validate_extra(&self.inner.extra, &v)?;
         self.inner.issuer = v;
         Ok(())
     }
@@ -633,32 +656,42 @@ impl ProviderMetadata {
         &self.inner.authorization_endpoint
     }
     #[setter]
-    fn set_authorization_endpoint(&mut self, v: String) {
+    fn set_authorization_endpoint(&mut self, v: String) -> PyResult<()> {
+        validate_url_member("authorization_endpoint", &v, &self.inner.issuer)?;
         self.inner.authorization_endpoint = v;
+        Ok(())
     }
     #[getter]
     fn token_endpoint(&self) -> &str {
         &self.inner.token_endpoint
     }
     #[setter]
-    fn set_token_endpoint(&mut self, v: String) {
+    fn set_token_endpoint(&mut self, v: String) -> PyResult<()> {
+        validate_url_member("token_endpoint", &v, &self.inner.issuer)?;
         self.inner.token_endpoint = v;
+        Ok(())
     }
     #[getter]
     fn userinfo_endpoint(&self) -> Option<&str> {
         self.inner.userinfo_endpoint.as_deref()
     }
     #[setter]
-    fn set_userinfo_endpoint(&mut self, v: Option<String>) {
+    fn set_userinfo_endpoint(&mut self, v: Option<String>) -> PyResult<()> {
+        if let Some(u) = &v {
+            validate_url_member("userinfo_endpoint", u, &self.inner.issuer)?;
+        }
         self.inner.userinfo_endpoint = v;
+        Ok(())
     }
     #[getter]
     fn jwks_uri(&self) -> &str {
         &self.inner.jwks_uri
     }
     #[setter]
-    fn set_jwks_uri(&mut self, v: String) {
+    fn set_jwks_uri(&mut self, v: String) -> PyResult<()> {
+        validate_url_member("jwks_uri", &v, &self.inner.issuer)?;
         self.inner.jwks_uri = v;
+        Ok(())
     }
 
     #[getter]
@@ -666,8 +699,12 @@ impl ProviderMetadata {
         self.inner.registration_endpoint.as_deref()
     }
     #[setter]
-    fn set_registration_endpoint(&mut self, v: Option<String>) {
+    fn set_registration_endpoint(&mut self, v: Option<String>) -> PyResult<()> {
+        if let Some(u) = &v {
+            validate_url_member("registration_endpoint", u, &self.inner.issuer)?;
+        }
         self.inner.registration_endpoint = v;
+        Ok(())
     }
 
     #[getter]

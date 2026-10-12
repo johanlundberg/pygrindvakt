@@ -371,9 +371,92 @@ def test_set_issuer_revalidates_url_members():
     md.revocation_endpoint = None
     md.end_session_endpoint = None
     md.revocation_endpoint = "https://op.example/revoke"
+    # Modelled endpoints (http loopback) still block the switch.
+    with pytest.raises(ValueError, match="authorization_endpoint"):
+        md.issuer = "https://op.example"
+    assert md.issuer == "http://localhost:8000"
+    md.authorization_endpoint = "https://op.example/authz"
+    md.token_endpoint = "https://op.example/token"
+    md.jwks_uri = "https://op.example/jwks"
+    md.userinfo_endpoint = "https://op.example/userinfo"
     md.issuer = "https://op.example"
     assert md.issuer == "https://op.example"
-    md.issuer = "https://op.example"
+
+
+MODELLED = [
+    "authorization_endpoint",
+    "token_endpoint",
+    "jwks_uri",
+    "userinfo_endpoint",
+    "registration_endpoint",
+]
+BAD_URLS = [
+    "javascript:alert(1)",
+    "http://attacker.test/t",
+    "https://op.example.com/x#frag",
+    "https://user:pw@op.example.com/x",
+    "nonsense",
+]
+
+
+@pytest.mark.parametrize("key", MODELLED)
+@pytest.mark.parametrize("bad", BAD_URLS)
+def test_modelled_setter_rejects_bad_url(key, bad):
+    md = metadata.ProviderMetadata(ISSUER)
+    before = getattr(md, key)
+    with pytest.raises(ValueError, match=key):
+        setattr(md, key, bad)
+    assert getattr(md, key) == before
+
+
+@pytest.mark.parametrize("key", MODELLED)
+def test_modelled_setter_accepts_https(key):
+    md = metadata.ProviderMetadata(ISSUER)
+    setattr(md, key, "https://other.example/ep")
+    assert getattr(md, key) == "https://other.example/ep"
+
+
+@pytest.mark.parametrize("key", ["userinfo_endpoint", "registration_endpoint"])
+def test_optional_modelled_setter_accepts_none(key):
+    md = metadata.ProviderMetadata(ISSUER)
+    setattr(md, key, "https://op.example.com/x")
+    setattr(md, key, None)
+    assert getattr(md, key) is None
+
+
+@pytest.mark.parametrize("key", MODELLED)
+@pytest.mark.parametrize("bad", ["javascript:alert(1)", "http://attacker.test/t"])
+def test_from_dict_rejects_bad_modelled_url(key, bad):
+    doc = minimal_doc()
+    doc[key] = bad
+    with pytest.raises(ValueError, match=key):
+        metadata.ProviderMetadata.from_dict(doc)
+
+
+def test_set_issuer_revalidates_modelled_fields_atomically():
+    md = metadata.ProviderMetadata("http://localhost:8000")
+    md.jwks_uri = "http://localhost:8000/jwks"
+    with pytest.raises(ValueError, match="_endpoint|jwks_uri"):
+        md.issuer = "https://op.example"
+    assert md.issuer == "http://localhost:8000"
+    md.authorization_endpoint = "https://op.example/a"
+    md.token_endpoint = "https://op.example/t"
+    with pytest.raises(ValueError, match="jwks_uri"):
+        md.issuer = "https://op.example"
+    assert md.issuer == "http://localhost:8000"
+
+
+def test_constructor_validates_base():
+    with pytest.raises(ValueError, match="_endpoint|jwks_uri"):
+        metadata.ProviderMetadata(ISSUER, "http://x.test/o")
+    md = metadata.ProviderMetadata(ISSUER, "https://cdn.other.example/o")
+    assert md.token_endpoint.startswith("https://cdn.other.example/")
+
+
+def test_loopback_http_issuer_and_endpoints():
+    md = metadata.ProviderMetadata("http://localhost:8000")
+    md.userinfo_endpoint = "http://localhost:8000/ui"
+    assert metadata.ProviderMetadata.from_dict(md.to_dict()).jwks_uri.startswith("http://localhost")
 
 
 @pytest.mark.parametrize("key", ABSENT_AS_EMPTY)
@@ -388,3 +471,49 @@ def test_exclude_defaults_explicit_empty_assigned_after_parse_is_kept(key):
     others = [k for k in ABSENT_AS_EMPTY if k != key]
     slim = md.to_dict(exclude_defaults=True)
     assert all(k not in slim for k in others)
+
+
+@pytest.mark.parametrize("bad", ["http://op.example.com", "nonsense", "https://op.example.com#f", ""])
+def test_issuer_validated_everywhere(bad):
+    with pytest.raises(ValueError, match="issuer"):
+        metadata.ProviderMetadata(bad)
+    doc = minimal_doc()
+    doc["issuer"] = bad
+    with pytest.raises(ValueError):
+        metadata.ProviderMetadata.from_dict(doc)
+    md = metadata.ProviderMetadata(ISSUER)
+    with pytest.raises(ValueError, match="issuer"):
+        md.issuer = bad
+    assert md.issuer == ISSUER
+
+
+def test_constructor_error_names_base_and_member():
+    with pytest.raises(ValueError, match=r"base .*http://x\.test/o.* yields an invalid endpoint.*_endpoint|jwks_uri"):
+        metadata.ProviderMetadata(ISSUER, "http://x.test/o")
+
+
+def test_constructor_trailing_slash_base():
+    md = metadata.ProviderMetadata(ISSUER, "https://cdn.example/o/")
+    assert md.token_endpoint == "https://cdn.example/o/token"
+
+
+@pytest.mark.parametrize("key", ["userinfo_endpoint", "registration_endpoint"])
+def test_from_dict_rejects_empty_optional_endpoint(key):
+    doc = minimal_doc()
+    doc[key] = ""
+    with pytest.raises(ValueError, match=key):
+        metadata.ProviderMetadata.from_dict(doc)
+    del doc[key]
+    metadata.ProviderMetadata.from_dict(doc)
+
+
+def test_set_issuer_revalidates_extra_via_shared_rules():
+    md = metadata.ProviderMetadata("http://localhost:8000")
+    md.set_extra_field("revocation_endpoint", "http://localhost:8000/c")
+    md.authorization_endpoint = "https://op.example/a"
+    md.token_endpoint = "https://op.example/t"
+    md.jwks_uri = "https://op.example/j"
+    md.userinfo_endpoint = None
+    with pytest.raises(ValueError, match="revocation_endpoint"):
+        md.issuer = "https://op.example"
+    assert md.issuer == "http://localhost:8000"

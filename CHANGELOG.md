@@ -9,6 +9,20 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## Unreleased
 
+### Breaking
+
+- `ProviderMetadata` now URL-validates the modelled `authorization_endpoint`,
+  `token_endpoint`, `userinfo_endpoint`, `jwks_uri` and `registration_endpoint`
+  like extension `*_endpoint` members: the setters, `from_dict` and the
+  `ProviderMetadata(issuer, base)` constructor raise `ValueError` for a
+  non-https (non-loopback), userinfo-bearing, fragment-bearing or malformed
+  URL. Setting `issuer` re-validates them (and the extension URL members)
+  against the new issuer and keeps the old one on failure. Hosts are not
+  compared with the issuer. The issuer itself is validated too (constructor,
+  `from_dict`, setter). An empty-string `userinfo_endpoint` or
+  `registration_endpoint` in a document now makes `from_dict` raise; drop the
+  key first (`rp.discover` does not apply this check).
+
 ### Security
 
 - `rp.verify_id_token` and `JwksCache.verify_id_token` gain keyword-only
