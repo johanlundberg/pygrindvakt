@@ -669,6 +669,13 @@ fn begin(
     request_object_key: Option<&SigningKey>,
 ) -> PyResult<(String, String, String, Option<String>)> {
     let client = effective_client(client, redirect_uri)?;
+    // Refuse before generating anything: a public client must not run the
+    // code flow without PKCE (upstream also enforces this; do not depend on it).
+    if !pkce && matches!(client.auth, ClientAuth::None) {
+        return Err(err(RsError::BadRequest(
+            "public clients must use S256 PKCE".into(),
+        )));
+    }
     let mut extra = extra_params(extra)?;
     let state = grindvakt::util::random_token(32);
     let nonce = grindvakt::util::random_token(32);
