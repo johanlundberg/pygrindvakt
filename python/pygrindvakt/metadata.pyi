@@ -36,8 +36,19 @@ class ProviderMetadata:
     def to_dict(self, *, exclude_defaults: bool = False) -> dict[str, Any]:
         """The discovery document as a dict.
 
-        With ``exclude_defaults=True``, modelled and known-extension members
-        that are empty lists, ``False`` or ``None`` are dropped.
+        With ``exclude_defaults=True``, members equal to their OIDC Discovery
+        / RFC 8414 / RFC 9126 default are omitted (not "omit falsy"):
+        ``None``, ``false`` for flags that default to false, ``true`` for
+        ``request_uri_parameter_supported`` (``false`` is kept), and ``[]``
+        for lists with no spec default. ``[]`` is kept for
+        ``response_modes_supported``, ``grant_types_supported``,
+        ``token_endpoint_auth_methods_supported``, ``claim_types_supported``
+        (non-empty defaults; ``[]`` means "none") and required lists.
+        Unknown extras are always kept. Limit: the full ``to_dict()`` emits
+        ``[]`` for absent modes/grant types/auth methods and required lists (upstream cannot
+        represent absence; needs ``Option<Vec<_>>``); ``exclude_defaults=True``
+        keeps them absent when ``raw`` shows the source lacked them and the
+        value is still ``[]``. Constructor-built metadata has no ``raw``.
         """
     @property
     def raw(self) -> dict[str, Any] | None:

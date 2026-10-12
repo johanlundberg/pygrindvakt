@@ -27,9 +27,33 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       The discovery document as a dict, with ``extra`` merged in at the top
       level. :meth:`pygrindvakt.provider.Provider.discovery_document` returns
       the same shape. Absent list and flag members are emitted as ``[]`` /
-      ``False``. With ``exclude_defaults=True`` modelled and known-extension
-      members that are empty lists, ``False`` or ``None`` are dropped; unknown
-      extras are kept as-is. ``from_dict(md.to_dict()).to_dict() == md.to_dict()``
+      ``False``. With ``exclude_defaults=True`` members equal to their OIDC
+      Discovery / RFC 8414 / RFC 9126 default are omitted; this is **not**
+      "omit falsy values". Dropped: ``None``; ``false`` for
+      ``claims_parameter_supported``, ``request_parameter_supported``,
+      ``require_request_uri_registration``, ``frontchannel_logout_supported``,
+      ``backchannel_logout_supported`` and
+      ``require_pushed_authorization_requests``; ``true`` for
+      ``request_uri_parameter_supported`` (its default is ``true``, so
+      ``false`` is kept); and ``[]`` for list members with no spec default
+      (``scopes_supported``, ``claims_supported``,
+      ``code_challenge_methods_supported``, ``acr_values_supported`` and the
+      other ``*_supported`` extension lists). Kept even when ``[]``: members
+      with a non-empty default, where ``[]`` means "none"
+      (``response_modes_supported``, ``grant_types_supported``,
+      ``token_endpoint_auth_methods_supported``, ``claim_types_supported``),
+      and the required ``response_types_supported``,
+      ``subject_types_supported`` and
+      ``id_token_signing_alg_values_supported``. Unknown extras are always
+      kept.
+
+      The full ``to_dict()`` still emits ``[]`` for absent members of these
+      lists, including the three required ones (the upstream model cannot represent absence; a proper fix needs
+      ``Option<Vec<_>>`` upstream), but ``exclude_defaults=True`` keeps them
+      absent when ``raw`` is available, the source lacked the key and the value
+      is still ``[]``. Constructor-built metadata has no ``raw``, so an
+      empty list is kept there. Re-parsing the output yields the same effective values.
+      ``from_dict(md.to_dict()).to_dict() == md.to_dict()``
       holds for any metadata, including ``end_session_endpoint`` and extras.
 
    .. py:attribute:: raw

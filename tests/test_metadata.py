@@ -38,17 +38,160 @@ def test_round_trip_constructed_metadata():
     assert metadata.ProviderMetadata.from_dict(md.to_dict()).to_dict() == md.to_dict()
 
 
-def test_exclude_defaults_drops_empty_false_and_none():
+def test_exclude_defaults_drops_spec_defaults_only():
     md = metadata.ProviderMetadata.from_dict(minimal_doc() | {"unknown_empty": [], "frontchannel_logout_supported": False})
     full = md.to_dict()
     assert full["scopes_supported"] == [] and full["claims_parameter_supported"] is False
     slim = md.to_dict(exclude_defaults=True)
-    assert slim == minimal_doc() | {"unknown_empty": []}
     assert "scopes_supported" not in slim and "frontchannel_logout_supported" not in slim
+    assert "claims_parameter_supported" not in slim and slim["unknown_empty"] == []
     md.scopes_supported = ["openid"]
     md.claims_parameter_supported = True
     slim = md.to_dict(exclude_defaults=True)
     assert slim["scopes_supported"] == ["openid"] and slim["claims_parameter_supported"] is True
+
+
+def test_exclude_defaults_request_uri_parameter_supported_defaults_true():
+    false_doc = minimal_doc() | {"request_uri_parameter_supported": False}
+    slim = metadata.ProviderMetadata.from_dict(false_doc).to_dict(exclude_defaults=True)
+    assert slim["request_uri_parameter_supported"] is False
+    true_doc = minimal_doc() | {"request_uri_parameter_supported": True}
+    slim = metadata.ProviderMetadata.from_dict(true_doc).to_dict(exclude_defaults=True)
+    assert "request_uri_parameter_supported" not in slim
+
+
+# Spec defaults, so the equivalence check below is independently verifiable.
+# Sources: OIDC Discovery 1.0 section 3, RFC 8414 section 2, OIDC Front-/Back-
+# Channel Logout 1.0 (discovery metadata), RFC 9126 section 5.
+BOOL_DEFAULTS = {
+    "claims_parameter_supported": False,
+    "request_parameter_supported": False,
+    "request_uri_parameter_supported": True,
+    "require_request_uri_registration": False,
+    "frontchannel_logout_supported": False,
+    "backchannel_logout_supported": False,
+    "require_pushed_authorization_requests": False,
+}
+# Members whose spec default is a NON-empty list: an explicit [] means "none"
+# and must survive exclude_defaults.
+NONEMPTY_LIST_DEFAULTS = {
+    "response_modes_supported": ["query", "fragment"],
+    "grant_types_supported": ["authorization_code", "implicit"],
+    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+    "claim_types_supported": ["normal"],
+}
+# List members with no spec default (absent == nothing advertised == []).
+EMPTY_LIST_DEFAULT = [
+    "scopes_supported",
+    "claims_supported",
+    "code_challenge_methods_supported",
+    "dpop_signing_alg_values_supported",
+    "acr_values_supported",
+    "display_values_supported",
+    "ui_locales_supported",
+    "claims_locales_supported",
+    "userinfo_signing_alg_values_supported",
+    "userinfo_encryption_alg_values_supported",
+    "userinfo_encryption_enc_values_supported",
+    "id_token_encryption_alg_values_supported",
+    "id_token_encryption_enc_values_supported",
+    "request_object_signing_alg_values_supported",
+    "token_endpoint_auth_signing_alg_values_supported",
+]
+# REQUIRED lists: no default, [] is kept as is.
+REQUIRED_LISTS = [
+    "response_types_supported",
+    "subject_types_supported",
+    "id_token_signing_alg_values_supported",
+]
+
+
+def effective(doc):
+    """Apply the spec defaults for members absent from ``doc``."""
+    out = dict(doc)
+    for k, v in BOOL_DEFAULTS.items():
+        out.setdefault(k, v)
+    for k, v in NONEMPTY_LIST_DEFAULTS.items():
+        out.setdefault(k, list(v))
+    for k in EMPTY_LIST_DEFAULT:
+        out.setdefault(k, [])
+    return out
+
+
+def _equivalence_docs():
+    docs = [minimal_doc()]
+    docs.append(minimal_doc() | {k: v for k, v in BOOL_DEFAULTS.items()})
+    docs.append(minimal_doc() | {k: (not v) for k, v in BOOL_DEFAULTS.items()})
+    docs.append(minimal_doc() | {k: [] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)})
+    docs.append(minimal_doc() | {k: ["x"] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)})
+    docs.append(minimal_doc() | {k: list(v) for k, v in NONEMPTY_LIST_DEFAULTS.items()})
+    for k, v in BOOL_DEFAULTS.items():
+        docs.append(minimal_doc() | {k: v})
+        docs.append(minimal_doc() | {k: not v})
+    for k in [*NONEMPTY_LIST_DEFAULTS, *EMPTY_LIST_DEFAULT, *REQUIRED_LISTS]:
+        docs.append(minimal_doc() | {k: []})
+        docs.append(minimal_doc() | {k: ["x"]})
+    return docs
+
+
+@pytest.mark.parametrize("doc", _equivalence_docs())
+def test_exclude_defaults_is_effectively_lossless(doc):
+    md = metadata.ProviderMetadata.from_dict(doc)
+    slim = md.to_dict(exclude_defaults=True)
+    # Expected values come from the ORIGINAL SOURCE with defaults applied to
+    # absent keys, not from to_dict() (which fills [] for absent lists).
+    expected = effective(doc)
+    # Re-parsed: from_dict keeps the slim doc as raw, so absence is preserved.
+    reparsed = metadata.ProviderMetadata.from_dict(slim)
+    assert effective(reparsed.raw) == expected
+    assert effective(reparsed.to_dict(exclude_defaults=True)) == expected
+    assert effective(slim) == expected
+
+
+@pytest.mark.parametrize("key", [*NONEMPTY_LIST_DEFAULTS, *REQUIRED_LISTS])
+def test_exclude_defaults_keeps_explicit_empty_list_without_empty_default(key):
+    md = metadata.ProviderMetadata.from_dict(minimal_doc() | {key: []})
+    slim = md.to_dict(exclude_defaults=True)
+    assert slim[key] == []
+
+
+ABSENT_AS_EMPTY = [
+    "response_modes_supported",
+    "grant_types_supported",
+    "token_endpoint_auth_methods_supported",
+    *REQUIRED_LISTS,
+]
+
+
+def test_exclude_defaults_minimal_doc_gains_no_empty_default_lists():
+    md = metadata.ProviderMetadata.from_dict(minimal_doc())
+    assert all(md.to_dict()[k] == [] for k in ABSENT_AS_EMPTY)  # upstream limit
+    slim = md.to_dict(exclude_defaults=True)
+    for k in [*ABSENT_AS_EMPTY, "claim_types_supported"]:
+        assert k not in slim
+
+
+@pytest.mark.parametrize("key", ABSENT_AS_EMPTY)
+def test_exclude_defaults_explicit_empty_kept_and_modified_value_kept(key):
+    md = metadata.ProviderMetadata.from_dict(minimal_doc() | {key: []})
+    assert md.to_dict(exclude_defaults=True)[key] == []
+    md = metadata.ProviderMetadata.from_dict(minimal_doc())
+    setattr(md, key, ["x"])
+    assert md.to_dict(exclude_defaults=True)[key] == ["x"]
+
+
+def test_exclude_defaults_constructor_built_keeps_empty_lists():
+    md = metadata.ProviderMetadata(ISSUER)
+    for k in ABSENT_AS_EMPTY:
+        setattr(md, k, [])
+    slim = md.to_dict(exclude_defaults=True)
+    assert all(slim[k] == [] for k in ABSENT_AS_EMPTY)  # no raw: cannot tell
+
+
+@pytest.mark.parametrize("key", EMPTY_LIST_DEFAULT)
+def test_exclude_defaults_drops_empty_list_with_no_default(key):
+    md = metadata.ProviderMetadata.from_dict(minimal_doc() | {key: []})
+    assert key not in md.to_dict(exclude_defaults=True)
 
 
 def test_raw_is_source_document_and_snapshot():

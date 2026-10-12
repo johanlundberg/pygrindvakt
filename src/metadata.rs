@@ -106,6 +106,78 @@ fn known_kind(key: &str) -> Option<ExtraKind> {
         .map(|(_, kind)| *kind)
 }
 
+/// Modelled list members that are kept when `[]` (non-empty spec default, or
+/// REQUIRED; see `is_spec_default`) but whose absence upstream cannot represent.
+const NONEMPTY_DEFAULT_LISTS: &[&str] = &[
+    "response_modes_supported",
+    "grant_types_supported",
+    "token_endpoint_auth_methods_supported",
+    // REQUIRED: an explicit `[]` is kept, but a `[]` the source never had
+    // (non-conformant source) is not invented either.
+    "response_types_supported",
+    "subject_types_supported",
+    "id_token_signing_alg_values_supported",
+];
+
+/// True when `value` is what an absent `key` means per the specs, so dropping
+/// the member loses nothing. Members not listed are never dropped.
+///
+/// Booleans (OIDC Discovery 1.0 s3, OIDC Front-/Back-Channel Logout, RFC 9126
+/// s5): `claims_parameter_supported`, `request_parameter_supported`,
+/// `require_request_uri_registration`, `frontchannel_logout_supported`,
+/// `backchannel_logout_supported`, `require_pushed_authorization_requests`
+/// default to `false`; `request_uri_parameter_supported` defaults to `true`
+/// (so `false` is kept).
+///
+/// Arrays: `[]` is dropped only where the spec states no default, so absent
+/// also means "nothing advertised". Kept even when `[]`:
+/// - `response_modes_supported` (default `["query","fragment"]`),
+///   `grant_types_supported` (default `["authorization_code","implicit"]`),
+///   `token_endpoint_auth_methods_supported` (default
+///   `["client_secret_basic"]`), `claim_types_supported` (default
+///   `["normal"]`): there `[]` means "none supported", not the default.
+/// - REQUIRED members (`response_types_supported`,
+///   `subject_types_supported`, `id_token_signing_alg_values_supported`):
+///   absence would make the document non-conformant.
+///
+/// `to_dict` additionally drops those (and the required lists) when `[]` and absent
+/// from the `raw` source (upstream parses absent as `[]`).
+///
+/// Unconfirmed defaults are kept: nothing here is guessed.
+fn is_spec_default(key: &str, value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    if value.is_null() {
+        return true;
+    }
+    match key {
+        "claims_parameter_supported"
+        | "request_parameter_supported"
+        | "require_request_uri_registration"
+        | "frontchannel_logout_supported"
+        | "backchannel_logout_supported"
+        | "require_pushed_authorization_requests" => *value == Value::Bool(false),
+        "request_uri_parameter_supported" => *value == Value::Bool(true),
+        "scopes_supported"
+        | "claims_supported"
+        | "code_challenge_methods_supported"
+        | "dpop_signing_alg_values_supported"
+        | "acr_values_supported"
+        | "display_values_supported"
+        | "ui_locales_supported"
+        | "claims_locales_supported"
+        | "userinfo_signing_alg_values_supported"
+        | "userinfo_encryption_alg_values_supported"
+        | "userinfo_encryption_enc_values_supported"
+        | "id_token_encryption_alg_values_supported"
+        | "id_token_encryption_enc_values_supported"
+        | "request_object_signing_alg_values_supported"
+        | "token_endpoint_auth_signing_alg_values_supported" => {
+            value.as_array().is_some_and(Vec::is_empty)
+        }
+        _ => false,
+    }
+}
+
 /// Check that a known extension member has its documented JSON type.
 fn validate_known_value(key: &str, value: &serde_json::Value, issuer: &str) -> PyResult<()> {
     let Some(kind) = known_kind(key) else {
@@ -243,8 +315,9 @@ impl ProviderMetadata {
     }
 
     /// The discovery document as a dict. With `exclude_defaults=True`,
-    /// modelled and known-extension members that are empty lists, `false` or
-    /// `None` are dropped (unknown extras are always kept as-is).
+    /// members equal to their OIDC Discovery / RFC 8414 / RFC 9126 default
+    /// (see `is_spec_default`) and `None` values are dropped; everything else,
+    /// including unknown extras, is kept.
     #[pyo3(signature = (*, exclude_defaults = false))]
     fn to_dict<'py>(&self, py: Python<'py>, exclude_defaults: bool) -> PyResult<Bound<'py, PyAny>> {
         if !exclude_defaults {
@@ -254,14 +327,18 @@ impl ProviderMetadata {
             return Err(PyValueError::new_err("metadata is not an object"));
         };
         doc.retain(|key, value| {
-            let droppable =
+            let known =
                 RESERVED_METADATA_FIELDS.contains(&key.as_str()) || known_kind(key).is_some();
-            let is_default = match value {
-                serde_json::Value::Null | serde_json::Value::Bool(false) => true,
-                serde_json::Value::Array(a) => a.is_empty(),
-                _ => false,
-            };
-            !(droppable && is_default)
+            if known && is_spec_default(key, value) {
+                return false;
+            }
+            // The upstream model parses an absent list as `[]`. For members
+            // whose spec default is non-empty, a `[]` that the source never
+            // contained is that artefact (not "none"), so keep it absent.
+            let absent_in_source = NONEMPTY_DEFAULT_LISTS.contains(&key.as_str())
+                && value.as_array().is_some_and(Vec::is_empty)
+                && self.raw.as_ref().is_some_and(|r| !r.contains_key(key));
+            !absent_in_source
         });
         to_py(py, &doc)
     }

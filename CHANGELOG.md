@@ -9,6 +9,27 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## Unreleased
 
+### Fixed
+
+- `ProviderMetadata.to_dict(exclude_defaults=True)` no longer drops every
+  `false`, `[]` and `None`; it omits only members equal to their spec default.
+  This corrects the earlier blanket behaviour, which re-published a source
+  `request_uri_parameter_supported: false` with the member absent (default
+  `true`), flipping policy. Members that now stay in the output:
+  `request_uri_parameter_supported: false`, and `[]` for
+  `response_modes_supported`, `grant_types_supported`,
+  `token_endpoint_auth_methods_supported`, `claim_types_supported` (non-empty
+  spec defaults, so `[]` means "none") and the required
+  `response_types_supported`, `subject_types_supported`,
+  `id_token_signing_alg_values_supported`. `request_uri_parameter_supported:
+  true` is now dropped. Limit: the full `to_dict()` still emits `[]` for
+  absent `response_modes_supported`, `grant_types_supported` (and the required lists) and
+  `token_endpoint_auth_methods_supported` (the upstream model cannot represent
+  absence; a proper fix needs `Option<Vec<_>>` upstream). With
+  `exclude_defaults=True` they stay absent when `raw` shows the source lacked
+  them and the value is still `[]`; constructor-built metadata (no `raw`)
+  keeps the `[]`.
+
 ### Changed
 
 - `JwksCache` now emits one `UserWarning` (per cache, on its first fetch) when
