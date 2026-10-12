@@ -148,6 +148,11 @@ Instance-level overrides:
   ``invalid_grant`` (also available as ``upstream_error``). Without one the
   class default ``authn`` applies. Code values from the upstream are
   arbitrary strings; compare against known values, do not assume a closed set.
+  This ``code`` is **controlled by the upstream server** (escaped, at most 64
+  characters). Branching on ``exc.code == "invalid_grant"`` is fine, but never
+  put it into a log line, redirect, template or query string without the same
+  care you would give any other untrusted input, and do not treat an unknown
+  value as trustworthy.
 * ``userinfo_unverifiable`` (``AuthnError``): :func:`pygrindvakt.rp.fetch_userinfo`
   received a signed (``application/jwt``) UserInfo response but was not given
   everything needed to verify it (``jwks``, ``client_id``,
