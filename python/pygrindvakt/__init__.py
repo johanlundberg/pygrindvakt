@@ -45,9 +45,12 @@ from ._native import (
     util,
 )
 
+# isort: off
 # OAuthError is defined in Python (it needs methods; see errors.py). It must be
 # imported after _native so the native side can resolve it lazily.
 from .errors import OAuthError
+
+# isort: on
 
 __all__ = [
     "AttributeMappingError",

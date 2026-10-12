@@ -1,5 +1,8 @@
 """Package-level checks: version, submodule registration, exception hierarchy."""
 
+import ast
+import pathlib
+
 import pygrindvakt
 import pytest
 from pygrindvakt import OAuthError
@@ -127,3 +130,10 @@ def test_py_typed_is_not_partial():
     marker = pathlib.Path(pygrindvakt.__file__).parent / "py.typed"
     assert marker.exists()
     assert "partial" not in marker.read_text()
+
+
+def test_errors_imports_after_native():
+    """OAuthError must follow _native, which resolves it lazily; keep the order."""
+    tree = ast.parse(pathlib.Path(pygrindvakt.__file__).read_text())
+    mods = [n.module for n in tree.body if isinstance(n, ast.ImportFrom)]
+    assert mods.index("_native") < mods.index("errors"), "OAuthError must follow _native"
