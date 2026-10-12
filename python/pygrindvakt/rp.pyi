@@ -59,6 +59,15 @@ class RpClient:
     ``post_logout_redirect_uris`` registers the only values
     :func:`end_session_url` will accept as ``post_logout_redirect_uri`` (exact
     string match); each is syntax-validated here.
+
+    ``redirect_uris`` registers the alternative login redirect URIs accepted
+    as the per-call ``redirect_uri=`` override (exact string match; the
+    configured ``redirect_uri`` is always accepted). Entries are
+    syntax-validated here and must not be plain ``http`` to a non-loopback
+    host (``https``, loopback ``http`` and custom/private-use schemes for
+    native apps are allowed). ``allow_unregistered_redirect_uri=True`` accepts
+    any valid override instead (RFC 7591 dynamic registrations only; never
+    feed it request-supplied values).
     """
 
     def __init__(
@@ -71,6 +80,8 @@ class RpClient:
         auth_method: str | None = ...,
         signing_key: SigningKey | None = ...,
         post_logout_redirect_uris: list[str] | None = ...,
+        redirect_uris: list[str] | None = ...,
+        allow_unregistered_redirect_uri: bool = ...,
     ) -> None: ...
     @property
     def client_id(self) -> str: ...
@@ -82,6 +93,10 @@ class RpClient:
     def auth_method(self) -> str: ...
     @property
     def post_logout_redirect_uris(self) -> tuple[str, ...]: ...
+    @property
+    def redirect_uris(self) -> tuple[str, ...]: ...
+    @property
+    def allow_unregistered_redirect_uri(self) -> bool: ...
     def __repr__(self) -> str: ...
 
 class TokenSet:

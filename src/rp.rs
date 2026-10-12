@@ -350,6 +350,32 @@ pub struct RpClient {
     /// Registered `post_logout_redirect_uris` (binding-side; the upstream
     /// client has no such field).
     pub post_logout_redirect_uris: Vec<String>,
+    /// Registered alternative login `redirect_uris` accepted as per-call
+    /// overrides (binding-side).
+    pub redirect_uris: Vec<String>,
+    /// Accept any syntactically valid per-call `redirect_uri` override.
+    pub allow_unregistered_redirect_uri: bool,
+}
+
+/// Reject plain `http` to a non-loopback host. `https`, loopback `http` and
+/// custom / private-use schemes (native apps) pass.
+fn check_redirect_uri_transport(uri: &str) -> Result<(), RsError> {
+    let u = url::Url::parse(uri)
+        .map_err(|_| RsError::BadRequest(format!("redirect_uri {uri:?} is not an absolute URL")))?;
+    if u.scheme() == "http" {
+        let loopback = match u.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(a)) => a.is_loopback(),
+            Some(url::Host::Ipv6(a)) => a.is_loopback(),
+            None => false,
+        };
+        if !loopback {
+            return Err(RsError::BadRequest(format!(
+                "redirect_uri {uri:?} uses plain http to a non-loopback host; use https"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl RpClient {
@@ -357,6 +383,8 @@ impl RpClient {
         Self {
             inner,
             post_logout_redirect_uris: Vec::new(),
+            redirect_uris: Vec::new(),
+            allow_unregistered_redirect_uri: false,
         }
     }
 }
@@ -364,7 +392,8 @@ impl RpClient {
 #[pymethods]
 impl RpClient {
     #[new]
-    #[pyo3(signature = (client_id, redirect_uri, *, scope = "openid profile email", client_secret = None, auth_method = None, signing_key = None, post_logout_redirect_uris = None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (client_id, redirect_uri, *, scope = "openid profile email", client_secret = None, auth_method = None, signing_key = None, post_logout_redirect_uris = None, redirect_uris = None, allow_unregistered_redirect_uri = false))]
     fn new(
         client_id: String,
         redirect_uri: String,
@@ -373,7 +402,14 @@ impl RpClient {
         auth_method: Option<&str>,
         signing_key: Option<SigningKey>,
         post_logout_redirect_uris: Option<Vec<String>>,
+        redirect_uris: Option<Vec<String>>,
+        allow_unregistered_redirect_uri: bool,
     ) -> PyResult<Self> {
+        let redirect_uris = redirect_uris.unwrap_or_default();
+        for uri in &redirect_uris {
+            grp::validate_redirect_uri_syntax(uri).map_err(err)?;
+            check_redirect_uri_transport(uri).map_err(err)?;
+        }
         let post_logout_redirect_uris = post_logout_redirect_uris.unwrap_or_default();
         for uri in &post_logout_redirect_uris {
             grp::validate_redirect_uri_syntax(uri).map_err(err)?;
@@ -387,6 +423,8 @@ impl RpClient {
                 scope: scope.to_string(),
             },
             post_logout_redirect_uris,
+            redirect_uris,
+            allow_unregistered_redirect_uri,
         })
     }
 
@@ -407,6 +445,16 @@ impl RpClient {
     fn post_logout_redirect_uris<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, &self.post_logout_redirect_uris)
     }
+    /// Registered alternative login redirect URIs, as a tuple.
+    #[getter]
+    fn redirect_uris<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.redirect_uris)
+    }
+    /// Whether any syntactically valid per-call `redirect_uri` is accepted.
+    #[getter]
+    fn allow_unregistered_redirect_uri(&self) -> bool {
+        self.allow_unregistered_redirect_uri
+    }
     /// The token-endpoint authentication method as a string.
     #[getter]
     fn auth_method(&self) -> &'static str {
@@ -415,12 +463,14 @@ impl RpClient {
 
     fn __repr__(&self) -> String {
         format!(
-            "RpClient(client_id={:?}, redirect_uri={:?}, scope={:?}, auth_method={:?}, post_logout_redirect_uris={:?})",
+            "RpClient(client_id={:?}, redirect_uri={:?}, scope={:?}, auth_method={:?}, post_logout_redirect_uris={:?}, redirect_uris={:?}, allow_unregistered_redirect_uri={})",
             self.inner.client_id,
             self.inner.redirect_uri,
             self.inner.scope,
             auth_method_name(&self.inner.auth),
-            self.post_logout_redirect_uris
+            self.post_logout_redirect_uris,
+            self.redirect_uris,
+            if self.allow_unregistered_redirect_uri { "True" } else { "False" }
         )
     }
 }
@@ -495,21 +545,44 @@ fn extra_params(extra: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(String, Strin
 }
 
 /// Return the upstream client, with `redirect_uri` swapped in when given.
-/// The upstream functions validate it (absolute URL, no fragment) and raise
-/// `BadRequestError` otherwise.
-fn effective_client(client: &RpClient, redirect_uri: Option<String>) -> grp::RpClient {
+///
+/// SECURITY: an override is accepted only if it equals the client's
+/// configured `redirect_uri` or one of its registered `redirect_uris`
+/// (exact string match), or the client opted in with
+/// `allow_unregistered_redirect_uri=True` (then it must still be valid and
+/// not plain http to a non-loopback host). Otherwise `BadRequestError`.
+fn effective_client(client: &RpClient, redirect_uri: Option<String>) -> PyResult<grp::RpClient> {
     let mut inner = client.inner.clone();
     if let Some(r) = redirect_uri {
-        inner.redirect_uri = r;
+        if r != inner.redirect_uri {
+            let registered = client.redirect_uris.contains(&r);
+            if !registered {
+                if !client.allow_unregistered_redirect_uri {
+                    return Err(err(RsError::BadRequest(
+                        "redirect_uri override must be registered on the client \
+                         (RpClient(redirect_uris=[...])) and match exactly; \
+                         allow_unregistered_redirect_uri=True disables this check \
+                         (only for RFC 7591 dynamic registrations, never with \
+                         request-supplied values)"
+                            .into(),
+                    )));
+                }
+                grp::validate_redirect_uri_syntax(&r).map_err(err)?;
+                check_redirect_uri_transport(&r).map_err(err)?;
+            }
+            inner.redirect_uri = r;
+        }
     }
-    inner
+    Ok(inner)
 }
 
 /// Build the authorization request URL to redirect the user to.
 ///
 /// `redirect_uri` overrides the client's configured value for this request
-/// only; it must be an absolute URL without a fragment, and the same value
-/// must be passed to `exchange_code`.
+/// only; it must equal the client's `redirect_uri` or one of its registered
+/// `redirect_uris` (exact match), or the client must be built with
+/// `allow_unregistered_redirect_uri=True`. Never take it from request
+/// parameters. The same value must be passed to `exchange_code`.
 ///
 /// `state` and `nonce` must be fresh random values bound to the user's
 /// session; `code_challenge` is the PKCE `S256` challenge
@@ -526,7 +599,7 @@ fn authorization_url(
     extra: Option<&Bound<'_, PyAny>>,
     redirect_uri: Option<String>,
 ) -> PyResult<String> {
-    let client = effective_client(client, redirect_uri);
+    let client = effective_client(client, redirect_uri)?;
     let extra = extra_params(extra)?;
     let extra_refs: Vec<(&str, &str)> = extra
         .iter()
@@ -562,7 +635,7 @@ fn signed_request_object(
     code_challenge: Option<&str>,
     redirect_uri: Option<String>,
 ) -> PyResult<String> {
-    let client = effective_client(client, redirect_uri);
+    let client = effective_client(client, redirect_uri)?;
     grp::signed_request_object(
         &provider.inner,
         &client,
@@ -595,7 +668,7 @@ fn begin(
     pkce: bool,
     request_object_key: Option<&SigningKey>,
 ) -> PyResult<(String, String, String, Option<String>)> {
-    let client = effective_client(client, redirect_uri);
+    let client = effective_client(client, redirect_uri)?;
     let mut extra = extra_params(extra)?;
     let state = grindvakt::util::random_token(32);
     let nonce = grindvakt::util::random_token(32);
@@ -891,7 +964,7 @@ fn exchange_code(
 ) -> PyResult<TokenSet> {
     let (http, failures) = extract_http_client(http)?;
     let provider = provider.inner.clone();
-    let client = effective_client(client, redirect_uri);
+    let client = effective_client(client, redirect_uri)?;
     let r = crate::runtime::block_on(py, async move {
         grp::exchange_code(&http, &provider, &client, &code, code_verifier.as_deref()).await
     })?;

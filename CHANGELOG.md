@@ -23,6 +23,21 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `BadRequestError`. This closes an open redirect (carrying `id_token_hint`)
   when the URI came from a request parameter. The `id_token_hint`-only path
   for `post_logout_redirect_uri` is removed (never released).
+- The per-call `redirect_uri=` override on `rp.authorization_url`,
+  `rp.signed_request_object`, `rp.begin` and `rp.exchange_code` is accepted
+  only if it exactly equals the client's `redirect_uri` or an entry of the new
+  `RpClient(..., redirect_uris=[...])` registration; otherwise
+  `BadRequestError`. This keeps the URL sent to the OP pinned to
+  operator-set values even when the override is derived from a request
+  parameter. `RpClient(..., allow_unregistered_redirect_uri=True)` is an
+  escape hatch (RFC 7591 dynamic registrations) that accepts any valid
+  override. `redirect_uris` entries are validated at construction and may not
+  be plain `http` to a non-loopback host (`https`, loopback `http` and
+  custom/private-use schemes are allowed); the same rule applies to
+  unregistered overrides. Breaking relative to earlier unreleased commits,
+  where any syntactically valid override was accepted. New read-only
+  properties `RpClient.redirect_uris` and
+  `RpClient.allow_unregistered_redirect_uri`.
 
 ### Documentation
 

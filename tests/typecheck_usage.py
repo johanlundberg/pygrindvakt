@@ -105,6 +105,14 @@ def use_all() -> None:
         info, client=rpc_logout, post_logout_redirect_uri="https://rp.example.com/bye"
     )
     del registered
+    rpc_login = rp.RpClient(
+        "demo", "https://rp.example.com/cb",
+        redirect_uris=["https://rp.example.com/alt"],
+        allow_unregistered_redirect_uri=False,
+    )
+    login_uris: tuple[str, ...] = rpc_login.redirect_uris
+    allow_any: bool = rpc_login.allow_unregistered_redirect_uri
+    del login_uris, allow_any
     es: str | None = info.end_session_endpoint
     rp.ProviderInfo(
         "https://op.example.com", "https://op.example.com/a",

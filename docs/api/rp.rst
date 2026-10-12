@@ -72,7 +72,7 @@ Provider and client
       other endpoints at construction and bound to the issuer's origin
       (see above). Used by :func:`end_session_url`.
 
-.. py:class:: RpClient(client_id: str, redirect_uri: str, *, scope: str = "openid profile email", client_secret: str | None = None, auth_method: str | None = None, signing_key: SigningKey | None = None, post_logout_redirect_uris: list[str] | None = None)
+.. py:class:: RpClient(client_id: str, redirect_uri: str, *, scope: str = "openid profile email", client_secret: str | None = None, auth_method: str | None = None, signing_key: SigningKey | None = None, post_logout_redirect_uris: list[str] | None = None, redirect_uris: list[str] | None = None, allow_unregistered_redirect_uri: bool = False)
 
    RP client configuration: ``client_id``, the ``redirect_uri`` registered
    at the OP, the requested ``scope``, and how the client authenticates to
@@ -89,6 +89,23 @@ Provider and client
    ``post_logout_redirect_uris`` registers the post-logout redirect URIs this
    client may use with :func:`end_session_url`. Each is validated like a
    redirect URI (absolute, no fragment) at construction.
+
+   ``redirect_uris`` registers alternative login redirect URIs accepted as
+   the per-call ``redirect_uri=`` override of :func:`authorization_url`,
+   :func:`signed_request_object`, :func:`begin` and :func:`exchange_code`.
+   An override is accepted only if it exactly equals ``redirect_uri`` or one
+   entry (plain string comparison, no normalisation); otherwise
+   :class:`~pygrindvakt.BadRequestError`. Entries are validated at
+   construction (absolute, no fragment) and must not be plain ``http`` to a
+   non-loopback host; ``https``, loopback ``http`` and custom/private-use
+   schemes (native apps) are allowed. "Loopback" means exactly ``localhost``,
+   ``127.0.0.0/8`` or ``::1``. The configured ``redirect_uri`` itself is not
+   transport-checked.
+
+   ``allow_unregistered_redirect_uri=True`` skips the registration check
+   (the override must still be valid and not plain ``http`` to a non-loopback
+   host). Use it only for RFC 7591 dynamic registrations, never with a value
+   derived from request data.
 
    .. warning::
 
@@ -107,6 +124,12 @@ Provider and client
       :type: tuple[str, ...]
 
       The registered post-logout redirect URIs (empty if none).
+   .. py:property:: redirect_uris
+      :type: tuple[str, ...]
+
+      The registered alternative login redirect URIs (empty if none).
+   .. py:property:: allow_unregistered_redirect_uri
+      :type: bool
    .. py:property:: auth_method
       :type: str
 

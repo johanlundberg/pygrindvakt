@@ -154,7 +154,9 @@ def prov(http):
 
 @pytest.fixture
 def rpc():
-    return rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET)
+    return rp.RpClient(
+        CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET, redirect_uris=[ALT_REDIRECT_URI]
+    )
 
 
 @pytest.fixture
@@ -448,6 +450,94 @@ def test_redirect_uri_override_reaches_token_request(op, http, prov, rpc):
     assert ts.id_token
     assert ("redirect_uri", ALT_REDIRECT_URI) in http.forms[-1]
     assert ("redirect_uri", REDIRECT_URI) not in http.forms[-1]
+
+
+def _all_overrides(prov, client, rp_key, uri):
+    """Run every per-call override entry point; yield one callable each."""
+    return [
+        lambda: rp.authorization_url(prov, client, "st", "n", redirect_uri=uri),
+        lambda: rp.signed_request_object(prov, client, rp_key, "st", "n", redirect_uri=uri),
+        lambda: rp.begin(prov, client, redirect_uri=uri),
+        lambda: rp.exchange_code(RaisingHttpClient(), prov, client, "code", "v" * 43, redirect_uri=uri),
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://evil.example/steal",
+        "http://evil.example/cb",
+        REDIRECT_URI + "/",
+        REDIRECT_URI.upper(),
+        ALT_REDIRECT_URI + "/",
+        ALT_REDIRECT_URI + "?x=1",
+        ALT_REDIRECT_URI.replace("rp.example.com", "rp.example.com:8443"),
+        ALT_REDIRECT_URI.replace("https://rp", "https://RP"),
+    ],
+)
+def test_unregistered_redirect_uri_override_rejected(prov, rpc, rp_key, bad):
+    for call in _all_overrides(prov, rpc, rp_key, bad):
+        with pytest.raises(BadRequestError, match="redirect_uris"):
+            call()
+
+
+def test_unregistered_override_error_names_escape_hatch(prov, rpc):
+    with pytest.raises(BadRequestError, match="allow_unregistered_redirect_uri"):
+        rp.authorization_url(prov, rpc, "st", "n", redirect_uri="https://evil.example/steal")
+
+
+def test_configured_redirect_uri_override_is_noop(prov, rpc, rp_key):
+    plain = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET)
+    url = rp.authorization_url(prov, plain, "st", "n", redirect_uri=REDIRECT_URI)
+    assert parse_qs(urlsplit(url).query)["redirect_uri"] == [REDIRECT_URI]
+    rp.signed_request_object(prov, plain, rp_key, "st", "n", redirect_uri=REDIRECT_URI)
+    rp.begin(prov, plain, redirect_uri=REDIRECT_URI)
+
+
+def test_redirect_uris_properties_and_repr():
+    c = rp.RpClient("c", REDIRECT_URI, redirect_uris=[ALT_REDIRECT_URI])
+    assert c.redirect_uris == (ALT_REDIRECT_URI,)
+    assert c.allow_unregistered_redirect_uri is False
+    assert "redirect_uris=" in repr(c)
+    d = rp.RpClient("c", REDIRECT_URI, allow_unregistered_redirect_uri=True)
+    assert d.redirect_uris == ()
+    assert d.allow_unregistered_redirect_uri is True
+    assert "allow_unregistered_redirect_uri=True" in repr(d)
+
+
+def test_allow_unregistered_redirect_uri_accepts_valid_https(prov, rp_key):
+    c = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET,
+                    allow_unregistered_redirect_uri=True)
+    uri = "https://other.example/dyn"
+    url = rp.authorization_url(prov, c, "st", "n", redirect_uri=uri)
+    assert parse_qs(urlsplit(url).query)["redirect_uri"] == [uri]
+    rp.signed_request_object(prov, c, rp_key, "st", "n", redirect_uri=uri)
+    rp.begin(prov, c, redirect_uri=uri)
+    for bad in ("https://other.example/dyn#frag", "http://other.example/cb", "/relative", ""):
+        for call in _all_overrides(prov, c, rp_key, bad):
+            with pytest.raises(BadRequestError):
+                call()
+    url = rp.authorization_url(prov, c, "st", "n", redirect_uri="http://127.0.0.1:8080/cb")
+    assert "127.0.0.1" in url
+
+
+def test_loopback_http_registered_override_accepted(prov):
+    c = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET,
+                    redirect_uris=["http://localhost:8080/cb", "http://[::1]:9/cb",
+                                   "com.example.app:/oauth2redirect"])
+    for uri in c.redirect_uris:
+        url = rp.authorization_url(prov, c, "st", "n", redirect_uri=uri)
+        assert parse_qs(urlsplit(url).query)["redirect_uri"] == [uri]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["https://rp.example.com/cb#frag", "/relative", "", "http://rp.example.com/cb",
+     "http://10.0.0.1/cb"],
+)
+def test_redirect_uris_validated_at_construction(bad):
+    with pytest.raises(GrindvaktError):
+        rp.RpClient(CLIENT_ID, REDIRECT_URI, redirect_uris=[bad])
 
 
 @pytest.mark.parametrize("bad", ["https://rp.example.com/cb#frag", "/relative", ""])

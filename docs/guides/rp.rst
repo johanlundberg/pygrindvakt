@@ -90,10 +90,26 @@ full control.
 Per-request redirect URI
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
+.. warning::
+
+   Never take ``redirect_uri`` from request parameters (query string, form
+   fields, headers such as ``Host`` or ``X-Forwarded-*``). An attacker-chosen
+   value would send the authorization code to their site. The exact-match
+   rule against ``redirect_uris`` exists for that reason: choose from your
+   own registered list, never pass request data through.
+
 ``begin``, ``authorization_url`` and ``signed_request_object`` accept a
 keyword-only ``redirect_uri`` that replaces the client's configured one for
-that call. It must be an absolute URL without a fragment
-(:class:`pygrindvakt.BadRequestError` otherwise) and be registered at the OP.
+that call. It must exactly equal the client's ``redirect_uri`` or one of
+``RpClient(redirect_uris=[...])``, a fixed server-side list that you also
+register at the OP (:class:`pygrindvakt.BadRequestError` otherwise). Entries
+must be absolute, have no fragment and not be plain ``http`` to a non-loopback
+host (``https``, loopback ``http`` and custom schemes for native apps are
+fine). "Loopback" means exactly ``localhost``, ``127.0.0.0/8`` or ``::1``
+(not ``foo.localhost`` or ``localhost.``). The client's own configured
+``redirect_uri`` is not transport-checked (unchanged), so use ``https`` there
+too. In the example, ``cb`` is one of those registered strings (for
+instance chosen by which of your own hosts served the login page).
 Pass the **same value** to ``exchange_code(..., redirect_uri=...)`` (RFC 6749
 section 4.1.3), so keep it in the session with the other values:
 
@@ -104,6 +120,17 @@ section 4.1.3), so keep it in the session with the other values:
    # callback:
    ts = rp.exchange_code(http_client, info, me, code,
                          code_verifier=pending["verifier"], redirect_uri=pending["redirect_uri"])
+
+Register the alternatives on the client::
+
+   me = rp.RpClient("demo", "https://rp.example.com/cb",
+                    redirect_uris=["https://rp.example.com/alt"])
+
+``RpClient(allow_unregistered_redirect_uri=True)`` disables the registration
+check, for RPs that register redirect URIs dynamically (RFC 7591). The
+override must still be a valid URL and not plain ``http`` to a non-loopback
+host, but any attacker-influenced value is now accepted, so the warning above
+applies with full force.
 
 ``authorization_url`` also accepts ``extra`` parameters (a dict or a list of
 pairs, so names can repeat) for ``prompt``, ``acr_values``, ``login_hint`` or
