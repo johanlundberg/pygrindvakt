@@ -20,7 +20,7 @@ use grindvakt::http::{HttpClient, HttpFetchResponse};
 use grindvakt::Error as RsError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyDict, PyModule, PyTuple};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::jose_rs::jwk::JwkSet;
@@ -260,18 +260,24 @@ fn resolve_client_auth(
 #[derive(Clone)]
 pub struct RpClient {
     pub inner: grp::RpClient,
+    /// Registered `post_logout_redirect_uris` (binding-side; the upstream
+    /// client has no such field).
+    pub post_logout_redirect_uris: Vec<String>,
 }
 
 impl RpClient {
     pub fn wrap(inner: grp::RpClient) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            post_logout_redirect_uris: Vec::new(),
+        }
     }
 }
 
 #[pymethods]
 impl RpClient {
     #[new]
-    #[pyo3(signature = (client_id, redirect_uri, *, scope = "openid profile email", client_secret = None, auth_method = None, signing_key = None))]
+    #[pyo3(signature = (client_id, redirect_uri, *, scope = "openid profile email", client_secret = None, auth_method = None, signing_key = None, post_logout_redirect_uris = None))]
     fn new(
         client_id: String,
         redirect_uri: String,
@@ -279,7 +285,12 @@ impl RpClient {
         client_secret: Option<String>,
         auth_method: Option<&str>,
         signing_key: Option<SigningKey>,
+        post_logout_redirect_uris: Option<Vec<String>>,
     ) -> PyResult<Self> {
+        let post_logout_redirect_uris = post_logout_redirect_uris.unwrap_or_default();
+        for uri in &post_logout_redirect_uris {
+            grp::validate_redirect_uri_syntax(uri).map_err(err)?;
+        }
         let auth = resolve_client_auth(auth_method, client_secret, signing_key)?;
         Ok(Self {
             inner: grp::RpClient {
@@ -288,6 +299,7 @@ impl RpClient {
                 auth,
                 scope: scope.to_string(),
             },
+            post_logout_redirect_uris,
         })
     }
 
@@ -303,6 +315,11 @@ impl RpClient {
     fn scope(&self) -> &str {
         &self.inner.scope
     }
+    /// Registered post-logout redirect URIs, as a tuple.
+    #[getter]
+    fn post_logout_redirect_uris<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, &self.post_logout_redirect_uris)
+    }
     /// The token-endpoint authentication method as a string.
     #[getter]
     fn auth_method(&self) -> &'static str {
@@ -311,11 +328,12 @@ impl RpClient {
 
     fn __repr__(&self) -> String {
         format!(
-            "RpClient(client_id={:?}, redirect_uri={:?}, scope={:?}, auth_method={:?})",
+            "RpClient(client_id={:?}, redirect_uri={:?}, scope={:?}, auth_method={:?}, post_logout_redirect_uris={:?})",
             self.inner.client_id,
             self.inner.redirect_uri,
             self.inner.scope,
-            auth_method_name(&self.inner.auth)
+            auth_method_name(&self.inner.auth),
+            self.post_logout_redirect_uris
         )
     }
 }
@@ -634,9 +652,12 @@ fn non_empty(name: &str, v: Option<&str>) -> PyResult<()> {
 ///
 /// Parameters are appended to the provider's `end_session_endpoint` (any
 /// existing query is preserved) with proper encoding. `client` adds
-/// `client_id`. `post_logout_redirect_uri` must be an absolute URL without a
-/// fragment and, per the specification, needs `id_token_hint` or `client` so
-/// the OP can identify the RP; it must also have been registered with the OP.
+/// `client_id`. `post_logout_redirect_uri` is accepted only if `client` is
+/// given and the value exactly equals one of
+/// `client.post_logout_redirect_uris` (pre-registration with exact match, as
+/// RP-Initiated Logout requires); this prevents an open redirect when the
+/// value comes from a request parameter. It must also be an absolute URL
+/// without a fragment and registered with the OP.
 /// `extra` (dict or list of pairs) may not contain the parameters controlled
 /// by this function. Raises `ConfigError` if the provider has no
 /// `end_session_endpoint`, `BadRequestError` for unsafe or invalid input.
@@ -685,10 +706,18 @@ fn end_session_url(
     }
     if let Some(uri) = post_logout_redirect_uri {
         grp::validate_redirect_uri_syntax(uri).map_err(err)?;
-        if id_token_hint.is_none() && client.is_none() {
+        // Exact match against the client's registration, never the caller's
+        // say-so: otherwise a request-supplied value makes logout an open
+        // redirect that also carries `id_token_hint`.
+        let registered = client.is_some_and(|c| {
+            c.post_logout_redirect_uris
+                .iter()
+                .any(|r| r.as_str() == uri)
+        });
+        if !registered {
             return Err(err(RsError::BadRequest(
-                "post_logout_redirect_uri requires id_token_hint or client so the OP can \
-                 identify the RP"
+                "post_logout_redirect_uri must be registered on the client \
+                 (RpClient(post_logout_redirect_uris=[...])) and match exactly"
                     .into(),
             )));
         }
@@ -833,6 +862,7 @@ struct IdTokenPolicy {
     require_at_hash: bool,
     authorization_code: Option<String>,
     require_c_hash: bool,
+    strict_hashes: bool,
 }
 
 impl IdTokenPolicy {
@@ -847,6 +877,7 @@ impl IdTokenPolicy {
         require_at_hash: bool,
         authorization_code: Option<String>,
         require_c_hash: bool,
+        strict_hashes: bool,
     ) -> PyResult<Self> {
         let policy = Self {
             algorithms: parse_algorithms(allowed_algorithms)?,
@@ -858,6 +889,7 @@ impl IdTokenPolicy {
             require_at_hash,
             authorization_code,
             require_c_hash,
+            strict_hashes,
         };
         // Fail on configuration errors before any key-set fetch; upstream
         // repeats these checks.
@@ -903,10 +935,13 @@ impl IdTokenPolicy {
             .acr_values
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect::<Vec<_>>());
-        // `allow_unchecked_hashes` keeps `verify_id_token`'s historical
-        // behaviour: an at_hash / c_hash is checked when the matching value is
-        // given and ignored otherwise.
-        let mut options = grp::IdTokenOptions::new().allow_unchecked_hashes();
+        // Unless `strict_hashes`, `allow_unchecked_hashes` keeps
+        // `verify_id_token`'s historical behaviour: an at_hash / c_hash is
+        // checked when the matching value is given and ignored otherwise.
+        let mut options = grp::IdTokenOptions::new();
+        if !self.strict_hashes {
+            options = options.allow_unchecked_hashes();
+        }
         if let Some(v) = self.leeway {
             options = options.with_leeway(v);
         }
@@ -972,11 +1007,17 @@ impl IdTokenPolicy {
 ///   additionally reject tokens without the claim (they need the matching
 ///   value, else `BadRequestError`). An `EdDSA` token carrying a hash claim
 ///   cannot be checked (`CryptoError`).
+/// * `strict_hashes`: reject (`AuthnError`) an id_token that carries
+///   `at_hash` / `c_hash` when the matching `access_token` /
+///   `authorization_code` is not given. Without it such a claim is ignored,
+///   so implicit / hybrid flows must pass the values (with `require_*`) or
+///   set this.
 #[pyfunction]
 #[pyo3(signature = (jwks, id_token, issuer, client_id, expected_nonce, allowed_algorithms,
                     trusted_additional_audiences = None, unsafe_skip_nonce_check = false, *,
                     leeway = None, max_age = None, acr_values = None, access_token = None,
-                    require_at_hash = false, authorization_code = None, require_c_hash = false))]
+                    require_at_hash = false, authorization_code = None, require_c_hash = false,
+                    strict_hashes = false))]
 // These arguments are deliberately explicit security-policy inputs in the
 // public Python API; hiding them in an options bag would make unsafe defaults
 // easier to overlook.
@@ -998,6 +1039,7 @@ fn verify_id_token<'py>(
     require_at_hash: bool,
     authorization_code: Option<String>,
     require_c_hash: bool,
+    strict_hashes: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     check_nonce_policy(py, expected_nonce, unsafe_skip_nonce_check)?;
     let policy = IdTokenPolicy::new(
@@ -1010,6 +1052,7 @@ fn verify_id_token<'py>(
         require_at_hash,
         authorization_code,
         require_c_hash,
+        strict_hashes,
     );
     let set = JwksSource::from_py(jwks)?;
     let policy = policy?;
@@ -1417,7 +1460,7 @@ impl JwksCache {
                         trusted_additional_audiences = None, unsafe_skip_nonce_check = false,
                         leeway = None, max_age = None, acr_values = None, access_token = None,
                         require_at_hash = false, authorization_code = None,
-                        require_c_hash = false))]
+                        require_c_hash = false, strict_hashes = false))]
     #[allow(clippy::too_many_arguments)]
     fn verify_id_token<'py>(
         &self,
@@ -1435,6 +1478,7 @@ impl JwksCache {
         require_at_hash: bool,
         authorization_code: Option<String>,
         require_c_hash: bool,
+        strict_hashes: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         check_nonce_policy(py, expected_nonce, unsafe_skip_nonce_check)?;
         let policy = IdTokenPolicy::new(
@@ -1447,6 +1491,7 @@ impl JwksCache {
             require_at_hash,
             authorization_code,
             require_c_hash,
+            strict_hashes,
         )?;
         let set = self.resolve_for_token(py, id_token)?;
         Ok(policy

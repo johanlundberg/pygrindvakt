@@ -65,6 +65,19 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       setters do not update it, so it is the way to see what the OP actually
       sent (including members that ``to_dict`` fills with defaults).
 
+      .. warning::
+
+         ``raw`` is an **unvalidated** copy of the source document, meant for
+         display and audit, **not** for reading policy. Known extension
+         members read from ``raw`` bypass the type checks applied to the typed
+         properties, so a value there may have any type. Use the typed
+         properties (``acr_values_supported``, ``end_session_endpoint``, ...)
+         instead. A malformed member from discovery reads back ``None`` from
+         its typed getter, is re-emitted verbatim by ``to_dict()``, and then
+         makes ``from_dict()`` raise ``ValueError``; this asymmetry is pinned
+         by ``test_discovered_malformed_known_extra_getter_none_roundtrip_raises``
+         in ``tests/test_metadata.py``.
+
    Core endpoints, all ``str`` and writable:
 
    .. py:attribute:: issuer

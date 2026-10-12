@@ -54,7 +54,15 @@ class ProviderMetadata:
     def raw(self) -> dict[str, Any] | None:
         """Source document (``from_dict`` input or ``rp.discover`` response
         body), or ``None`` if built with the constructor. A snapshot: setters
-        do not change it."""
+        do not change it.
+
+        Unvalidated: for display / audit, NOT for reading policy. Known
+        extension members read from ``raw`` bypass the type checks of the
+        typed properties, so use those instead. A malformed member from
+        discovery reads back ``None`` from its typed getter, is re-emitted
+        verbatim by ``to_dict()``, and then makes ``from_dict()`` raise
+        (see ``test_discovered_malformed_known_extra_getter_none_roundtrip_raises``).
+        """
     @property
     def end_session_endpoint(self) -> str | None: ...
     @end_session_endpoint.setter

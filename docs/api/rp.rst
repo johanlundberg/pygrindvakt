@@ -58,7 +58,7 @@ Provider and client
       OIDC RP-Initiated Logout endpoint, or ``None``. Validated like the
       other endpoints at construction. Used by :func:`end_session_url`.
 
-.. py:class:: RpClient(client_id: str, redirect_uri: str, *, scope: str = "openid profile email", client_secret: str | None = None, auth_method: str | None = None, signing_key: SigningKey | None = None)
+.. py:class:: RpClient(client_id: str, redirect_uri: str, *, scope: str = "openid profile email", client_secret: str | None = None, auth_method: str | None = None, signing_key: SigningKey | None = None, post_logout_redirect_uris: list[str] | None = None)
 
    RP client configuration: ``client_id``, the ``redirect_uri`` registered
    at the OP, the requested ``scope``, and how the client authenticates to
@@ -71,6 +71,10 @@ Provider and client
    being ignored: a secret method without ``client_secret``,
    ``private_key_jwt`` without ``signing_key``, an empty secret, or a secret
    or key that the chosen method would not use.
+
+   ``post_logout_redirect_uris`` registers the post-logout redirect URIs this
+   client may use with :func:`end_session_url`. Each is validated like a
+   redirect URI (absolute, no fragment) at construction.
 
    .. warning::
 
@@ -85,6 +89,10 @@ Provider and client
       :type: str
    .. py:property:: scope
       :type: str
+   .. py:property:: post_logout_redirect_uris
+      :type: tuple[str, ...]
+
+      The registered post-logout redirect URIs (empty if none).
    .. py:property:: auth_method
       :type: str
 
@@ -194,9 +202,13 @@ Discovery and keys
    Build the OIDC RP-Initiated Logout 1.0 URL to redirect the user to.
    Parameters are appended to ``provider.end_session_endpoint`` (an existing
    query is preserved) with proper percent-encoding. ``client`` adds
-   ``client_id``. ``post_logout_redirect_uri`` must be an absolute URL without
-   a fragment and requires ``id_token_hint`` or ``client`` (the OP must be able
-   to identify the RP); it must also be registered at the OP. ``extra`` may not
+   ``client_id``. ``post_logout_redirect_uri`` is accepted **only** when
+   ``client`` is given and the value exactly equals (string equality, as
+   RP-Initiated Logout requires) one of ``client.post_logout_redirect_uris``;
+   anything else, including an ``id_token_hint``-only call, raises
+   :class:`pygrindvakt.BadRequestError`. Registration is structural so that a
+   value taken from a request parameter cannot turn logout into an open
+   redirect carrying ``id_token_hint``. It must also be registered at the OP. ``extra`` may not
    contain ``id_token_hint``, ``client_id``, ``post_logout_redirect_uri``,
    ``state``, ``logout_hint`` or ``ui_locales``, and neither may the endpoint's
    own query. Raises :class:`pygrindvakt.ConfigError` when the provider has no
@@ -275,7 +287,7 @@ Discovery and keys
       attempt (successful or not) returns without fetching. A failing fetch
       raises and leaves the cached set in place.
 
-   .. py:method:: verify_id_token(id_token: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], *, trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False, leeway: int | None = None, max_age: int | None = None, acr_values: list[str] | None = None, access_token: str | None = None, require_at_hash: bool = False, authorization_code: str | None = None, require_c_hash: bool = False) -> dict[str, Any]
+   .. py:method:: verify_id_token(id_token: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], *, trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False, leeway: int | None = None, max_age: int | None = None, acr_values: list[str] | None = None, access_token: str | None = None, require_at_hash: bool = False, authorization_code: str | None = None, require_c_hash: bool = False, strict_hashes: bool = False) -> dict[str, Any]
 
       :func:`verify_id_token` against this cache's key set, with the cache's
       ``issuer`` as the expected issuer; the options are those of the
@@ -315,7 +327,7 @@ Finishing the flow
    details. The description and body may echo secrets: never log them
    verbatim or show them to users.
 
-.. py:function:: verify_id_token(jwks: dict[str, Any] | JwksCache, id_token: str, issuer: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False, *, leeway: int | None = None, max_age: int | None = None, acr_values: list[str] | None = None, access_token: str | None = None, require_at_hash: bool = False, authorization_code: str | None = None, require_c_hash: bool = False) -> dict[str, Any]
+.. py:function:: verify_id_token(jwks: dict[str, Any] | JwksCache, id_token: str, issuer: str, client_id: str, expected_nonce: str | None, allowed_algorithms: list[str], trusted_additional_audiences: list[str] | None = None, unsafe_skip_nonce_check: bool = False, *, leeway: int | None = None, max_age: int | None = None, acr_values: list[str] | None = None, access_token: str | None = None, require_at_hash: bool = False, authorization_code: str | None = None, require_c_hash: bool = False, strict_hashes: bool = False) -> dict[str, Any]
 
    Verify an ``id_token`` against the provider JWKS (a dict
    ``{"keys": [...]}`` or a :class:`JwksCache`), the expected ``issuer``,
@@ -365,6 +377,13 @@ Finishing the flow
 
    ``authorization_code``, ``require_c_hash``
       The same for ``c_hash`` (hybrid flows need ``require_c_hash=True``).
+
+   ``strict_hashes``
+      By default an ``at_hash`` / ``c_hash`` claim is **ignored** when the
+      matching ``access_token`` / ``authorization_code`` is not passed, so a
+      missing binding goes unnoticed. With ``strict_hashes=True`` such a token
+      raises :class:`pygrindvakt.AuthnError` instead. Implicit and hybrid
+      flows must pass the values (with ``require_*_hash``) or set this.
 
    The hash is computed with the SHA-2 variant matching the token's ``alg``.
    ``EdDSA`` defines none: an ``EdDSA`` token that carries ``at_hash`` /

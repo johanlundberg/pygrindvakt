@@ -696,6 +696,15 @@ def test_cache_verify_options_are_forwarded():
     assert verify(cache, id_token(k1), leeway=300)
 
 
+def test_cache_strict_hashes_is_forwarded():
+    k1 = make_key("k1")
+    cache, _ = make_cache(ScriptedHttp(jwks_doc(k1)))
+    tok = id_token(k1, at_hash="AAAAAAAAAAAAAAAAAAAAAA")
+    assert verify(cache, tok)  # default: ignored
+    with pytest.raises(AuthnError, match="at_hash"):
+        verify(cache, tok, strict_hashes=True)
+
+
 def test_cache_argument_errors_do_not_fetch():
     k1 = make_key("k1")
     http = ScriptedHttp(jwks_doc(k1))

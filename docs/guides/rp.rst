@@ -211,6 +211,15 @@ for signed UserInfo responses. Extra checks are keyword options on both:
 ``require_at_hash``, ``authorization_code`` / ``require_c_hash``, ``leeway``
 (see :func:`~pygrindvakt.rp.verify_id_token`).
 
+.. warning::
+
+   Implicit and hybrid flows (``code id_token``, ``code id_token token``) must
+   pass ``access_token`` + ``require_at_hash=True`` and / or
+   ``authorization_code`` + ``require_c_hash=True`` (or set
+   ``strict_hashes=True``): ``verify_id_token`` does not notice a missing
+   ``at_hash`` / ``c_hash`` binding otherwise, and by default ignores a hash
+   claim when no value is given to check it against.
+
 .. code-block:: python
 
    claims = jwks_cache.verify_id_token(
@@ -398,14 +407,19 @@ your own session first, then redirect the browser to
        logout_url = rp.end_session_url(
            info,
            id_token_hint=session["id_token"],
-           client=me,
+           client=me,  # RpClient(..., post_logout_redirect_uris=["https://rp.example.com/logged-out"])
            post_logout_redirect_uri="https://rp.example.com/logged-out",
            state=util.random_token(24),
        )
        # redirect the browser to logout_url
 
-``post_logout_redirect_uri`` must be registered with the OP, and needs
-``id_token_hint`` or ``client`` so the OP can identify the RP. A provider
+``post_logout_redirect_uri`` must be registered with the OP and also on the
+client, via ``RpClient(..., post_logout_redirect_uris=[...])``.
+``end_session_url`` accepts it only when ``client`` is passed and the value
+exactly equals a registered entry; anything else (including a value from
+``request.args``, or an ``id_token_hint``-only call) raises
+``BadRequestError``. This prevents logout from becoming an open redirect that
+also carries ``id_token_hint``. A provider
 without an ``end_session_endpoint`` makes ``end_session_url`` raise
 ``ConfigError``; end only the local session in that case. The endpoint is
 validated like the other endpoints (https, no credentials or fragment).

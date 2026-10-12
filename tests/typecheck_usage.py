@@ -96,6 +96,15 @@ def use_all() -> None:
     logout: str = rp.end_session_url(
         info, id_token_hint="t", client=me, state="s", extra={"k": "v"}
     )
+    rpc_logout = rp.RpClient(
+        "demo", "https://rp.example.com/cb",
+        post_logout_redirect_uris=["https://rp.example.com/bye"],
+    )
+    registered: tuple[str, ...] = rpc_logout.post_logout_redirect_uris
+    rp.end_session_url(
+        info, client=rpc_logout, post_logout_redirect_uri="https://rp.example.com/bye"
+    )
+    del registered
     es: str | None = info.end_session_endpoint
     rp.ProviderInfo("i", "a", "t", end_session_endpoint="https://x/logout")
     acr: list[str] | None = md.acr_values_supported
@@ -131,6 +140,7 @@ def use_all() -> None:
         require_at_hash=True,
         authorization_code="c",
         require_c_hash=False,
+        strict_hashes=True,
         trusted_additional_audiences=["https://api.example"],
     )
     direct: dict[str, object] = rp.verify_id_token(

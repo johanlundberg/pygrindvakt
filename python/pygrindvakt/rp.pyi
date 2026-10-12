@@ -42,6 +42,10 @@ class RpClient:
     ``"client_secret_post"`` or ``"private_key_jwt"``; it defaults to
     ``client_secret_basic`` when ``client_secret`` is given, else ``none``.
     Inconsistent combinations raise ``ValueError``.
+
+    ``post_logout_redirect_uris`` registers the only values
+    :func:`end_session_url` will accept as ``post_logout_redirect_uri`` (exact
+    string match); each is syntax-validated here.
     """
 
     def __init__(
@@ -53,6 +57,7 @@ class RpClient:
         client_secret: str | None = ...,
         auth_method: str | None = ...,
         signing_key: SigningKey | None = ...,
+        post_logout_redirect_uris: list[str] | None = ...,
     ) -> None: ...
     @property
     def client_id(self) -> str: ...
@@ -62,6 +67,8 @@ class RpClient:
     def scope(self) -> str: ...
     @property
     def auth_method(self) -> str: ...
+    @property
+    def post_logout_redirect_uris(self) -> tuple[str, ...]: ...
     def __repr__(self) -> str: ...
 
 class TokenSet:
@@ -118,7 +125,13 @@ def end_session_url(
     ui_locales: str | None = ...,
     extra: dict[str, str] | list[tuple[str, str]] | None = ...,
 ) -> str:
-    """OIDC RP-Initiated Logout 1.0 request URL."""
+    """OIDC RP-Initiated Logout 1.0 request URL.
+
+    ``post_logout_redirect_uri`` is accepted only with ``client`` and when it
+    exactly equals one of ``client.post_logout_redirect_uris``; otherwise
+    ``BadRequestError``. This prevents an open redirect carrying
+    ``id_token_hint`` when the value comes from a request parameter.
+    """
 def fetch_jwks(http: _HttpArg, jwks_uri: str, issuer: str) -> dict[str, Any]: ...
 def exchange_code(
     http: _HttpArg,
@@ -146,6 +159,7 @@ def verify_id_token(
     require_at_hash: bool = ...,
     authorization_code: str | None = ...,
     require_c_hash: bool = ...,
+    strict_hashes: bool = ...,
 ) -> dict[str, Any]:
     """Verify an id_token and return its claims.
 
@@ -163,6 +177,10 @@ def verify_id_token(
       tokens lacking the claim (and need the matching value, else
       ``BadRequestError``). ``EdDSA`` tokens carrying a hash claim cannot be
       checked (``CryptoError``).
+    * ``strict_hashes``: an id_token carrying ``at_hash`` / ``c_hash`` without
+      the matching ``access_token`` / ``authorization_code`` raises
+      ``AuthnError`` instead of being accepted unverified. Implicit / hybrid
+      flows must pass the values (with ``require_*``) or set this.
     """
 
 class JwksCache:
@@ -216,6 +234,7 @@ class JwksCache:
         require_at_hash: bool = ...,
         authorization_code: str | None = ...,
         require_c_hash: bool = ...,
+        strict_hashes: bool = ...,
     ) -> dict[str, Any]:
         """:func:`verify_id_token` against this cache's keys and issuer.
 

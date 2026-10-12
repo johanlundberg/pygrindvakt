@@ -9,6 +9,27 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## Unreleased
 
+### Security
+
+- `rp.verify_id_token` and `JwksCache.verify_id_token` gain keyword-only
+  `strict_hashes: bool = False`. When true, an id_token carrying `at_hash` /
+  `c_hash` without the matching `access_token` / `authorization_code` raises
+  `AuthnError` instead of being accepted unverified (the default keeps the
+  lenient behaviour). Implicit / hybrid flows must pass the values with
+  `require_*_hash`, or set `strict_hashes=True`.
+- `rp.end_session_url` accepts `post_logout_redirect_uri` only when `client`
+  is given and the value exactly equals an entry of the new
+  `RpClient(..., post_logout_redirect_uris=[...])` registration; otherwise
+  `BadRequestError`. This closes an open redirect (carrying `id_token_hint`)
+  when the URI came from a request parameter. The `id_token_hint`-only path
+  for `post_logout_redirect_uri` is removed (never released).
+
+### Documentation
+
+- `ProviderMetadata.raw` is documented as an unvalidated snapshot for
+  display / audit, not for reading policy (extension members read from it
+  bypass the type checks; use the typed properties).
+
 ### Fixed
 
 - `ProviderMetadata.to_dict(exclude_defaults=True)` no longer drops every

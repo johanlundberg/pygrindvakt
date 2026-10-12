@@ -1152,7 +1152,12 @@ def test_from_metadata_drops_unsafe_end_session_endpoint():
             rp.end_session_url(info)
 
 
-def test_end_session_url_params_and_encoding(lprov, rpc):
+def _logout_client(*uris):
+    return rp.RpClient(CLIENT_ID, REDIRECT_URI, post_logout_redirect_uris=list(uris))
+
+
+def test_end_session_url_params_and_encoding(lprov):
+    rpc = _logout_client("https://rp.example.com/after?x=1&y=2")
     url = rp.end_session_url(
         lprov, id_token_hint="a.b.c", client=rpc,
         post_logout_redirect_uri="https://rp.example.com/after?x=1&y=2",
@@ -1177,15 +1182,61 @@ def test_end_session_url_minimal_and_existing_query():
     assert rp.end_session_url(p, extra=[("a", "1"), ("a", "2")]).endswith("?tenant=x&a=1&a=2")
 
 
-def test_end_session_url_post_logout_requires_hint_or_client(lprov, rpc):
-    with pytest.raises(BadRequestError, match="id_token_hint or client"):
-        rp.end_session_url(lprov, post_logout_redirect_uri="https://rp.example.com/after")
-    rp.end_session_url(lprov, id_token_hint="h", post_logout_redirect_uri="https://rp.example.com/after")
-    rp.end_session_url(lprov, client=rpc, post_logout_redirect_uri="https://rp.example.com/after")
+AFTER = "https://rp.example.com/after"
+
+
+def test_end_session_url_registered_post_logout_accepted(lprov):
+    c = _logout_client(AFTER, "https://rp.example.com/other")
+    assert c.post_logout_redirect_uris == (AFTER, "https://rp.example.com/other")
+    assert "post_logout_redirect_uris" in repr(c)
+    url = rp.end_session_url(lprov, client=c, post_logout_redirect_uri=AFTER)
+    assert parse_qs(urlsplit(url).query)["post_logout_redirect_uri"] == [AFTER]
+    rp.end_session_url(lprov, client=c, id_token_hint="h", post_logout_redirect_uri=AFTER)
+
+
+def test_end_session_url_unregistered_post_logout_rejected(lprov):
+    c = _logout_client(AFTER)
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, client=c, post_logout_redirect_uri="https://evil.example/")
+
+
+@pytest.mark.parametrize("near", [
+    AFTER + "/", AFTER.replace("rp.", "RP."), "HTTPS://rp.example.com/after",
+    AFTER + "?next=1", AFTER + " ",
+])
+def test_end_session_url_near_miss_rejected(lprov, near):
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, client=_logout_client(AFTER), post_logout_redirect_uri=near)
+
+
+def test_end_session_url_hint_only_post_logout_rejected(lprov):
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, id_token_hint="h", post_logout_redirect_uri=AFTER)
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, post_logout_redirect_uri=AFTER)
+
+
+def test_end_session_url_empty_registration_rejects_all(lprov, rpc):
+    assert rpc.post_logout_redirect_uris == ()
+    for c in (rpc, _logout_client()):
+        with pytest.raises(BadRequestError, match="registered on the client"):
+            rp.end_session_url(lprov, client=c, id_token_hint="h", post_logout_redirect_uri=AFTER)
+
+
+def test_end_session_url_request_value_cannot_bypass(lprov):
+    request_args = {"next": "https://evil.example/steal"}
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, id_token_hint="h", client=_logout_client(AFTER),
+                           post_logout_redirect_uri=request_args["next"])
+
+
+def test_end_session_url_post_logout_syntax_still_validated(lprov):
     with pytest.raises(BadRequestError):
-        rp.end_session_url(lprov, client=rpc, post_logout_redirect_uri="https://rp.example.com/after#frag")
+        _logout_client(AFTER + "#frag")
     with pytest.raises(BadRequestError):
-        rp.end_session_url(lprov, client=rpc, post_logout_redirect_uri="relative/path")
+        _logout_client("relative/path")
+    # Without post_logout_redirect_uri nothing changes.
+    rp.end_session_url(lprov, client=_logout_client(AFTER), id_token_hint="h")
 
 
 def test_end_session_url_rejects_reserved_extras_and_empty(lprov):
@@ -1225,6 +1276,20 @@ def _vo(op_key, claims, *args, **kw):
 def test_verify_options_default_behaviour_unchanged(op_key):
     """at_hash / c_hash without values to check stay ignored, as before."""
     claims = _co(at_hash="x", c_hash="y", auth_time=1, acr="whatever")
+    assert _vo(op_key, claims)["sub"] == "alice"
+
+
+def test_verify_strict_hashes(op_key):
+    at = "the-access-token"
+    claims = _co(at_hash=_half_hash(at))
+    with pytest.raises(AuthnError, match="at_hash"):
+        _vo(op_key, claims, strict_hashes=True)
+    assert _vo(op_key, claims, access_token=at, strict_hashes=True)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="c_hash"):
+        _vo(op_key, _co(c_hash="x"), strict_hashes=True)
+    # No hash claims: strict_hashes is harmless.
+    assert _vo(op_key, _co(), strict_hashes=True)["sub"] == "alice"
+    # Default unchanged.
     assert _vo(op_key, claims)["sub"] == "alice"
 
 
