@@ -489,7 +489,8 @@ Finishing the flow
           http_client, info.userinfo_endpoint, ts.access_token, claims["sub"],
           info.issuer,
           method="GET",
-          jwks=jwks, client_id="demo", allowed_algorithms=["ES256"],
+          jwks=jwks_cache,   # a JwksCache for this issuer, or a JWK Set dict
+          client_id="demo", allowed_algorithms=["ES256"],
           trust="typed", typ="userinfo+jwt",   # only used if the OP signs it
       )
 

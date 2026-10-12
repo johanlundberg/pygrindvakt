@@ -258,8 +258,11 @@ say how to verify it:
            http_client, info.userinfo_endpoint, ts.access_token, claims["sub"],
            info.issuer,
            method="GET",
-           jwks=jwks, client_id="demo", allowed_algorithms=["ES256"],
-           trust="dedicated_keys",
+           # the process-wide cache from the id_token section above; the
+           # OP's UserInfo JOSE ``typ`` (use trust="dedicated_keys" instead
+           # if the OP signs UserInfo with keys that never sign id_tokens)
+           jwks=jwks_cache, client_id=me.client_id, allowed_algorithms=["ES256"],
+           trust="typed", typ="userinfo+jwt",
        )
 
 A signed response is never accepted without ``jwks``, ``client_id``,
