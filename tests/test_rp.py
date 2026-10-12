@@ -1010,6 +1010,60 @@ def test_userinfo_get_client_without_header_support_is_config_error():
     assert ui(Plain())["sub"] == "alice"  # POST still fine
 
 
+def test_userinfo_get_positional_only_or_var_positional_headers_is_unsupported():
+    """`headers` must be passable by keyword; the adapter calls get(url, headers=...)."""
+    from pygrindvakt import ConfigError
+
+    class PosOnly:
+        called = False
+
+        def get(self, url, headers=None, /):
+            PosOnly.called = True
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    class VarPos:
+        called = False
+
+        def get(self, url, *headers):
+            VarPos.called = True
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    for cls in (PosOnly, VarPos):
+        with pytest.raises(ConfigError, match="request headers"):
+            ui(cls(), method="GET")
+        assert not cls.called
+
+
+def test_userinfo_get_keyword_only_and_var_keyword_named_headers_are_supported():
+    class KwOnly:
+        def get(self, url, *, headers=None):
+            self.h = headers
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    class VarKwHeaders:
+        def get(self, url, **headers):
+            self.h = headers
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    for cls in (KwOnly, VarKwHeaders):
+        c = cls()
+        ui(c, method="GET")
+        h = c.h["headers"] if cls is VarKwHeaders else c.h
+        assert h == [("authorization", "Bearer tok")]
+
+
 def test_userinfo_get_typeerror_inside_client_is_not_swallowed():
     class Boom:
         def get(self, url, headers=None):

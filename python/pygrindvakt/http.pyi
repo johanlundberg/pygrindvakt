@@ -10,7 +10,7 @@ and does all three.
 Request headers on GET (needed by ``rp.fetch_userinfo(method="GET")``) are
 optional. Whether an injected client supports them is decided once, when the
 client is first used: it does if its ``get`` accepts a ``headers`` parameter
-(a ``**kwargs`` parameter also counts) or it has a callable
+passable by keyword (positional-only and ``*headers`` do not count; a ``**kwargs`` parameter also counts) or it has a callable
 ``get_with_headers(url, headers)`` (preferred when present). pygrindvakt never
 calls ``get`` and falls back on ``TypeError``. A client without support raises
 ``ConfigError`` only when a GET with headers is requested. See

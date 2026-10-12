@@ -226,7 +226,7 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   rejected (`userinfo_encrypted`). Defaults (POST, JSON) are unchanged.
 - `ReqwestClient.get(url, headers=None)` accepts request headers (invalid
   names or values raise `BadRequestError`). Python `HttpClient`s may support
-  headers on GET via a `headers` parameter / `**kwargs` on `get`, or a
+  headers on GET via a keyword-passable `headers` parameter (not positional-only) / `**kwargs` on `get`, or a
   `get_with_headers(url, headers)` method (preferred); the capability is
   decided once, never by catching `TypeError`. Stub-only
   `HttpClientWithHeadersProtocol` / `HttpClientGetWithHeadersProtocol`.

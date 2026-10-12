@@ -913,20 +913,25 @@ enum HeadersMode {
     GetKeyword,
 }
 
-/// `get` accepts a `headers` parameter or `**kwargs`. Introspection failure
+/// `get` accepts `headers` by keyword (a positional-or-keyword or keyword-only
+/// parameter) or `**kwargs`. Introspection failure
 /// (for example a builtin without a signature) counts as unsupported.
 fn get_accepts_headers(py: Python<'_>, obj: &Bound<'_, PyAny>) -> bool {
     let probe = || -> PyResult<bool> {
         let get = obj.getattr("get")?;
         let sig = py.import("inspect")?.call_method1("signature", (get,))?;
         let params = sig.getattr("parameters")?;
+        let kinds = py.import("inspect")?.getattr("Parameter")?;
+        // The adapter calls `get(url, headers=...)`, so `headers` must be
+        // passable by keyword: a positional-only or `*headers` parameter
+        // would raise TypeError on every call.
         if params.contains("headers")? {
-            return Ok(true);
+            let kind = params.get_item("headers")?.getattr("kind")?;
+            return Ok(kind.eq(&kinds.getattr("POSITIONAL_OR_KEYWORD")?)?
+                || kind.eq(&kinds.getattr("KEYWORD_ONLY")?)?
+                || kind.eq(&kinds.getattr("VAR_KEYWORD")?)?);
         }
-        let var_kw = py
-            .import("inspect")?
-            .getattr("Parameter")?
-            .getattr("VAR_KEYWORD")?;
+        let var_kw = kinds.getattr("VAR_KEYWORD")?;
         for p in params.call_method0("values")?.try_iter()? {
             if p?.getattr("kind")?.eq(&var_kw)? {
                 return Ok(true);

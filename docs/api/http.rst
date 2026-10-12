@@ -57,7 +57,7 @@ supports headers if either
 
 * it has a callable ``get_with_headers(url, headers)`` (preferred when
   present), or
-* its ``get`` accepts a ``headers`` parameter (a ``**kwargs`` parameter also
+* its ``get`` accepts a ``headers`` parameter that can be passed by keyword (positional-only or ``*headers`` does not count; a ``**kwargs`` parameter also
   counts), and is called as ``get(url, headers=[(name, value), ...])``.
 
 ``headers`` is a list of ``(name, value)`` pairs. A client that supports
