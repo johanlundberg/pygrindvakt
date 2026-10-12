@@ -533,3 +533,15 @@ def test_failing_constructor_does_not_warn(op_key):
             from pygrindvakt import client
 
             provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"))
+
+
+def test_provider_warning_escalates_under_warnings_as_errors(op_key):
+    """-W error::UserWarning must turn the unimplemented-member warning into a failure."""
+    import warnings
+
+    md = metadata.ProviderMetadata(ISSUER)
+    md.require_pushed_authorization_requests = True
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        with pytest.raises(UserWarning, match="require_pushed_authorization_requests"):
+            _build(md, op_key)
