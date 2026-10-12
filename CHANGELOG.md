@@ -135,7 +135,7 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   repeats kept). `JwksCache` uses them for `Cache-Control` / `Age`.
 
 - `rp.JwksCache(http, jwks_uri, issuer, *, default_ttl=3600, min_ttl=60,
-  max_ttl=86400, min_refresh_interval=30)`: thread-safe, single-flight JWK Set
+  max_ttl=86400, min_refresh_interval=30, fetch_timeout=45.0)`: thread-safe, single-flight JWK Set
   cache honouring `Cache-Control: max-age` minus `Age` (clamped; `no-store` /
   `no-cache` are floored by `min_ttl`), never serving an expired set, with
   `jwks()`, `refresh()` and `verify_id_token(...)`. An unknown `kid` triggers
@@ -146,6 +146,14 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `HttpClient` gets `Cache-Control` / `Age` handling only if it reports response
   headers (see "Python `HttpClient` adapters can report response headers");
   without headers the cache uses `default_ttl` and warns once.
+  `fetch_timeout` (seconds, finite and at least 1e-9, else `ValueError`; default 45, the
+  built-in client's 30s timeout plus margin; read-only property of the same name) bounds how long
+  a thread waits for another thread's in-flight fetch in `jwks()`, `refresh()`
+  and `verify_id_token` (including the unknown-`kid` refresh): the waiter
+  raises `InternalError` with `code == "jwks_fetch_timeout"` instead of
+  blocking forever. It does not interrupt the fetching thread, so a Python
+  `HttpClient` adapter must set its own network timeouts; a stalled adapter
+  still stalls its own caller, and its result is cached when it finishes.
 - `UnknownKeyError(JoseError)`, `code == "unknown_kid"`, `status_hint` 401.
 - `rp.verify_id_token` keyword-only options `leeway` (<= 300), `max_age`
   (checked against `auth_time`, which must be present), `acr_values`,

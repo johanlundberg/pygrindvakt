@@ -213,6 +213,15 @@ set: if the OP is unreachable when the set expires, verification fails with an
 :class:`~pygrindvakt.InternalError` (``code == "transport"``) instead of
 trusting possibly revoked keys.
 
+Concurrent callers share one fetch, and the others wait for it. That wait is
+bounded by ``fetch_timeout`` (default 45 seconds: the built-in client's 30 second timeout plus margin): a waiter raises
+:class:`~pygrindvakt.InternalError` with ``code == "jwks_fetch_timeout"``
+instead of blocking forever. The bound covers only the waiting threads. The
+thread that runs the fetch is not interrupted, so a Python ``HttpClient``
+adapter must set its own network timeouts; a stalled adapter still stalls its
+own caller. When it finally returns, its result is cached and later calls
+work normally.
+
 ``Cache-Control`` is honoured only when the HTTP client reports response
 headers. The built-in client (``http=None`` or a
 :class:`~pygrindvakt.http.ReqwestClient`) always does; a Python adapter must

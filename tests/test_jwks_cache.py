@@ -832,3 +832,198 @@ def test_unknown_kid_after_single_flight_never_uses_expired_snapshot():
     assert len(results) == 2
     # A fetched once; B waited, found the stored set expired and fetched again.
     assert http.calls == 3
+
+
+# --- fetch_timeout (bounded wait for another thread's fetch) ---------------------
+
+
+class StallingHttp(ScriptedHttp):
+    """Blocks in ``get`` until ``release`` is set once ``stall`` is true."""
+
+    def __init__(self, doc):
+        super().__init__(doc)
+        self.stall = False
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def get(self, url):
+        if self.stall:
+            self.entered.set()
+            assert self.release.wait(30), "test never released the stalled fetch"
+        return super().get(url)
+
+
+@pytest.fixture
+def stalling():
+    k1, k2 = make_key("k1"), make_key("k2")
+    http = StallingHttp(jwks_doc(k1))
+    http.k1, http.k2 = k1, k2
+    threads = []
+    yield http, threads
+    http.release.set()  # always let stalled holders finish
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive()
+
+
+def start_holder(http, threads, fn):
+    out = {}
+
+    def run():
+        try:
+            out["result"] = fn()
+        except BaseException as e:  # noqa: BLE001
+            out["result"] = e
+
+    t = threading.Thread(target=run)
+    threads.append(t)
+    t.start()
+    assert http.entered.wait(10), "holder never reached the adapter"
+    return t, out
+
+
+def assert_flight_timeout(fn, bound=5.0):
+    start = time.monotonic()
+    with pytest.raises(InternalError) as ei:
+        fn()
+    assert time.monotonic() - start < bound
+    assert ei.value.code == "jwks_fetch_timeout"
+    assert "timed out after 0.5s" in str(ei.value)
+    return ei.value
+
+
+def test_fetch_timeout_validation_and_default():
+    http = ScriptedHttp({"keys": []})
+    for bad in (0, 0.0, -1, -0.5, 1e-12, 4e-10, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="fetch_timeout"):
+            rp.JwksCache(http, JWKS_URI, ISSUER, fetch_timeout=bad)
+    rp.JwksCache(http, JWKS_URI, ISSUER, fetch_timeout=0.001)
+    rp.JwksCache(http, JWKS_URI, ISSUER, fetch_timeout=1e300)
+    rp.JwksCache(http, JWKS_URI, ISSUER, fetch_timeout=5)
+    with pytest.raises(TypeError):
+        rp.JwksCache(http, JWKS_URI, ISSUER, 30.0)  # type: ignore[call-arg, misc]
+    assert rp.JwksCache(http, JWKS_URI, ISSUER).fetch_timeout == 45.0
+    assert rp.JwksCache(http, JWKS_URI, ISSUER, fetch_timeout=2).fetch_timeout == 2.0
+    with pytest.raises(AttributeError):
+        rp.JwksCache(http, JWKS_URI, ISSUER).fetch_timeout = 1.0  # type: ignore[misc]
+
+
+def test_waiter_in_jwks_times_out_and_cache_recovers(stalling):
+    http, threads = stalling
+    http.stall = True
+    cache, _ = make_cache(http, fetch_timeout=0.5)
+    a, out = start_holder(http, threads, cache.jwks)
+    assert_flight_timeout(cache.jwks)
+    assert_flight_timeout(cache.jwks)  # repeatable; holder still running
+    assert a.is_alive()
+    http.release.set()
+    a.join(timeout=10)
+    assert out["result"] == jwks_doc(http.k1)
+    # No stale flight: later calls are served from cache without refetching.
+    assert cache.jwks() == jwks_doc(http.k1)
+    assert http.calls == 1
+    cache.refresh()  # rate-limited no-op, must not block
+    assert http.calls == 1
+
+
+def test_waiter_in_verify_id_token_times_out(stalling):
+    http, threads = stalling
+    http.stall = True
+    cache, _ = make_cache(http, fetch_timeout=0.5)
+    a, _ = start_holder(http, threads, cache.jwks)
+    assert_flight_timeout(lambda: verify(cache, id_token(http.k1)))
+    http.release.set()
+    a.join(timeout=10)
+    assert verify(cache, id_token(http.k1))["sub"] == "alice"
+
+
+def test_waiter_in_refresh_times_out(stalling):
+    http, threads = stalling
+    http.stall = True
+    cache, clock = make_cache(http, fetch_timeout=0.5)
+    a, _ = start_holder(http, threads, cache.jwks)
+    clock.advance(31)  # no longer rate-limited, so refresh() must wait
+    assert_flight_timeout(cache.refresh)
+    http.release.set()
+    a.join(timeout=10)
+    assert cache.jwks() == jwks_doc(http.k1)
+
+
+def test_unknown_kid_waiter_raises_timeout_not_unknown_key(stalling):
+    http, threads = stalling
+    cache, clock = make_cache(http, fetch_timeout=0.5)
+    cache.jwks()  # primed with k1 only
+    clock.advance(31)  # rotation refresh no longer rate-limited
+    http.doc = jwks_doc(http.k1, http.k2)
+    http.stall = True
+    a, _ = start_holder(http, threads, cache.refresh)
+    err = assert_flight_timeout(lambda: verify(cache, id_token(http.k2)))
+    assert not isinstance(err, UnknownKeyError)
+    http.release.set()
+    a.join(timeout=10)
+    assert verify(cache, id_token(http.k2))["sub"] == "alice"
+
+
+def test_late_finish_wakes_remaining_waiters(stalling):
+    """A waiter that timed out must not break the wake-up of later waiters."""
+    http, threads = stalling
+    http.stall = True
+    cache, _ = make_cache(http, fetch_timeout=1.5)
+    a, out = start_holder(http, threads, cache.jwks)
+    results = []
+
+    def waiter():
+        try:
+            results.append(cache.jwks())
+        except BaseException as e:  # noqa: BLE001
+            results.append(e)
+
+    ws = [threading.Thread(target=waiter) for _ in range(3)]
+    for w in ws:
+        w.start()
+    time.sleep(0.3)
+    http.release.set()
+    for w in ws:
+        w.join(timeout=10)
+        assert not w.is_alive()
+    a.join(timeout=10)
+    assert results == [jwks_doc(http.k1)] * 3
+    assert http.calls == 1
+
+
+def test_slow_fetch_under_default_timeout_still_single_flight():
+    k1 = make_key("k1")
+    http = ScriptedHttp(jwks_doc(k1), delay=0.2)
+    cache, _ = make_cache(http)
+    results = run_threads(6, cache.jwks)
+    assert all(r == jwks_doc(k1) for r in results), results
+    assert http.calls == 1
+
+
+def test_refresh_within_interval_does_not_wait_for_inflight_fetch(stalling):
+    http, threads = stalling
+    http.stall = True
+    cache, _ = make_cache(http, fetch_timeout=0.5, min_refresh_interval=30)
+    a, _ = start_holder(http, threads, cache.refresh)  # sets last_attempt
+    start = time.monotonic()
+    cache.refresh()  # rate-limited: silent no-op, no wait, no timeout error
+    assert time.monotonic() - start < 0.4
+    http.release.set()
+    a.join(timeout=10)
+    assert http.calls == 1
+
+
+def test_waiter_never_hangs_when_holder_finishes_near_deadline(stalling):
+    """Holder ends around the waiter's deadline: result or timeout, never a hang."""
+    http, threads = stalling
+    http.stall = True
+    cache, _ = make_cache(http, fetch_timeout=0.3)
+    a, _ = start_holder(http, threads, cache.jwks)
+    threading.Timer(0.3, http.release.set).start()
+    try:
+        assert cache.jwks() == jwks_doc(http.k1)
+    except InternalError as e:
+        assert e.code == "jwks_fetch_timeout"
+    a.join(timeout=10)
+    assert cache.jwks() == jwks_doc(http.k1)
+    assert http.calls == 1

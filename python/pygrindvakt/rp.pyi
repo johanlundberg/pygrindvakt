@@ -224,6 +224,13 @@ class JwksCache:
     and a ``UserWarning`` is emitted on the first fetch. An expired set is never
     served: a failed refetch raises. Concurrent callers share one fetch.
     The cache is in-process memory; it stays valid after ``fork``.
+
+    ``fetch_timeout`` (seconds, finite, at least 1e-9, default 45: the built-in client's 30s timeout plus margin) bounds how long a
+    thread WAITS for another thread's in-flight fetch; on expiry the waiter
+    raises ``InternalError`` with ``code == "jwks_fetch_timeout"``. It does not
+    interrupt the thread running the fetch: a Python ``HttpClient`` adapter
+    must set its own network timeouts, and a stalled adapter still stalls its
+    own caller. The fetch carries on and its result is cached when it ends.
     """
 
     def __init__(
@@ -236,11 +243,14 @@ class JwksCache:
         min_ttl: int = 60,
         max_ttl: int = 86400,
         min_refresh_interval: int = 30,
+        fetch_timeout: float = 45.0,
     ) -> None: ...
     @property
     def jwks_uri(self) -> str: ...
     @property
     def issuer(self) -> str: ...
+    @property
+    def fetch_timeout(self) -> float: ...
     def jwks(self) -> dict[str, Any]:
         """The cached key set, fetched first if absent or expired."""
     def refresh(self) -> None:

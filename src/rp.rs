@@ -29,7 +29,7 @@ use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
 use crate::convert::{from_py, new_submodule, to_py, warn};
-use crate::errors::{err, with_code, AuthnError, ConfigError, UnknownKeyError};
+use crate::errors::{err, with_code, AuthnError, ConfigError, InternalError, UnknownKeyError};
 use crate::http::extract_http_client;
 use crate::jwt::jwks_from_py;
 use crate::keys::SigningKey;
@@ -1367,6 +1367,15 @@ impl Drop for Flight<'_> {
 /// is emitted on the first fetch. An expired set is never served: a
 /// failed refetch raises. Concurrent callers share a single fetch.
 ///
+/// `fetch_timeout` (seconds, at least 1e-9, default 45: the built-in client's
+/// 30s request timeout plus margin) bounds how long a thread WAITS for
+/// another thread's in-flight fetch; on expiry the waiter raises
+/// `InternalError(code="jwks_fetch_timeout")`. It does not interrupt the
+/// thread running the fetch: a Python `HttpClient` adapter must set its own
+/// network timeouts, and a stalled adapter still stalls its own caller (the
+/// built-in `ReqwestClient` has a 30s request timeout). The fetch carries on
+/// and its result is cached when it finishes.
+///
 /// `verify_id_token` refreshes the set at most once when the token's `kid` is
 /// not in it (key rotation), but no more often than `min_refresh_interval`
 /// seconds after the previous fetch attempt; if the `kid` is still unknown it
@@ -1385,6 +1394,7 @@ pub struct JwksCache {
     min_ttl: u64,
     max_ttl: u64,
     min_refresh_interval: u64,
+    fetch_timeout: std::time::Duration,
     clock: Option<Py<PyAny>>,
     state: RwLock<CacheState>,
     flight: Mutex<bool>,
@@ -1416,19 +1426,47 @@ impl JwksCache {
 
     /// Wait (with the GIL released, because the holder needs the GIL to run a
     /// Python HTTP adapter) until no other thread is fetching, then become the
-    /// fetching thread.
-    fn begin_flight(&self, py: Python<'_>) -> Flight<'_> {
-        py.detach(|| {
+    /// fetching thread. The wait is bounded by `fetch_timeout` (real time,
+    /// not the injected test clock); on expiry it raises
+    /// `InternalError(code="jwks_fetch_timeout")`. The holder is never
+    /// interrupted and still clears the flight when it finishes.
+    fn begin_flight(&self, py: Python<'_>) -> PyResult<Flight<'_>> {
+        let acquired = py.detach(|| {
+            // `None`: the timeout is too large to represent; wait unbounded.
+            let deadline = std::time::Instant::now().checked_add(self.fetch_timeout);
             let mut busy = self.flight.lock().unwrap_or_else(|e| e.into_inner());
             while *busy {
+                let wait = match deadline {
+                    None => std::time::Duration::from_secs(3600),
+                    Some(d) => {
+                        let left = d.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            return false;
+                        }
+                        left
+                    }
+                };
                 busy = self
                     .flight_done
-                    .wait(busy)
-                    .unwrap_or_else(|e| e.into_inner());
+                    .wait_timeout(busy, wait)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
             }
             *busy = true;
+            true
         });
-        Flight { cache: self }
+        if !acquired {
+            let msg = format!(
+                "timed out after {}s waiting for another thread's JWKS fetch",
+                self.fetch_timeout.as_secs_f64()
+            );
+            return Err(with_code(
+                py,
+                InternalError::new_err(msg),
+                "jwks_fetch_timeout",
+            ));
+        }
+        Ok(Flight { cache: self })
     }
 
     fn rate_limited(&self, now: f64) -> bool {
@@ -1493,7 +1531,7 @@ impl JwksCache {
         if let Some(e) = self.valid_entry(self.now()) {
             return Ok(e);
         }
-        let _flight = self.begin_flight(py);
+        let _flight = self.begin_flight(py)?;
         // Another thread may have fetched while we waited.
         if let Some(e) = self.valid_entry(self.now()) {
             return Ok(e);
@@ -1510,7 +1548,7 @@ impl JwksCache {
         if !kid_unknown(&entry.jwks, &kid) {
             return Ok(entry.jwks.clone());
         }
-        let _flight = self.begin_flight(py);
+        let _flight = self.begin_flight(py)?;
         // Re-select through `valid_entry`: the wait may have outlived the old
         // entry, or another thread may have stored a zero-TTL set. Never
         // verify with an expired snapshot; fetch again instead.
@@ -1541,7 +1579,8 @@ fn kid_unknown(jwks: &JwkSet, kid: &str) -> bool {
 impl JwksCache {
     #[new]
     #[pyo3(signature = (http, jwks_uri, issuer, *, default_ttl = 3600, min_ttl = 60,
-                        max_ttl = 86400, min_refresh_interval = 30, _now = None))]
+                        max_ttl = 86400, min_refresh_interval = 30, fetch_timeout = 45.0,
+                        _now = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         http: Option<&Bound<'_, PyAny>>,
@@ -1551,6 +1590,7 @@ impl JwksCache {
         min_ttl: i64,
         max_ttl: i64,
         min_refresh_interval: i64,
+        fetch_timeout: f64,
         _now: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         // Validate the client and the URLs now rather than on first use.
@@ -1566,6 +1606,19 @@ impl JwksCache {
         if min_ttl > max_ttl {
             return Err(PyValueError::new_err("min_ttl must not exceed max_ttl"));
         }
+        if !(fetch_timeout.is_finite() && fetch_timeout > 0.0) {
+            return Err(PyValueError::new_err(
+                "fetch_timeout must be a finite number of seconds, at least 1e-9",
+            ));
+        }
+        // Absurdly large values saturate instead of panicking.
+        let fetch_timeout = std::time::Duration::try_from_secs_f64(fetch_timeout)
+            .unwrap_or(std::time::Duration::MAX);
+        if fetch_timeout.is_zero() {
+            return Err(PyValueError::new_err(
+                "fetch_timeout must be a finite number of seconds, at least 1e-9",
+            ));
+        }
         Ok(Self {
             http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
             jwks_uri,
@@ -1574,6 +1627,7 @@ impl JwksCache {
             min_ttl,
             max_ttl,
             min_refresh_interval: get("min_refresh_interval", min_refresh_interval)?,
+            fetch_timeout,
             clock: _now,
             state: RwLock::default(),
             flight: Mutex::new(false),
@@ -1590,6 +1644,12 @@ impl JwksCache {
     #[getter]
     fn issuer(&self) -> &str {
         &self.issuer
+    }
+
+    /// Seconds a thread waits for another thread's in-flight fetch.
+    #[getter]
+    fn fetch_timeout(&self) -> f64 {
+        self.fetch_timeout.as_secs_f64()
     }
 
     fn __repr__(&self) -> String {
@@ -1611,7 +1671,12 @@ impl JwksCache {
     /// within `min_refresh_interval` seconds of the previous fetch attempt is
     /// a silent no-op. A failed fetch raises and keeps the cached set.
     fn refresh(&self, py: Python<'_>) -> PyResult<()> {
-        let _flight = self.begin_flight(py);
+        // A fetch in progress has already set `last_attempt`, so a rate-limited
+        // call returns at once instead of waiting for it.
+        if self.rate_limited(self.now()) {
+            return Ok(());
+        }
+        let _flight = self.begin_flight(py)?;
         if self.rate_limited(self.now()) {
             return Ok(());
         }

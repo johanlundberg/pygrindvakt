@@ -159,6 +159,10 @@ Instance-level overrides:
   that raised). The original failure is chained as ``__cause__``.
 * ``response_too_large`` (``InternalError``): an outbound response exceeded the
   client's size cap.
+* ``jwks_fetch_timeout`` (``InternalError``): a :class:`pygrindvakt.rp.JwksCache`
+  call waited longer than ``fetch_timeout`` seconds for another thread's
+  in-flight JWKS fetch. The fetching thread is not interrupted and the cache
+  stays usable.
 * ``upstream_http`` (``InternalError``): a discovery, JWKS or federation
   fetch got a failing status. Always this value for such non-auth failures,
   even if the upstream sent an OAuth ``error`` (that stays in

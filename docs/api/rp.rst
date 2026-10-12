@@ -264,7 +264,7 @@ Discovery and keys
    uncached fetch; use :class:`JwksCache` to cache the key set and handle key
    rotation.
 
-.. py:class:: JwksCache(http: HttpClientProtocol | None, jwks_uri: str, issuer: str, *, default_ttl: int = 3600, min_ttl: int = 60, max_ttl: int = 86400, min_refresh_interval: int = 30)
+.. py:class:: JwksCache(http: HttpClientProtocol | None, jwks_uri: str, issuer: str, *, default_ttl: int = 3600, min_ttl: int = 60, max_ttl: int = 86400, min_refresh_interval: int = 30, fetch_timeout: float = 45.0)
 
    A thread-safe cache of one issuer's JWK Set (frozen; read-only
    ``jwks_uri`` and ``issuer`` properties). ``jwks_uri`` and ``issuer`` are
@@ -309,6 +309,20 @@ Discovery and keys
    find the cache empty or expired cause a single request, and the others wait
    (with the GIL released) and reuse its result. The GIL is released during
    the fetch. Do not call a cache from inside its own HTTP client.
+
+   ``fetch_timeout`` (seconds, finite and at least 1e-9, else ``ValueError``;
+   default 45, the built-in client's 30 second timeout plus margin; also a
+   read-only attribute) bounds how long a thread *waits* for another thread's in-flight
+   fetch, in :meth:`jwks`, :meth:`refresh` and both verification paths
+   (including the unknown-``kid`` refresh). On expiry the waiter raises
+   :class:`pygrindvakt.InternalError` with ``code == "jwks_fetch_timeout"``
+   (not ``UnknownKeyError``). It is real time, independent of the cache
+   lifetime. It does **not** interrupt the thread running the fetch: that
+   thread runs your HTTP client, which must set its own network timeouts (the
+   built-in :class:`~pygrindvakt.http.ReqwestClient` has a 30 second request
+   timeout). A Python adapter that stalls still stalls its own caller; the
+   other threads give up after ``fetch_timeout``, and when the fetch finally
+   ends its result is cached and later calls proceed normally.
 
    **Fork.** The cache is plain in-process memory, so a forked child keeps
    the cached set and its expiry (the clock is monotonic). As with the rest of

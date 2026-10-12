@@ -146,6 +146,7 @@ def use_all() -> None:
         min_ttl=30,
         max_ttl=3600,
         min_refresh_interval=10,
+        fetch_timeout=5.0,
     )
     rp.JwksCache(None, "https://op.example.com/jwks", "https://op.example.com")
     keyset: dict[str, object] = cache.jwks()
