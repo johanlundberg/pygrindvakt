@@ -51,18 +51,14 @@ class FetchResponseClient:
 class HeadersClient(TupleClient):
     """``get`` accepts request headers (``HttpClientWithHeadersProtocol``)."""
 
-    def get(
-        self, url: str, headers: list[tuple[str, str]] | None = None
-    ) -> tuple[int, bytes, str | None]:
+    def get(self, url: str, headers: list[tuple[str, str]] | None = None) -> tuple[int, bytes, str | None]:
         return 200, b"{}", "application/json"
 
 
 class GetWithHeadersClient(TupleClient):
     """Provides ``get_with_headers`` (``HttpClientGetWithHeadersProtocol``)."""
 
-    def get_with_headers(
-        self, url: str, headers: list[tuple[str, str]]
-    ) -> tuple[int, bytes, str | None]:
+    def get_with_headers(self, url: str, headers: list[tuple[str, str]]) -> tuple[int, bytes, str | None]:
         return 200, b"{}", "application/json"
 
 
@@ -79,9 +75,7 @@ def use_all() -> None:
     me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
     rp.exchange_code(reqwest, info, me, "code")
     rp.exchange_code(custom, info, me, "code", code_verifier="v")
-    rp.exchange_code(
-        reqwest, info, me, "code", "v", redirect_uri="https://rp.example.com/alt"
-    )
+    rp.exchange_code(reqwest, info, me, "code", "v", redirect_uri="https://rp.example.com/alt")
     url, state, nonce, verifier = rp.begin(info, me)
     check: tuple[str, str, str, str | None] = (url, state, nonce, verifier)
     del check
@@ -93,18 +87,14 @@ def use_all() -> None:
         pkce=False,
     )
     rp.authorization_url(info, me, state, nonce, redirect_uri=None)
-    logout: str = rp.end_session_url(
-        info, id_token_hint="t", client=me, state="s", extra={"k": "v"}
-    )
+    logout: str = rp.end_session_url(info, id_token_hint="t", client=me, state="s", extra={"k": "v"})
     rpc_logout = rp.RpClient(
         "demo",
         "https://rp.example.com/cb",
         post_logout_redirect_uris=["https://rp.example.com/bye"],
     )
     registered: tuple[str, ...] = rpc_logout.post_logout_redirect_uris
-    rp.end_session_url(
-        info, client=rpc_logout, post_logout_redirect_uri="https://rp.example.com/bye"
-    )
+    rp.end_session_url(info, client=rpc_logout, post_logout_redirect_uri="https://rp.example.com/bye")
     del registered
     rpc_login = rp.RpClient(
         "demo",
@@ -129,9 +119,7 @@ def use_all() -> None:
         end_session_endpoint="https://logout.other.example/logout",
         allow_cross_origin_end_session=True,
     )
-    xo: rp.ProviderInfo = rp.ProviderInfo.from_metadata(
-        md, allow_cross_origin_end_session=True
-    )
+    xo: rp.ProviderInfo = rp.ProviderInfo.from_metadata(md, allow_cross_origin_end_session=True)
     del xo
     acr: list[str] | None = md.acr_values_supported
     flag: bool | None = md.backchannel_logout_supported
@@ -173,13 +161,9 @@ def use_all() -> None:
     direct: dict[str, object] = rp.verify_id_token(
         cache, "tok", "https://op.example.com", "demo", "n", ["ES256"], max_age=60
     )
-    rp.verify_id_token(
-        keyset, "tok", "https://op.example.com", "demo", "n", ["ES256"], leeway=5
-    )
+    rp.verify_id_token(keyset, "tok", "https://op.example.com", "demo", "n", ["ES256"], leeway=5)
     del keyset, cached_claims, direct
-    rp.fetch_userinfo(
-        reqwest, "https://op.example.com/ui", "tok", "sub", "https://op.example.com"
-    )
+    rp.fetch_userinfo(reqwest, "https://op.example.com/ui", "tok", "sub", "https://op.example.com")
 
     rp.fetch_userinfo(
         reqwest,
@@ -196,9 +180,7 @@ def use_all() -> None:
         max_age=None,
         require_exp=True,
     )
-    rp.fetch_userinfo(
-        custom, "https://op.example.com/ui", "tok", "sub", "https://op.example.com"
-    )
+    rp.fetch_userinfo(custom, "https://op.example.com/ui", "tok", "sub", "https://op.example.com")
     rp.fetch_userinfo(
         HeadersClient(),
         "https://op.example.com/ui",
@@ -220,9 +202,7 @@ def use_all() -> None:
 
     federation.fetch_entity_configuration(reqwest, "https://ta.example.com")
     federation.fetch_entity_configuration(custom, "https://ta.example.com")
-    federation.fetch_collection(
-        None, "https://ta.example.com/collection", "openid_provider"
-    )
+    federation.fetch_collection(None, "https://ta.example.com/collection", "openid_provider")
 
     discovery.self_published_rp(reqwest, "https://rp.example.com")
     discovery.self_published_rp(custom, "https://rp.example.com")
@@ -235,9 +215,7 @@ def use_all() -> None:
 
 def use_errors() -> None:
     try:
-        rp.JwksCache(None, "https://x/jwks", "https://x").verify_id_token(
-            "t", "c", "n", ["ES256"]
-        )
+        rp.JwksCache(None, "https://x/jwks", "https://x").verify_id_token("t", "c", "n", ["ES256"])
     except pygrindvakt.UnknownKeyError as ke:
         jose: pygrindvakt.JoseError = ke
         print(jose.code, ke.status_hint)

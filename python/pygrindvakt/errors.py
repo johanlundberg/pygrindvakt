@@ -43,10 +43,7 @@ class OAuthError(_native.GrindvaktError):
         return self.code
 
     def __repr__(self) -> str:
-        return (
-            f"OAuthError(code={self.code!r}, description={self.description!r}, "
-            f"state={self.state!r})"
-        )
+        return f"OAuthError(code={self.code!r}, description={self.description!r}, state={self.state!r})"
 
     @property
     def http_status(self) -> int:
@@ -80,6 +77,4 @@ class OAuthError(_native.GrindvaktError):
         validated request's ``"query"`` or ``"fragment"`` response mode;
         there is deliberately no default.
         """
-        return _native.oauth_error_redirect(
-            self.code, redirect_uri, response_mode, self.description, self.state
-        )
+        return _native.oauth_error_redirect(self.code, redirect_uri, response_mode, self.description, self.state)

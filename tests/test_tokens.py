@@ -57,9 +57,7 @@ def test_type_confusion_rejected():
 def test_key_rotation_with_previous_secrets():
     """Tokens sealed under an old secret still open after rotation."""
     old = tokens.TokenCodec("old")
-    at = tokens.AccessTokenPayload(
-        client_id="demo", sub="alice", scope="openid", exp=int(time.time()) + 60
-    )
+    at = tokens.AccessTokenPayload(client_id="demo", sub="alice", scope="openid", exp=int(time.time()) + 60)
     sealed = old.seal_access_token(at)
     new = tokens.TokenCodec("new", previous_secrets=["old"])
     assert new.open_access_token(sealed).sub == "alice"
@@ -82,9 +80,7 @@ def test_refresh_payload_round_trip_and_dpop_binding():
 
 
 def test_payload_from_dict():
-    p = tokens.AccessTokenPayload.from_dict(
-        {"client_id": "c", "sub": "s", "scope": "x", "exp": 5}
-    )
+    p = tokens.AccessTokenPayload.from_dict({"client_id": "c", "sub": "s", "scope": "x", "exp": 5})
     assert p.claims == {} and p.exp == 5
     with pytest.raises(ValueError):
         tokens.AccessTokenPayload.from_dict({"sub": "s"})

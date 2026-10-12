@@ -57,7 +57,17 @@ markers = [
     "redis: tests requiring a live Redis at REDIS_URL (auto-skip if unset)",
 ]
 
+[tool.ruff]
+line-length = 120
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+# Explicit so a ruff upgrade cannot silently change the gate (ruff is pinned in
+# the dev dependency group). F821 must stay enabled for the stubs.
+extend-select = ["F", "I", "PYI", "B", "RUF", "UP", "SIM", "C4"]
+
 [tool.ruff.lint.per-file-ignores]
 # PYI029 autofix deletes `__repr__` from stubs. Several runtime reprs redact
 # secrets on purpose, and tests/test_stubs.py requires the stub to declare them.
-"*.pyi" = ["PYI029"]
+# PYI021: the stubs carry the user-facing docstrings on purpose.
+"*.pyi" = ["PYI029", "PYI021"]

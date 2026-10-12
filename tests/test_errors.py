@@ -47,9 +47,7 @@ UPSTREAM_ATTRS = (
     "upstream_body",
 )
 
-PROV = rp.ProviderInfo(
-    "http://127.0.0.1:1", "http://127.0.0.1:1/a", "http://127.0.0.1:1/token"
-)
+PROV = rp.ProviderInfo("http://127.0.0.1:1", "http://127.0.0.1:1/a", "http://127.0.0.1:1/token")
 RPC = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
 VERIFIER = "v" * 48
 
@@ -109,9 +107,7 @@ def test_exchange_code_400_exposes_upstream_details():
 def test_upstream_body_is_escaped():
     body = b"bad \x1b[31mred\x1b[0m\nline2\rline3"
     with pytest.raises(AuthnError) as ei:
-        rp.exchange_code(
-            FakeTokenClient(400, body, "text/plain"), PROV, RPC, "code", VERIFIER
-        )
+        rp.exchange_code(FakeTokenClient(400, body, "text/plain"), PROV, RPC, "code", VERIFIER)
     e = ei.value
     assert e.upstream_status == 400
     assert e.upstream_body is not None
@@ -127,9 +123,7 @@ def test_upstream_body_is_escaped():
 def test_non_auth_upstream_error_code_is_always_upstream_http():
     body = b'{"error":"invalid_client","error_description":"d"}'
     with pytest.raises(InternalError) as ei:
-        rp.fetch_jwks(
-            FakeTokenClient(500, body), "http://127.0.0.1:1/jwks", "http://127.0.0.1:1"
-        )
+        rp.fetch_jwks(FakeTokenClient(500, body), "http://127.0.0.1:1/jwks", "http://127.0.0.1:1")
     e = ei.value
     assert e.code == "upstream_http"
     assert e.upstream_error == "invalid_client"

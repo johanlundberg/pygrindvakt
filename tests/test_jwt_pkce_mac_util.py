@@ -18,13 +18,7 @@ def test_sign_and_verify_with_jwks(op_key):
     )
     hdr = jwt.peek_header(tok)
     assert hdr["alg"] == "ES256" and hdr["kid"] == "op-1" and hdr["typ"] == "custom+jwt"
-    v = (
-        jwt.Validation()
-        .with_issuer("i")
-        .with_audience("a")
-        .with_typ("custom+jwt")
-        .require_exp()
-    )
+    v = jwt.Validation().with_issuer("i").with_audience("a").with_typ("custom+jwt").require_exp()
     claims = jwt.verify_with_jwks(op_key.to_public_jwks(), tok, v)
     assert claims["sub"] == "s" and claims["x"] == [1, 2]
 
@@ -32,9 +26,7 @@ def test_sign_and_verify_with_jwks(op_key):
 def test_validation_failures(op_key):
     tok = jwt.sign(op_key, {"iss": "i", "exp": int(time.time()) + 60})
     with pytest.raises(GrindvaktError):
-        jwt.verify_with_jwks(
-            op_key.to_public_jwks(), tok, jwt.Validation().with_issuer("other")
-        )
+        jwt.verify_with_jwks(op_key.to_public_jwks(), tok, jwt.Validation().with_issuer("other"))
     with pytest.raises(GrindvaktError):
         jwt.verify_with_jwks(
             op_key.to_public_jwks(),
@@ -63,9 +55,7 @@ def test_expired_token_rejected(op_key):
     with pytest.raises(GrindvaktError):
         jwt.verify_with_jwk(op_key.public_jwk(), tok, jwt.Validation())
     # leeway rescues it
-    assert jwt.verify_with_jwk(
-        op_key.public_jwk(), tok, jwt.Validation().with_leeway(1000)
-    )
+    assert jwt.verify_with_jwk(op_key.public_jwk(), tok, jwt.Validation().with_leeway(1000))
 
 
 # ---- pkce -------------------------------------------------------------------
@@ -74,20 +64,14 @@ def test_expired_token_rejected(op_key):
 def test_pkce_rfc7636_vector():
     """RFC 7636 appendix B test vector."""
     verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-    assert (
-        pkce.s256_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-    )
+    assert pkce.s256_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
     assert pkce.verify(verifier, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "S256")
     assert not pkce.verify(verifier, "wrong", "S256")
     valid_plain = "a" * 43
     assert pkce.verify(valid_plain, valid_plain, "plain")
     assert not pkce.verify("abc", "abc", "plain")
-    assert pkce.verify(
-        valid_plain, valid_plain
-    )  # RFC 7636 section 4.3: no method means plain
-    assert not pkce.verify(
-        verifier, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-    )  # plain compare fails
+    assert pkce.verify(valid_plain, valid_plain)  # RFC 7636 section 4.3: no method means plain
+    assert not pkce.verify(verifier, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")  # plain compare fails
     assert not pkce.verify("abc", "abc", "S512")
 
 

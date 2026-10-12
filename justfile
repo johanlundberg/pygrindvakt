@@ -22,15 +22,15 @@ typecheck:
 
 # Lint with ruff.
 lint:
-    ruff check {{ python_dirs }}
+    .venv/bin/ruff check {{ python_dirs }}
 
 # Check formatting with ruff without changing files.
 format-check:
-    ruff format --check {{ python_dirs }}
+    .venv/bin/ruff format --check {{ python_dirs }}
 
 # Format with ruff.
 format:
-    ruff format {{ python_dirs }}
+    .venv/bin/ruff format {{ python_dirs }}
 
 # Everything: ruff lint + format check, mypy, tests.
 check: lint format-check typecheck test

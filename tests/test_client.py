@@ -13,9 +13,7 @@ def test_client_defaults():
     assert c.subject_type == "public"
     assert c.client_secret is None and c.jwks is None and c.scope is None
     assert c.allows_response_type("code") and not c.allows_response_type("token")
-    assert "Client(" in repr(c) and "secret" not in repr(c).lower().replace(
-        "client_secret", ""
-    )
+    assert "Client(" in repr(c) and "secret" not in repr(c).lower().replace("client_secret", "")
 
 
 def test_client_rejects_unknown_keyword():
@@ -38,11 +36,7 @@ def test_client_dict_round_trip():
         client_name="N",
     )
     d = c.to_dict()
-    assert (
-        d["client_id"] == "id"
-        and d["redirect_uris"] == ["https://x/cb"]
-        and d["scope"] == "a b"
-    )
+    assert d["client_id"] == "id" and d["redirect_uris"] == ["https://x/cb"] and d["scope"] == "a b"
     c2 = client.Client.from_dict(d)
     assert c2.client_name == "N" and c2.allows_redirect("https://x/cb")
 

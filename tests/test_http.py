@@ -24,11 +24,7 @@ def test_request_data_normalization():
     assert r.path == "OIDC/token" and r.method == "POST"
     assert r.headers == {"authorization": "Bearer t", "content-type": "x"}
     assert r.authorization() == "Bearer t" and r.bearer_token() == "t"
-    assert (
-        r.param("x") == "1"
-        and r.param("grant_type") == "code"
-        and r.param("nope") is None
-    )
+    assert r.param("x") == "1" and r.param("grant_type") == "code" and r.param("nope") is None
     assert r.body == b"grant_type=code" and r.cookies == {"s": "v"}
     r.headers = {"X-A": "b"}
     assert r.headers == {"x-a": "b"} and r.bearer_token() is None
@@ -57,18 +53,10 @@ def test_response_builders():
     r = http.Response.redirect("https://x")
     assert r.status == 302 and r.header("Location") == "https://x"
     r = http.Response.json({"a": [1, 2]}, status=201)
-    assert (
-        r.status == 201
-        and r.body == b'{"a":[1,2]}'
-        and r.header("content-type") == "application/json"
-    )
+    assert r.status == 201 and r.body == b'{"a":[1,2]}' and r.header("content-type") == "application/json"
     r = http.Response.html("<p>hi</p>")
     assert r.text() == "<p>hi</p>" and "text/html" in r.header("content-type")
-    r = (
-        http.Response.text_response(404, "nope")
-        .with_header("x-a", "1")
-        .with_header("x-a", "2")
-    )
+    r = http.Response.text_response(404, "nope").with_header("x-a", "1").with_header("x-a", "2")
     assert r.status == 404 and [v for k, v in r.headers if k == "x-a"] == ["1", "2"]
     r2 = http.Response(200, [("a", "b")], b"body")
     r2.status = 500
@@ -122,9 +110,7 @@ def test_reqwest_client_against_local_server():
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(
-                b"echo:" + body + b"|" + self.headers.get("X-Test", "").encode()
-            )
+            self.wfile.write(b"echo:" + body + b"|" + self.headers.get("X-Test", "").encode())
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), H)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -146,9 +132,7 @@ def test_reqwest_client_against_local_server():
         srv.shutdown()
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"), reason="fork test is Linux-only"
-)
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fork test is Linux-only")
 @pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
 def test_reqwest_client_usable_after_fork():
     """A client used (and its pool warmed) before ``fork`` keeps working in the
@@ -222,9 +206,7 @@ def _recording_servers():
 
         def _record(self):
             n = int(self.headers.get("Content-Length", 0))
-            received.append(
-                (self.command, self.headers.get("Authorization"), self.rfile.read(n))
-            )
+            received.append((self.command, self.headers.get("Authorization"), self.rfile.read(n)))
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -261,9 +243,7 @@ def test_credentials_never_forwarded_on_cross_origin_redirect(status):
         base = f"http://127.0.0.1:{a.server_port}/{status}"
         st, _, _ = c.get(base, [("Authorization", "Bearer secret-token")])
         assert st == status
-        st, _, _ = c.post_form(
-            base, [("client_secret", "hunter2")], [("Authorization", "Basic abc")]
-        )
+        st, _, _ = c.post_form(base, [("client_secret", "hunter2")], [("Authorization", "Basic abc")])
         assert st == status
         st, _, _ = c.get(base)
         assert st == status

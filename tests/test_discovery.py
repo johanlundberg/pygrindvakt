@@ -46,9 +46,7 @@ def rp_signing_key():
     return keys.signing_key_from_jwk(jwk, "ES256", "rp")
 
 
-def rp_entity_configuration(
-    entity_id: str, rp_metadata: dict, lifetime: int = 3600
-) -> str:
+def rp_entity_configuration(entity_id: str, rp_metadata: dict, lifetime: int = 3600) -> str:
     """Build a self-signed entity configuration JWT for ``entity_id``.
 
     Prefers ``pygrindvakt.federation.build_entity_configuration`` when it is
@@ -171,24 +169,14 @@ def test_discovery_request_url_keyword_arguments():
 
 def test_discovery_request_url_joins_existing_query():
     """An endpoint that already has a query string gets ``&`` rather than ``?``."""
-    url = discovery.discovery_request_url(
-        "https://discovery.example.com/?ui=compact", "https://rp.example.com"
-    )
-    assert (
-        url
-        == "https://discovery.example.com/?ui=compact&entity_id=https%3A%2F%2Frp.example.com"
-    )
+    url = discovery.discovery_request_url("https://discovery.example.com/?ui=compact", "https://rp.example.com")
+    assert url == "https://discovery.example.com/?ui=compact&entity_id=https%3A%2F%2Frp.example.com"
 
 
 def test_discovery_request_url_places_query_before_fragment():
     """A fragment on the endpoint stays after the appended query."""
-    url = discovery.discovery_request_url(
-        "https://discovery.example.com/discovery#chooser", "https://rp.example.com"
-    )
-    assert (
-        url
-        == "https://discovery.example.com/discovery?entity_id=https%3A%2F%2Frp.example.com#chooser"
-    )
+    url = discovery.discovery_request_url("https://discovery.example.com/discovery#chooser", "https://rp.example.com")
+    assert url == "https://discovery.example.com/discovery?entity_id=https%3A%2F%2Frp.example.com#chooser"
 
 
 def test_discovery_request_url_rejects_invalid_endpoint():
@@ -202,9 +190,7 @@ def test_discovery_request_url_rejects_bad_ids():
     with pytest.raises(pygrindvakt.BadRequestError):
         discovery.discovery_request_url("https://d.example", "http://rp.example")
     with pytest.raises(pygrindvakt.BadRequestError):
-        discovery.discovery_request_url(
-            "https://d.example", "https://rp.example", "not a url"
-        )
+        discovery.discovery_request_url("https://d.example", "https://rp.example", "not a url")
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +247,7 @@ def test_parse_third_party_initiated_login_requires_https_iss():
     with pytest.raises(pygrindvakt.BadRequestError):
         discovery.parse_third_party_initiated_login({"iss": "http://op.example.com"})
     with pytest.raises(pygrindvakt.BadRequestError):
-        discovery.parse_third_party_initiated_login(
-            {"iss": "https://op.example.com/?x=1"}
-        )
+        discovery.parse_third_party_initiated_login({"iss": "https://op.example.com/?x=1"})
 
 
 def test_parse_third_party_initiated_login_rejects_non_string_values():
@@ -326,16 +310,8 @@ def test_initiate_login_uri_extraction():
         {"openid_relying_party": {}},
         {},
         {"openid_relying_party": {"initiate_login_uri": ""}},
-        {
-            "openid_relying_party": {
-                "initiate_login_uri": "http://rp.example.com/initiate"
-            }
-        },
-        {
-            "openid_relying_party": {
-                "initiate_login_uri": "https://rp.example.com/i#frag"
-            }
-        },
+        {"openid_relying_party": {"initiate_login_uri": "http://rp.example.com/initiate"}},
+        {"openid_relying_party": {"initiate_login_uri": "https://rp.example.com/i#frag"}},
         {"openid_relying_party": {"initiate_login_uri": "not a url"}},
         {"openid_relying_party": {"initiate_login_uri": 42}},
         {"openid_relying_party": "https://rp.example.com/initiate"},
@@ -350,9 +326,7 @@ def test_initiate_login_uri_rejects_missing_non_https_or_fragmented(metadata):
 
 def test_initiate_login_uri_keeps_query():
     """A query string on the initiate_login_uri is allowed and preserved."""
-    metadata = {
-        "openid_relying_party": {"initiate_login_uri": "https://rp.example.com/i?v=2"}
-    }
+    metadata = {"openid_relying_party": {"initiate_login_uri": "https://rp.example.com/i?v=2"}}
     assert discovery.initiate_login_uri(metadata) == "https://rp.example.com/i?v=2"
 
 
@@ -401,9 +375,7 @@ def test_third_party_login_url_login_hint_and_existing_query():
 
 def test_third_party_login_url_minimal():
     """Without optional parameters only iss is appended."""
-    url = discovery.third_party_login_url(
-        "https://rp.example.com/initiate", "https://op.example.com"
-    )
+    url = discovery.third_party_login_url("https://rp.example.com/initiate", "https://op.example.com")
     assert url == "https://rp.example.com/initiate?iss=https%3A%2F%2Fop.example.com"
 
 
@@ -420,8 +392,7 @@ def test_self_published_initiate_login_uri_roundtrip():
     )
     http = FakeHttpClient(body)
     assert (
-        discovery.self_published_initiate_login_uri(http, "https://rp.example.com")
-        == "https://rp.example.com/initiate"
+        discovery.self_published_initiate_login_uri(http, "https://rp.example.com") == "https://rp.example.com/initiate"
     )
     assert http.urls == ["https://rp.example.com/.well-known/openid-federation"]
 
@@ -434,16 +405,11 @@ def test_self_published_rp_exposes_metadata_and_exp():
     )
     rp = discovery.self_published_rp(FakeHttpClient(body), "https://rp.example.com")
     assert isinstance(rp, discovery.SelfPublishedRp)
-    assert (
-        rp.metadata["openid_relying_party"]["initiate_login_uri"]
-        == "https://rp.example.com/initiate"
-    )
+    assert rp.metadata["openid_relying_party"]["initiate_login_uri"] == "https://rp.example.com/initiate"
     now = int(time.time())
     assert rp.exp is not None
     assert now < rp.exp <= now + 3600
-    assert (
-        discovery.initiate_login_uri(rp.metadata) == "https://rp.example.com/initiate"
-    )
+    assert discovery.initiate_login_uri(rp.metadata) == "https://rp.example.com/initiate"
     r = repr(rp)
     assert r.startswith("SelfPublishedRp(")
     assert "openid_relying_party" in r
@@ -468,9 +434,7 @@ def test_self_published_rp_must_be_issued_by_requested_entity():
         {"initiate_login_uri": "https://rp.example.com/initiate"},
     )
     with pytest.raises(pygrindvakt.AuthnError):
-        discovery.self_published_initiate_login_uri(
-            FakeHttpClient(body), "https://other.example.com"
-        )
+        discovery.self_published_initiate_login_uri(FakeHttpClient(body), "https://other.example.com")
     with pytest.raises(pygrindvakt.AuthnError):
         discovery.self_published_rp(FakeHttpClient(body), "https://other.example.com")
 
@@ -479,9 +443,7 @@ def test_self_published_requires_initiate_login_uri():
     """A valid RP without an initiate_login_uri has metadata but no login URI."""
     body = rp_entity_configuration("https://rp.example.com", {})
     with pytest.raises(pygrindvakt.AuthnError):
-        discovery.self_published_initiate_login_uri(
-            FakeHttpClient(body), "https://rp.example.com"
-        )
+        discovery.self_published_initiate_login_uri(FakeHttpClient(body), "https://rp.example.com")
     # The richer form still succeeds; it is the extraction that fails.
     rp = discovery.self_published_rp(FakeHttpClient(body), "https://rp.example.com")
     assert rp.metadata == {"openid_relying_party": {}}
@@ -502,9 +464,7 @@ def test_self_published_rp_rejects_bad_signature():
         {"initiate_login_uri": "https://rp.example.com/initiate"},
     )
     head, payload, sig = body.split(".")
-    tampered = ".".join(
-        [head, payload, sig[:-4] + ("AAAA" if not sig.endswith("AAAA") else "BBBB")]
-    )
+    tampered = ".".join([head, payload, sig[:-4] + ("AAAA" if not sig.endswith("AAAA") else "BBBB")])
     with pytest.raises(pygrindvakt.GrindvaktError):
         discovery.self_published_rp(FakeHttpClient(tampered), "https://rp.example.com")
 
@@ -512,9 +472,7 @@ def test_self_published_rp_rejects_bad_signature():
 def test_self_published_rp_rejects_non_200():
     """A non-200 fetch is reported as an error."""
     with pytest.raises(pygrindvakt.GrindvaktError):
-        discovery.self_published_rp(
-            FakeHttpClient("", status=404), "https://rp.example.com"
-        )
+        discovery.self_published_rp(FakeHttpClient("", status=404), "https://rp.example.com")
 
 
 def test_self_published_rp_rejects_object_without_http_protocol():
@@ -622,15 +580,11 @@ def resolved_rp_entity(rp_metadata: dict):
     federation = pytest.importorskip("pygrindvakt.federation")
     if not hasattr(federation, "ResolvedEntity"):
         pytest.skip("pygrindvakt.federation.ResolvedEntity is not available yet")
-    ta_key = keys.signing_key_from_jwk(
-        keys.generate_ec_jwk("P-256"), alg="ES256", kid="ta"
-    )
+    ta_key = keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid="ta")
     rp_key = rp_signing_key()
     now = int(time.time())
     metadata = {"openid_relying_party": rp_metadata}
-    rp_ec = federation.build_entity_configuration(
-        rp_key, RP_ID, rp_key.to_public_jwks(), [TA_ID], metadata, None, 3600
-    )
+    rp_ec = federation.build_entity_configuration(rp_key, RP_ID, rp_key.to_public_jwks(), [TA_ID], metadata, None, 3600)
     ta_ec = federation.build_entity_configuration(
         ta_key,
         TA_ID,
@@ -669,9 +623,7 @@ def resolved_rp_entity(rp_metadata: dict):
             f"{TA_ID}/resolve": resolve_response,
         }
     )
-    return federation.resolve_via_trust_anchors(
-        http, RP_ID, {TA_ID: ta_key.to_public_jwks()}
-    )
+    return federation.resolve_via_trust_anchors(http, RP_ID, {TA_ID: ta_key.to_public_jwks()})
 
 
 def test_initiate_login_uri_from_resolved():
@@ -696,11 +648,7 @@ def test_initiate_login_uri_from_resolved_requires_resolved_entity():
     """A plain dict is not accepted in place of a ResolvedEntity."""
     with pytest.raises(TypeError):
         discovery.initiate_login_uri_from_resolved(
-            {
-                "metadata": {
-                    "openid_relying_party": {"initiate_login_uri": f"{RP_ID}/initiate"}
-                }
-            }
+            {"metadata": {"openid_relying_party": {"initiate_login_uri": f"{RP_ID}/initiate"}}}
         )
 
 

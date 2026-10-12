@@ -15,9 +15,7 @@ class OAuthError(GrindvaktError):
     code: str
     description: str | None
     state: str | None
-    def __init__(
-        self, code: str, description: str | None = ..., state: str | None = ...
-    ) -> None: ...
+    def __init__(self, code: str, description: str | None = ..., state: str | None = ...) -> None: ...
     @property
     def http_status(self) -> int:
         """HTTP status conventionally returned with this error (400/401/500/503)."""

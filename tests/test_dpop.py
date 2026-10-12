@@ -52,9 +52,7 @@ def _sign_with_jwk_header(key, claims, typ):
 
     priv, pub_jwk = key
     header = {"typ": typ, "alg": "ES256", "jwk": pub_jwk}
-    signing_input = (
-        f"{b64(json.dumps(header).encode())}.{b64(json.dumps(claims).encode())}"
-    )
+    signing_input = f"{b64(json.dumps(header).encode())}.{b64(json.dumps(claims).encode())}"
     der = priv.sign(signing_input.encode(), ec.ECDSA(hashes.SHA256()))
     r, s = decode_dss_signature(der)
     sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
@@ -82,9 +80,7 @@ def test_config_validation():
     c = dpop.DpopConfig(require_nonce=True, nonce_secret="s")
     assert c.require_nonce and c.proof_max_age_secs == 300
     n = dpop.issue_nonce(c)
-    assert n and n != dpop.issue_nonce(
-        dpop.DpopConfig(require_nonce=True, nonce_secret="other")
-    )
+    assert n and n != dpop.issue_nonce(dpop.DpopConfig(require_nonce=True, nonce_secret="other"))
 
 
 def test_validate_and_replay(dpop_key):
@@ -102,13 +98,9 @@ def test_htm_htu_mismatch(dpop_key):
     store = dpop.InMemoryReplayStore()
     cfg = dpop.DpopConfig()
     with pytest.raises(DpopInvalidError):
-        dpop.validate_proof(
-            store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "GET", TOKEN_URL
-        )
+        dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "GET", TOKEN_URL)
     with pytest.raises(DpopInvalidError):
-        dpop.validate_proof(
-            store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL + "/"
-        )
+        dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL + "/")
     with pytest.raises(DpopInvalidError):
         dpop.validate_proof(
             store,
@@ -132,9 +124,7 @@ def test_nonce_challenge_then_accept(dpop_key):
     store = dpop.InMemoryReplayStore()
     cfg = dpop.DpopConfig(require_nonce=True, nonce_secret="nonce-key")
     with pytest.raises(DpopNonceRequiredError):
-        dpop.validate_proof(
-            store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL
-        )
+        dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
     nonce = dpop.issue_nonce(cfg)
     dpop.validate_proof(
         store,
@@ -183,9 +173,7 @@ def test_python_replay_store_and_failure(dpop_key):
             raise RuntimeError("redis down")
 
     with pytest.raises(DpopServerError):
-        dpop.validate_proof(
-            Broken(), cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL
-        )
+        dpop.validate_proof(Broken(), cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
 
     with pytest.raises(TypeError, match="record"):
         dpop.validate_proof(object(), cfg, proof, "POST", TOKEN_URL)
@@ -196,9 +184,7 @@ def test_dpop_bound_token_end_to_end(op, dpop_key):
     rejects it as plain Bearer and accepts it with a matching resource proof."""
     store = dpop.InMemoryReplayStore()
     cfg = dpop.DpopConfig()
-    proof = dpop.validate_proof(
-        store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL
-    )
+    proof = dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
     tr = op.handle_token_request(
         list(
             {
@@ -214,11 +200,7 @@ def test_dpop_bound_token_end_to_end(op, dpop_key):
     assert tr.token_type == "DPoP"
     with pytest.raises(OAuthError):
         op.userinfo(tr.access_token)  # bound token presented without proof
-    ath = (
-        base64.urlsafe_b64encode(hashlib.sha256(tr.access_token.encode()).digest())
-        .rstrip(b"=")
-        .decode()
-    )
+    ath = base64.urlsafe_b64encode(hashlib.sha256(tr.access_token.encode()).digest()).rstrip(b"=").decode()
     rp = dpop.validate_resource_proof(
         store,
         cfg,

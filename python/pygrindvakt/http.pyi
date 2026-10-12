@@ -63,9 +63,7 @@ class HttpClientWithHeadersProtocol(HttpClientProtocol, Protocol):
     token.
     """
 
-    def get(
-        self, url: str, headers: list[tuple[str, str]] | None = None
-    ) -> _FetchResult: ...
+    def get(self, url: str, headers: list[tuple[str, str]] | None = None) -> _FetchResult: ...
 
 class HttpClientGetWithHeadersProtocol(HttpClientProtocol, Protocol):
     """An ``HttpClientProtocol`` that also provides
@@ -76,9 +74,7 @@ class HttpClientGetWithHeadersProtocol(HttpClientProtocol, Protocol):
     runtime when present.
     """
 
-    def get_with_headers(
-        self, url: str, headers: list[tuple[str, str]]
-    ) -> _FetchResult: ...
+    def get_with_headers(self, url: str, headers: list[tuple[str, str]]) -> _FetchResult: ...
 
 class HttpRequestData:
     """A parsed inbound HTTP request, normalized for grindvakt.
@@ -244,9 +240,7 @@ class ReqwestClient:
         max_response_bytes: int = ...,
         user_agent: str | None = ...,
     ) -> None: ...
-    def get(
-        self, url: str, headers: list[tuple[str, str]] | None = ...
-    ) -> tuple[int, bytes, str | None]:
+    def get(self, url: str, headers: list[tuple[str, str]] | None = ...) -> tuple[int, bytes, str | None]:
         """Issue a GET, optionally with request headers.
 
         Returns ``(status, body, content_type)``. Redirects are never followed,
@@ -269,9 +263,7 @@ class ReqwestClient:
 # ``src/http.rs``). Report headers if you can: ``rp.JwksCache`` needs
 # ``Cache-Control`` / ``Age`` to honour the OP's cache lifetime.
 _FetchResult: TypeAlias = (
-    tuple[int, bytes, str | None]
-    | tuple[int, bytes, str | None, list[tuple[str, str]] | None]
-    | HttpFetchResponse
+    tuple[int, bytes, str | None] | tuple[int, bytes, str | None, list[tuple[str, str]] | None] | HttpFetchResponse
 )
 # What every networked function accepts as ``http``: any protocol client, the
 # built-in ``ReqwestClient``, or ``None`` for the process-wide default client.
@@ -279,8 +271,5 @@ _HttpArg: TypeAlias = HttpClientProtocol | ReqwestClient | None  # noqa: PYI047 
 # What a networked function accepts as ``http`` when it sends request headers on
 # GET (``rp.fetch_userinfo(method="GET")``).
 _HttpHeadersArg: TypeAlias = (  # noqa: PYI047 (imported by other stubs)
-    HttpClientWithHeadersProtocol
-    | HttpClientGetWithHeadersProtocol
-    | ReqwestClient
-    | None
+    HttpClientWithHeadersProtocol | HttpClientGetWithHeadersProtocol | ReqwestClient | None
 )

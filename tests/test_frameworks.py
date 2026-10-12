@@ -92,9 +92,7 @@ class FlaskDriver:
 
     def get(self, path, params=None, headers=None):
         r = self.client.get(path, query_string=params, headers=headers)
-        return Reply(
-            r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.data
-        )
+        return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.data)
 
     def post(self, path, form, headers=None):
         if isinstance(form, list):
@@ -102,9 +100,7 @@ class FlaskDriver:
 
             form = MultiDict(form)
         r = self.client.post(path, data=form, headers=headers)
-        return Reply(
-            r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.data
-        )
+        return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.data)
 
 
 class DjangoDriver:
@@ -117,9 +113,7 @@ class DjangoDriver:
         if params:
             path = f"{path}?{urlencode(params)}"
         r = self.client.get(path, headers=headers)
-        return Reply(
-            r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content
-        )
+        return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
     def post(self, path, form, headers=None):
         r = self.client.post(
@@ -128,9 +122,7 @@ class DjangoDriver:
             content_type="application/x-www-form-urlencoded",
             headers=headers,
         )
-        return Reply(
-            r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content
-        )
+        return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
 
 class FastapiDriver:
@@ -140,12 +132,8 @@ class FastapiDriver:
         self.client = client
 
     def get(self, path, params=None, headers=None):
-        r = self.client.get(
-            path, params=params, headers=headers, follow_redirects=False
-        )
-        return Reply(
-            r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content
-        )
+        r = self.client.get(path, params=params, headers=headers, follow_redirects=False)
+        return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
     def post(self, path, form, headers=None):
         if isinstance(form, list):
@@ -153,16 +141,10 @@ class FastapiDriver:
                 **(headers or {}),
                 "content-type": "application/x-www-form-urlencoded",
             }
-            r = self.client.post(
-                path, content=urlencode(form), headers=headers, follow_redirects=False
-            )
+            r = self.client.post(path, content=urlencode(form), headers=headers, follow_redirects=False)
         else:
-            r = self.client.post(
-                path, data=form, headers=headers, follow_redirects=False
-            )
-        return Reply(
-            r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content
-        )
+            r = self.client.post(path, data=form, headers=headers, follow_redirects=False)
+        return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
 
 # --- fixtures ----------------------------------------------------------------
@@ -229,9 +211,7 @@ def exchange(op, code, verifier):
         "redirect_uri": REDIRECT_URI,
         "code_verifier": verifier,
     }
-    return op.post(
-        "/token", form, headers={"Authorization": basic_auth("demo", "demo-secret")}
-    )
+    return op.post("/token", form, headers={"Authorization": basic_auth("demo", "demo-secret")})
 
 
 # --- OP examples ---------------------------------------------------------------
@@ -264,36 +244,22 @@ def test_full_code_flow(op_app):
     )
     assert r.status == 200 and b"<form" in r.body and b"demo" in r.body
 
-    code = code_from_login(
-        op_app.post("/authorization", {"username": "alice", "password": "alice"})
-    )
+    code = code_from_login(op_app.post("/authorization", {"username": "alice", "password": "alice"}))
 
     r = exchange(op_app, code, verifier)
     assert r.status == 200, r.body
     assert r.headers["cache-control"] == "no-store"
     body = r.json()
-    assert (
-        body["token_type"] == "Bearer"
-        and body["access_token"]
-        and body["refresh_token"]
-    )
+    assert body["token_type"] == "Bearer" and body["access_token"] and body["refresh_token"]
 
     jwks = op_app.get("/jwks").json()
-    claims = rp.verify_id_token(
-        jwks, body["id_token"], OP_ISSUER, "demo", "n-1", ["ES256"]
-    )
+    claims = rp.verify_id_token(jwks, body["id_token"], OP_ISSUER, "demo", "n-1", ["ES256"])
     assert claims["sub"] == "alice" and claims["email"] == "alice@example.com"
 
-    r = op_app.get(
-        "/userinfo", headers={"Authorization": f"Bearer {body['access_token']}"}
-    )
+    r = op_app.get("/userinfo", headers={"Authorization": f"Bearer {body['access_token']}"})
     assert r.status == 200
     info = r.json()
-    assert (
-        info["sub"] == "alice"
-        and info["email"] == "alice@example.com"
-        and info["email_verified"] is True
-    )
+    assert info["sub"] == "alice" and info["email"] == "alice@example.com" and info["email_verified"] is True
 
 
 def test_wrong_password_redirects_with_access_denied(op_app):
@@ -304,9 +270,7 @@ def test_wrong_password_redirects_with_access_denied(op_app):
     assert r.status == 302
     assert r.location.startswith(REDIRECT_URI + "?")
     q = parse_qs(urlsplit(r.location).query)
-    assert (
-        q["error"] == ["access_denied"] and q["state"] == ["st-1"] and "code" not in q
-    )
+    assert q["error"] == ["access_denied"] and q["state"] == ["st-1"] and "code" not in q
 
 
 def test_unknown_client_is_not_redirected(op_app):
@@ -324,7 +288,7 @@ def test_unknown_client_is_not_redirected(op_app):
 
 def test_duplicate_authorization_parameter_is_rejected_by_every_adapter(op_app):
     """Flask, Django, and FastAPI preserve duplicate query values for rejection."""
-    params = list(AUTHZ_PARAMS.items()) + [("client_id", "attacker")]
+    params = [*AUTHZ_PARAMS.items(), ("client_id", "attacker")]
     r = op_app.get("/authorization", params)
     assert r.status == 400
     assert r.json()["error"] == "invalid_request"
@@ -355,9 +319,7 @@ def test_code_replay_is_rejected(op_app):
             "code_challenge_method": "S256",
         },
     )
-    code = code_from_login(
-        op_app.post("/authorization", {"username": "alice", "password": "alice"})
-    )
+    code = code_from_login(op_app.post("/authorization", {"username": "alice", "password": "alice"}))
     assert exchange(op_app, code, verifier).status == 200
     r = exchange(op_app, code, verifier)
     assert r.status == 400 and r.json()["error"] == "invalid_grant"
@@ -425,9 +387,7 @@ class OpBridge:
 
     def post_form(self, url, form, headers):
         self.calls.append(url)
-        return self._fetch(
-            in_thread(self.op.post, self._path(url), dict(form), dict(headers))
-        )
+        return self._fetch(in_thread(self.op.post, self._path(url), dict(form), dict(headers)))
 
 
 def test_flask_rp_end_to_end(flask_op, monkeypatch):
@@ -456,9 +416,7 @@ def test_flask_rp_end_to_end(flask_op, monkeypatch):
     assert r.status_code == 200, r.data
     page = r.data.decode()
     assert "Signed in as alice" in page and "alice@example.com" in page
-    assert (
-        f"{OP_ISSUER}/token" in bridge.calls and f"{OP_ISSUER}/userinfo" in bridge.calls
-    )
+    assert f"{OP_ISSUER}/token" in bridge.calls and f"{OP_ISSUER}/userinfo" in bridge.calls
 
 
 def test_flask_rp_rejects_state_mismatch(flask_op, monkeypatch):

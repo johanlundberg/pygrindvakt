@@ -41,9 +41,7 @@ def provider_info() -> rp.ProviderInfo:
 def create_app() -> Flask:
     app = Flask(__name__)
     app.secret_key = os.environ.get("RP_SECRET_KEY", "dev-only-rp-secret")
-    app.config["SESSION_COOKIE_NAME"] = (
-        "rp_session"  # the demo OP also runs on 127.0.0.1
-    )
+    app.config["SESSION_COOKIE_NAME"] = "rp_session"  # the demo OP also runs on 127.0.0.1
 
     @app.get("/")
     def index():
@@ -72,9 +70,7 @@ def create_app() -> Flask:
             abort(400, "missing code")
         try:
             prov = provider_info()
-            tokens = rp.exchange_code(
-                HTTP_CLIENT, prov, CLIENT, code, pending["verifier"]
-            )
+            tokens = rp.exchange_code(HTTP_CLIENT, prov, CLIENT, code, pending["verifier"])
             jwks = rp.fetch_jwks(HTTP_CLIENT, prov.jwks_uri, prov.issuer)
             id_claims = rp.verify_id_token(
                 jwks,

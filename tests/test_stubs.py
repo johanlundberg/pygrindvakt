@@ -48,13 +48,9 @@ def _stub_names(tree):
             if isinstance(node, ast.ClassDef):
                 members = set()
                 for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and not item.name.startswith(
-                        "_"
-                    ):
+                    if isinstance(item, ast.FunctionDef) and not item.name.startswith("_"):
                         members.add(item.name)
-                    elif isinstance(item, ast.AnnAssign) and isinstance(
-                        item.target, ast.Name
-                    ):
+                    elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
                         members.add(item.target.id)
                     elif isinstance(item, ast.Assign):
                         for t in item.targets:
@@ -62,9 +58,7 @@ def _stub_names(tree):
                                 members.add(t.id)
                 classes[node.name] = members
         elif (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and not node.target.id.startswith("_")
+            isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and not node.target.id.startswith("_")
         ):
             names.add(node.target.id)
         elif isinstance(node, ast.Assign):
@@ -77,11 +71,7 @@ def _stub_names(tree):
 def _stub_dunders(tree):
     """Map class name -> redaction-relevant dunders declared in the stub."""
     return {
-        node.name: {
-            i.name
-            for i in node.body
-            if isinstance(i, ast.FunctionDef) and i.name in REDACTED_DUNDERS
-        }
+        node.name: {i.name for i in node.body if isinstance(i, ast.FunctionDef) and i.name in REDACTED_DUNDERS}
         for node in tree.body
         if isinstance(node, ast.ClassDef)
     }
@@ -102,12 +92,8 @@ def test_stub_matches_runtime(name):
     stub_public = {n for n in stub_names if not n.endswith(STUB_ONLY_SUFFIX)}
     missing_in_stub = runtime - stub_public
     missing_at_runtime = stub_public - runtime
-    assert not missing_in_stub, (
-        f"{name}: runtime names absent from stub: {sorted(missing_in_stub)}"
-    )
-    assert not missing_at_runtime, (
-        f"{name}: stub names absent at runtime: {sorted(missing_at_runtime)}"
-    )
+    assert not missing_in_stub, f"{name}: runtime names absent from stub: {sorted(missing_in_stub)}"
+    assert not missing_at_runtime, f"{name}: stub names absent at runtime: {sorted(missing_at_runtime)}"
     for cls_name, members in stub_classes.items():
         if cls_name.endswith(STUB_ONLY_SUFFIX):
             continue
@@ -150,6 +136,4 @@ def test_stubs_do_not_blanket_suppress_undefined_names(name):
         stripped = line.strip().lower()
         if stripped.startswith("# ruff: noqa"):
             codes = stripped.removeprefix("# ruff: noqa").lstrip(": ")
-            assert codes and "f821" not in codes, (
-                f"{name}.pyi: file-level noqa covers F821: {line}"
-            )
+            assert codes and "f821" not in codes, f"{name}.pyi: file-level noqa covers F821: {line}"

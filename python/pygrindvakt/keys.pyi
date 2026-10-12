@@ -26,23 +26,17 @@ class SigningKey:
         """A one-key JWKS document (``{"keys": [...]}``) as a dict."""
     def __repr__(self) -> str: ...
 
-def signing_key_from_pem(
-    data: bytes, alg: str | None = ..., kid: str | None = ...
-) -> SigningKey:
+def signing_key_from_pem(data: bytes, alg: str | None = ..., kid: str | None = ...) -> SigningKey:
     """Load a signing key from PEM (or DER) bytes: PKCS#8, PKCS#1 or SEC1.
 
     ``alg`` overrides the algorithm inferred from the key type; ``kid`` sets
     the published key id.
     """
 
-def signing_key_from_jwk_json(
-    json: str, alg: str | None = ..., kid: str | None = ...
-) -> SigningKey:
+def signing_key_from_jwk_json(json: str, alg: str | None = ..., kid: str | None = ...) -> SigningKey:
     """Load a signing key from a private JWK given as a JSON string."""
 
-def signing_key_from_jwk(
-    jwk: dict[str, Any], alg: str | None = ..., kid: str | None = ...
-) -> SigningKey:
+def signing_key_from_jwk(jwk: dict[str, Any], alg: str | None = ..., kid: str | None = ...) -> SigningKey:
     """Load a signing key from a private JWK given as a dict."""
 
 def signing_key_from_pkcs11(

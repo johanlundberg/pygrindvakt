@@ -87,10 +87,7 @@ def test_oauth_error_is_constructible_and_renders():
     assert b'"error":"access_denied"' in r.body and b'"state":"xyz"' in r.body
     rd = e.to_redirect("https://rp.example.com/cb?x=1", "query")
     assert rd.status == 302
-    assert (
-        rd.header("location")
-        == "https://rp.example.com/cb?x=1&error=access_denied&error_description=nope&state=xyz"
-    )
+    assert rd.header("location") == "https://rp.example.com/cb?x=1&error=access_denied&error_description=nope&state=xyz"
     fragment = e.to_redirect("https://rp.example.com/cb", "fragment")
     assert fragment.header("location") == (
         "https://rp.example.com/cb#error=access_denied&error_description=nope&state=xyz"

@@ -58,9 +58,7 @@ def _op(op_key, clients, tus=None):
     md = metadata.ProviderMetadata(ISSUER)
     if tus is None:
         tus = provider.InMemoryTokenUseStore()
-    return provider.Provider(
-        md, op_key, clients, tokens.TokenCodec("s"), token_use_store=tus
-    )
+    return provider.Provider(md, op_key, clients, tokens.TokenCodec("s"), token_use_store=tus)
 
 
 def _flow(op, verifier="v" * 43):
@@ -203,15 +201,11 @@ def test_reentrant_http_client_drives_in_process_provider(op):
     info = rp.ProviderInfo.from_metadata(rp.discover(fake, ISSUER))
     me = rp.RpClient("demo", REDIRECT_URI, client_secret="s3cret")
     verifier = util.random_token(32)
-    url = rp.authorization_url(
-        info, me, "st", "nn", code_challenge=pkce.s256_challenge(verifier)
-    )
+    url = rp.authorization_url(info, me, "st", "nn", code_challenge=pkce.s256_challenge(verifier))
     params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
     req = request.AuthorizationRequest.from_params(list(params.items()))
     op.validate_authorization_request(req)
-    code = code_from_redirect(
-        op.authorization_redirect(req, "alice", {"email": ["a@b"]})
-    )
+    code = code_from_redirect(op.authorization_redirect(req, "alice", {"email": ["a@b"]}))
     ts = rp.exchange_code(fake, info, me, code, code_verifier=verifier)
     claims = rp.verify_id_token(
         rp.fetch_jwks(fake, info.jwks_uri, info.issuer),
@@ -223,10 +217,7 @@ def test_reentrant_http_client_drives_in_process_provider(op):
     )
     assert claims["sub"] == "alice"
     assert (
-        rp.fetch_userinfo(
-            fake, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer
-        )["email"]
-        == "a@b"
+        rp.fetch_userinfo(fake, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer)["email"] == "a@b"
     )
 
 
@@ -273,9 +264,7 @@ def test_fetch_response_object_accepted(op):
         def get(self, url):
             import json
 
-            return http.HttpFetchResponse(
-                200, json.dumps(op.discovery_document()).encode(), "application/json"
-            )
+            return http.HttpFetchResponse(200, json.dumps(op.discovery_document()).encode(), "application/json")
 
         def post_form(self, url, form, headers):
             raise AssertionError

@@ -37,9 +37,7 @@ def authz(op, verifier=None, **extra):
     params.update(extra)
     req = request.AuthorizationRequest.from_params(list(params.items()))
     op.validate_authorization_request(req)
-    resp = op.authorization_redirect(
-        req, "alice", {"email": ["alice@example.com"], "email_verified": ["true"]}
-    )
+    resp = op.authorization_redirect(req, "alice", {"email": ["alice@example.com"], "email_verified": ["true"]})
     return req, code_from_redirect(resp)
 
 
@@ -81,25 +79,13 @@ def test_full_code_flow_with_pkce(op):
         "refresh_token",
     }
     r = tr.to_response()
-    assert (
-        r.status == 200
-        and r.header("cache-control") == "no-store"
-        and json.loads(r.body)["token_type"] == "Bearer"
-    )
-    claims = rp.verify_id_token(
-        op.jwks_document(), tr.id_token, ISSUER, "demo", "n1", ["ES256"]
-    )
-    assert (
-        claims["sub"] == "alice"
-        and claims["email"] == "alice@example.com"
-        and claims["email_verified"] is True
-    )
+    assert r.status == 200 and r.header("cache-control") == "no-store" and json.loads(r.body)["token_type"] == "Bearer"
+    claims = rp.verify_id_token(op.jwks_document(), tr.id_token, ISSUER, "demo", "n1", ["ES256"])
+    assert claims["sub"] == "alice" and claims["email"] == "alice@example.com" and claims["email_verified"] is True
     ui = op.userinfo(tr.access_token)
     assert ui == {"sub": "alice", "email": "alice@example.com", "email_verified": True}
     tr2 = op.handle_token_request(
-        list(
-            {"grant_type": "refresh_token", "refresh_token": tr.refresh_token}.items()
-        ),
+        list({"grant_type": "refresh_token", "refresh_token": tr.refresh_token}.items()),
         TOKEN_URL,
         auth_header=basic_auth("demo", "s3cret"),
     )
@@ -128,13 +114,9 @@ def test_code_replay_rejected(op):
         "redirect_uri": REDIRECT_URI,
         "code_verifier": verifier,
     }
-    op.handle_token_request(
-        list(form.items()), TOKEN_URL, auth_header=basic_auth("demo", "s3cret")
-    )
+    op.handle_token_request(list(form.items()), TOKEN_URL, auth_header=basic_auth("demo", "s3cret"))
     with pytest.raises(OAuthError) as ei:
-        op.handle_token_request(
-            list(form.items()), TOKEN_URL, auth_header=basic_auth("demo", "s3cret")
-        )
+        op.handle_token_request(list(form.items()), TOKEN_URL, auth_header=basic_auth("demo", "s3cret"))
     assert ei.value.code == "invalid_grant" and ei.value.http_status == 400
 
 
@@ -232,9 +214,7 @@ def test_authorization_request_accessors():
             }.items()
         )
     )
-    assert (
-        access_token_flow.use_fragment()
-    )  # front-channel tokens never default to query
+    assert access_token_flow.use_fragment()  # front-channel tokens never default to query
     bad = request.AuthorizationRequest.from_params(
         list(
             {
@@ -281,9 +261,7 @@ def test_extra_claims_land_in_id_token(op):
         "code_challenge_method": "S256",
     }
     req = request.AuthorizationRequest.from_params(list(params.items()))
-    resp = op.authorization_redirect(
-        req, "alice", acr="urn:mfa", extra_claims={"tenant": {"id": 7}}
-    )
+    resp = op.authorization_redirect(req, "alice", acr="urn:mfa", extra_claims={"tenant": {"id": 7}})
     code = code_from_redirect(resp)
     tr = op.handle_token_request(
         list(
@@ -298,11 +276,7 @@ def test_extra_claims_land_in_id_token(op):
         auth_header=basic_auth("demo", "s3cret"),
     )
     claims = jwt.peek_claims_unverified(tr.id_token)
-    assert (
-        claims["tenant"] == {"id": 7}
-        and claims["acr"] == "urn:mfa"
-        and claims["nonce"] == "n"
-    )
+    assert claims["tenant"] == {"id": 7} and claims["acr"] == "urn:mfa" and claims["nonce"] == "n"
 
 
 def test_client_credentials(op):
@@ -370,9 +344,7 @@ def test_private_key_jwt(op, rp_key):
         list(
             {
                 "client_assertion_type": provider.CLIENT_ASSERTION_TYPE,
-                "client_assertion": rp.build_client_assertion(
-                    rp_key, "jwt-rp", TOKEN_URL
-                ),
+                "client_assertion": rp.build_client_assertion(rp_key, "jwt-rp", TOKEN_URL),
             }.items()
         ),
         TOKEN_URL,
@@ -394,9 +366,7 @@ def test_private_key_jwt(op, rp_key):
             list(
                 {
                     "client_assertion_type": provider.CLIENT_ASSERTION_TYPE,
-                    "client_assertion": rp.build_client_assertion(
-                        rp_key, "jwt-rp", "https://other/token"
-                    ),
+                    "client_assertion": rp.build_client_assertion(rp_key, "jwt-rp", "https://other/token"),
                 }.items()
             ),
             TOKEN_URL,
@@ -435,9 +405,7 @@ def test_provider_rejects_symmetric_id_token_signing_key(demo_client):
     from pygrindvakt import client, tokens
 
     encoded = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode()
-    symmetric = keys.signing_key_from_jwk(
-        {"kty": "oct", "k": encoded}, alg="HS256", kid="op-hs"
-    )
+    symmetric = keys.signing_key_from_jwk({"kty": "oct", "k": encoded}, alg="HS256", kid="op-hs")
     with pytest.raises(ConfigError, match="asymmetric"):
         provider.Provider(
             metadata.ProviderMetadata(ISSUER),
@@ -471,10 +439,7 @@ def test_duplicate_authorization_and_token_parameters_are_rejected(op):
     )
     assert resources.resources == ["https://api-one.example", "https://api-two.example"]
     assert "resource" not in resources.extra
-    assert (
-        request.AuthorizationRequest.from_dict(resources.to_dict()).resources
-        == resources.resources
-    )
+    assert request.AuthorizationRequest.from_dict(resources.to_dict()).resources == resources.resources
 
     with pytest.raises(OAuthError) as exc:
         op.handle_token_request(
@@ -589,11 +554,7 @@ def test_hybrid_and_implicit_responses_include_oidc_hashes(op_key):
     values = parse_qs(urlparse(location).fragment)
     claims = jwt.peek_claims_unverified(values["id_token"][0])
     expected_c_hash = (
-        base64.urlsafe_b64encode(
-            hashlib.sha256(values["code"][0].encode()).digest()[:16]
-        )
-        .rstrip(b"=")
-        .decode()
+        base64.urlsafe_b64encode(hashlib.sha256(values["code"][0].encode()).digest()[:16]).rstrip(b"=").decode()
     )
     assert claims["c_hash"] == expected_c_hash
 
@@ -613,11 +574,7 @@ def test_hybrid_and_implicit_responses_include_oidc_hashes(op_key):
     assert values["token_type"] == ["Bearer"] and int(values["expires_in"][0]) > 0
     claims = jwt.peek_claims_unverified(values["id_token"][0])
     expected_at_hash = (
-        base64.urlsafe_b64encode(
-            hashlib.sha256(values["access_token"][0].encode()).digest()[:16]
-        )
-        .rstrip(b"=")
-        .decode()
+        base64.urlsafe_b64encode(hashlib.sha256(values["access_token"][0].encode()).digest()[:16]).rstrip(b"=").decode()
     )
     assert claims["at_hash"] == expected_at_hash
 
@@ -651,14 +608,10 @@ def test_hybrid_and_implicit_responses_include_oidc_hashes(op_key):
     assert flow_op.authorization_redirect(reordered, "alice").status == 302
 
 
-def test_non_openid_flow_omits_id_token_and_userinfo_and_claims_are_scope_filtered(
-    op, op_key
-):
+def test_non_openid_flow_omits_id_token_and_userinfo_and_claims_are_scope_filtered(op, op_key):
     from pygrindvakt import client, tokens
 
-    c = client.Client(
-        "oauth", client_secret="secret", redirect_uris=[REDIRECT_URI], scope="email"
-    )
+    c = client.Client("oauth", client_secret="secret", redirect_uris=[REDIRECT_URI], scope="email")
     oauth_op = provider.Provider(
         metadata.ProviderMetadata(ISSUER),
         op_key,
@@ -676,9 +629,7 @@ def test_non_openid_flow_omits_id_token_and_userinfo_and_claims_are_scope_filter
             }.items()
         )
     )
-    code = code_from_redirect(
-        oauth_op.authorization_redirect(req, "alice", {"email": ["a@b"]})
-    )
+    code = code_from_redirect(oauth_op.authorization_redirect(req, "alice", {"email": ["a@b"]}))
     tr = oauth_op.handle_token_request(
         list(
             {
@@ -733,9 +684,7 @@ def test_non_openid_flow_omits_id_token_and_userinfo_and_claims_are_scope_filter
         )
     )
     code = code_from_redirect(
-        op.authorization_redirect(
-            req, "alice", {"email": ["a@b"], "name": ["Alice"], "tenant": ["example"]}
-        )
+        op.authorization_redirect(req, "alice", {"email": ["a@b"], "name": ["Alice"], "tenant": ["example"]})
     )
     tr = op.handle_token_request(
         list(
@@ -749,9 +698,7 @@ def test_non_openid_flow_omits_id_token_and_userinfo_and_claims_are_scope_filter
         auth_header=basic_auth("demo", "s3cret"),
     )
     claims = jwt.peek_claims_unverified(tr.id_token)
-    assert (
-        "email" not in claims and "name" not in claims and claims["tenant"] == "example"
-    )
+    assert "email" not in claims and "name" not in claims and claims["tenant"] == "example"
     assert op.userinfo(tr.access_token) == {"sub": "alice", "tenant": "example"}
 
 
@@ -770,9 +717,7 @@ def test_explicit_end_session_endpoint_is_advertised_and_warns(op, op_key):
             tokens.TokenCodec("s"),
             token_use_store=provider.InMemoryTokenUseStore(),
         )
-    assert (
-        advertising.discovery_document()["end_session_endpoint"] == f"{ISSUER}/logout"
-    )
+    assert advertising.discovery_document()["end_session_endpoint"] == f"{ISSUER}/logout"
     with pytest.raises(ValueError, match="reserved"):
         md.extra = {"issuer": "https://evil.example"}
 
@@ -844,9 +789,7 @@ def test_metadata_setters_do_not_warn():
 def test_token_lifetimes_and_metadata_customisation(op_key, demo_client):
     from pygrindvakt import client, tokens
 
-    md = metadata.ProviderMetadata(
-        "https://issuer.example", "https://issuer.example/oidc"
-    )
+    md = metadata.ProviderMetadata("https://issuer.example", "https://issuer.example/oidc")
     assert md.token_endpoint == "https://issuer.example/oidc/token"
     md.scopes_supported = ["openid"]
     md.set_extra_field("custom", {"x": 1})
@@ -865,17 +808,17 @@ def test_token_lifetimes_and_metadata_customisation(op_key, demo_client):
     assert d["custom"] == {"x": 1} and d["scopes_supported"] == ["openid"]
     assert d["claims_parameter_supported"] is False
     assert d["id_token_signing_alg_values_supported"] == ["ES256"]
-    assert (
-        p.lifetimes.access_token_ttl == 7 and p.lifetimes.refresh_token_ttl == 2_592_000
-    )
+    assert p.lifetimes.access_token_ttl == 7 and p.lifetimes.refresh_token_ttl == 2_592_000
     assert metadata.ProviderMetadata.from_dict(d).token_endpoint == md.token_endpoint
     assert isinstance(p.token_use_store, provider.InMemoryTokenUseStore)
 
 
 def test_flatten_claims():
-    assert provider.flatten_claims(
-        {"email_verified": ["true"], "groups": ["a", "b"], "name": ["N"]}
-    ) == {"email_verified": True, "groups": ["a", "b"], "name": "N"}
+    assert provider.flatten_claims({"email_verified": ["true"], "groups": ["a", "b"], "name": ["N"]}) == {
+        "email_verified": True,
+        "groups": ["a", "b"],
+        "name": "N",
+    }
     assert "sub" in provider.RESERVED_ID_TOKEN_CLAIMS
 
 
@@ -946,9 +889,7 @@ def test_failing_constructor_does_not_warn(op_key):
         with pytest.raises(ValueError, match="token_use_store"):
             from pygrindvakt import client
 
-            provider.Provider(
-                md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s")
-            )
+            provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"))
 
 
 def test_provider_warning_escalates_under_warnings_as_errors(op_key):

@@ -36,9 +36,7 @@ CLIENT_ID = "demo"
 
 
 def make_key(kid):
-    return keys.signing_key_from_jwk(
-        keys.generate_ec_jwk("P-256"), alg="ES256", kid=kid
-    )
+    return keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid=kid)
 
 
 def jwks_doc(*signing_keys):
@@ -98,9 +96,7 @@ class ScriptedHttp:
             return 404, b"", "text/plain"
         body = json.dumps(self.doc).encode()
         if self.as_response:
-            return rp_http.HttpFetchResponse(
-                self.status, body, "application/json", self.headers
-            )
+            return rp_http.HttpFetchResponse(self.status, body, "application/json", self.headers)
         if self.headers is not None:
             return self.status, body, "application/json", self.headers
         return self.status, body, "application/json"
@@ -226,9 +222,7 @@ def jwks_server():
 
 def server_cache(srv, **kw):
     clock = Clock()
-    cache = rp.JwksCache(
-        ReqwestClient(), f"{srv.issuer}/jwks", srv.issuer, _now=clock, **kw
-    )
+    cache = rp.JwksCache(ReqwestClient(), f"{srv.issuer}/jwks", srv.issuer, _now=clock, **kw)
     return cache, clock
 
 
@@ -299,9 +293,7 @@ def test_no_store_with_zero_min_ttl_never_caches(jwks_server, header):
 def test_python_client_without_headers_warns_once_and_uses_default_ttl():
     http = ScriptedHttp({"keys": []})
     cache, clock = make_cache(http, default_ttl=100, min_ttl=1)
-    with pytest.warns(
-        UserWarning, match=r"reports no response headers.*default_ttl \(100s\)"
-    ):
+    with pytest.warns(UserWarning, match=r"reports no response headers.*default_ttl \(100s\)"):
         cache.jwks()
     clock.advance(99)
     cache.jwks()
@@ -607,9 +599,7 @@ def test_kidless_token_follows_upstream_behaviour():
 
 def test_set_with_mixed_kid_and_kidless_keys_refreshes_for_unknown_kid():
     k1, rogue = make_key("k1"), make_key("rogue")
-    plain = keys.signing_key_from_jwk(
-        keys.generate_ec_jwk("P-256"), alg="ES256"
-    ).public_jwk()
+    plain = keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256").public_jwk()
     plain.pop("kid", None)
     http = ScriptedHttp({"keys": [k1.public_jwk(), plain]})
     cache, clock = make_cache(http)
@@ -698,9 +688,7 @@ def test_rp_verify_id_token_accepts_cache():
     assert rp.verify_id_token(cache, id_token(k2), ISSUER, CLIENT_ID, "n", ["ES256"])
     with pytest.raises(UnknownKeyError):
         clock.advance(31)
-        rp.verify_id_token(
-            cache, id_token(make_key("zzz")), ISSUER, CLIENT_ID, "n", ["ES256"]
-        )
+        rp.verify_id_token(cache, id_token(make_key("zzz")), ISSUER, CLIENT_ID, "n", ["ES256"])
 
 
 def test_rp_verify_id_token_with_cache_rejects_issuer_mismatch():
@@ -711,9 +699,7 @@ def test_rp_verify_id_token_with_cache_rejects_issuer_mismatch():
     other = "https://other.example.com"
     # Token claims iss == other and is signed by the cache's key.
     with pytest.raises(BadRequestError, match="issuer"):
-        rp.verify_id_token(
-            cache, id_token(k1, issuer=other), other, CLIENT_ID, "n", ["ES256"]
-        )
+        rp.verify_id_token(cache, id_token(k1, issuer=other), other, CLIENT_ID, "n", ["ES256"])
     # Rejected before any fetch.
     assert http.calls == 0
 
@@ -776,9 +762,7 @@ def test_cache_strict_hashes_requires_claims_when_values_given():
             strict_hashes=True,
         )
     ok = id_token(k1, at_hash=hh("at"), c_hash=hh("code"))
-    assert verify(
-        cache, ok, access_token="at", authorization_code="code", strict_hashes=True
-    )
+    assert verify(cache, ok, access_token="at", authorization_code="code", strict_hashes=True)
     assert verify(cache, id_token(k1), strict_hashes=True)
     assert verify(cache, id_token(k1), access_token="at")  # default lenient
     assert verify(
@@ -858,9 +842,7 @@ def test_fetch_userinfo_json_does_not_touch_cache():
 
     http = JsonHttp({"keys": []})
     cache, _ = make_cache(http)
-    out = rp.fetch_userinfo(
-        http, f"{ISSUER}/userinfo", "tok", "alice", ISSUER, jwks=cache
-    )
+    out = rp.fetch_userinfo(http, f"{ISSUER}/userinfo", "tok", "alice", ISSUER, jwks=cache)
     assert out["sub"] == "alice"
     assert http.calls == 0
 
