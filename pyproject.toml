@@ -34,6 +34,8 @@ dev = [
     "django",
     "fastapi",
     "httpx",
+    "mypy>=2.4",
+    "ruff==0.16.10",
 ]
 docs = [
     # Sphinx 9.1 needs Python >= 3.12 (what Read the Docs uses); older
