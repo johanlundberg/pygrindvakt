@@ -76,6 +76,7 @@ class Client:
         """Whether ``uri`` exactly matches a registered redirect URI."""
     def allows_response_type(self, rt: str) -> bool:
         """Whether the client is allowed the given response type."""
+    def __repr__(self) -> str: ...
 
 class InMemoryClientStore:
     """In-memory client store with optional per-entry TTL (used by federation
@@ -89,3 +90,4 @@ class InMemoryClientStore:
         """Insert or replace a client with no expiry."""
     def put_with_ttl(self, client: Client | dict[str, Any], ttl_secs: int) -> None:
         """Insert or replace a client that expires after ``ttl_secs``."""
+    def __repr__(self) -> str: ...

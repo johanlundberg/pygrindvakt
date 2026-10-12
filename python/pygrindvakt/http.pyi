@@ -168,6 +168,7 @@ class HttpRequestData:
         """The value of the ``Authorization`` header, if present."""
     def bearer_token(self) -> str | None:
         """Extract a Bearer token from the Authorization header."""
+    def __repr__(self) -> str: ...
 
 class Response:
     """A framework-agnostic HTTP response produced by grindvakt.
@@ -214,6 +215,7 @@ class Response:
     @staticmethod
     def text_response(status: int, body: str) -> Response:
         """A plain-text response."""
+    def __repr__(self) -> str: ...
 
 class HttpFetchResponse:
     """The result of an outbound fetch made through an ``HttpClient``."""
@@ -237,6 +239,7 @@ class HttpFetchResponse:
     def text(self) -> str: ...
     def json(self) -> Any:
         """Parse the body as JSON into native Python objects."""
+    def __repr__(self) -> str: ...
 
 class ReqwestClient:
     """The built-in outbound HTTP client (reqwest + rustls).
@@ -284,3 +287,4 @@ class ReqwestClient:
         headers: list[tuple[str, str]] | None = ...,
     ) -> tuple[int, bytes, str | None]:
         """Issue a form-encoded POST. Returns ``(status, body, content_type)``."""
+    def __repr__(self) -> str: ...

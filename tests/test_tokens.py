@@ -88,3 +88,8 @@ def test_payload_from_dict():
     assert p.claims == {} and p.exp == 5
     with pytest.raises(ValueError):
         tokens.AccessTokenPayload.from_dict({"sub": "s"})
+
+
+def test_codec_repr_never_renders_the_secret():
+    r = repr(tokens.TokenCodec("hunter2-super-secret"))
+    assert "hunter2" not in r and "<secret>" in r

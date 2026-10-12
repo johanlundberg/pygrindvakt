@@ -51,6 +51,7 @@ class TokenLifetimes:
     def id_token_ttl(self) -> int: ...
     @property
     def refresh_token_ttl(self) -> int: ...
+    def __repr__(self) -> str: ...
 
 class TokenResponse:
     """A successful token-endpoint response. ``to_dict()`` is exactly the JSON
@@ -71,6 +72,7 @@ class TokenResponse:
     def to_dict(self) -> dict[str, Any]: ...
     def to_response(self) -> Response:
         """The complete HTTP response: 200, JSON body, ``cache-control: no-store``."""
+    def __repr__(self) -> str: ...
 
 class InMemoryTokenUseStore:
     """Process-local one-time-use store for codes, refresh tokens and
@@ -80,6 +82,7 @@ class InMemoryTokenUseStore:
     def __init__(self) -> None: ...
     def consume(self, token_hash: str, ttl_secs: int) -> bool:
         """Mark ``token_hash`` used; True iff it was not already used."""
+    def __repr__(self) -> str: ...
 
 class RedisStore:
     """Redis-backed one-time-use store (``SET key 1 EX ttl NX``) for
@@ -89,6 +92,7 @@ class RedisStore:
     DEFAULT_KEY_PREFIX: str
     def __init__(self, redis_url: str, key_prefix: str | None = ...) -> None: ...
     def consume(self, token_hash: str, ttl_secs: int) -> bool: ...
+    def __repr__(self) -> str: ...
 
 class Provider:
     """The OpenID Provider engine. Build once, share across requests.
@@ -185,6 +189,7 @@ class Provider:
     ) -> Client:
         """Authenticate from ordered token-endpoint form pairs. Mappings are
         rejected because they erase duplicate parameter names."""
+    def __repr__(self) -> str: ...
 
 def flatten_claims(external: dict[str, list[str]]) -> dict[str, Any]:
     """Flatten ``{claim: [values]}`` into id_token / userinfo claim values the

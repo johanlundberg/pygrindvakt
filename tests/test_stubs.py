@@ -33,6 +33,9 @@ SUBMODULES = [
 ]
 # Names that exist only in stubs (typing helpers) and are not runtime objects.
 STUB_ONLY_SUFFIX = "Protocol"
+# Dunders that the member comparison skips but that control what ends up in logs.
+# Several runtime reprs redact secrets on purpose, so the stub must declare them.
+REDACTED_DUNDERS = {"__repr__", "__str__"}
 
 
 def _stub_names(tree):
@@ -67,6 +70,19 @@ def _stub_names(tree):
     return names, classes
 
 
+def _stub_dunders(tree):
+    """Map class name -> redaction-relevant dunders declared in the stub."""
+    return {
+        node.name: {
+            i.name
+            for i in node.body
+            if isinstance(i, ast.FunctionDef) and i.name in REDACTED_DUNDERS
+        }
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+    }
+
+
 def _runtime_names(mod):
     return {n for n in dir(mod) if not n.startswith("_")}
 
@@ -96,6 +112,16 @@ def test_stub_matches_runtime(name):
         assert rt_members == members, (
             f"{name}.{cls_name}: stub {sorted(members ^ rt_members)} differs "
             f"(stub-only: {sorted(members - rt_members)}, runtime-only: {sorted(rt_members - members)})"
+        )
+    stub_dunders = _stub_dunders(tree)
+    for cls_name in stub_classes:
+        if cls_name.endswith(STUB_ONLY_SUFFIX):
+            continue
+        cls = getattr(mod, cls_name)
+        runtime_dunders = {d for d in REDACTED_DUNDERS if d in vars(cls)}
+        assert stub_dunders[cls_name] == runtime_dunders, (
+            f"{name}.{cls_name}: runtime defines {sorted(runtime_dunders)} but "
+            f"stub declares {sorted(stub_dunders[cls_name])}"
         )
 
 

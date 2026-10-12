@@ -56,3 +56,8 @@ markers = [
     "pkcs11: tests requiring a SoftHSM2 token (auto-skip if unavailable)",
     "redis: tests requiring a live Redis at REDIS_URL (auto-skip if unset)",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# PYI029 autofix deletes `__repr__` from stubs. Several runtime reprs redact
+# secrets on purpose, and tests/test_stubs.py requires the stub to declare them.
+"*.pyi" = ["PYI029"]
