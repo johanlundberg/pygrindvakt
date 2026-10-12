@@ -61,7 +61,11 @@ def _stub_names(tree):
                             if isinstance(t, ast.Name):
                                 members.add(t.id)
                 classes[node.name] = members
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and not node.target.id.startswith("_")
+        ):
             names.add(node.target.id)
         elif isinstance(node, ast.Assign):
             for t in node.targets:
@@ -137,3 +141,15 @@ def test_top_level_stub_lists_all_submodules_and_exceptions():
             names.add(node.target.id)
     for n in pygrindvakt.__all__:
         assert n in names, f"__init__.pyi lacks {n}"
+
+
+@pytest.mark.parametrize("name", SUBMODULES)
+def test_stubs_do_not_blanket_suppress_undefined_names(name):
+    """A file-level ``# ruff: noqa: F821`` would hide typos in every annotation."""
+    for line in (STUB_DIR / f"{name}.pyi").read_text().splitlines():
+        stripped = line.strip().lower()
+        if stripped.startswith("# ruff: noqa"):
+            codes = stripped.removeprefix("# ruff: noqa").lstrip(": ")
+            assert codes and "f821" not in codes, (
+                f"{name}.pyi: file-level noqa covers F821: {line}"
+            )

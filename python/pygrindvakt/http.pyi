@@ -27,34 +27,7 @@ calling thread while it holds the GIL, so one shared across threads must be
 thread-safe itself.
 """
 
-# Forward references to classes defined below are valid in a stub; PYI026 would
-# add TypeAlias annotations that tests/test_stubs.py counts as public names.
-# ruff: noqa: F821, PYI026
-
-from typing import Any, Protocol
-
-# Stub-only aliases (underscore-prefixed so they are not expected at runtime).
-# What a client method may return: the ``(status, body, content_type)`` tuple,
-# the same with an optional 4th ``headers`` element (response ``(name, value)``
-# pairs), or an ``HttpFetchResponse`` (see ``extract_fetch`` in
-# ``src/http.rs``). Report headers if you can: ``rp.JwksCache`` needs
-# ``Cache-Control`` / ``Age`` to honour the OP's cache lifetime.
-_FetchResult = (
-    tuple[int, bytes, str | None]
-    | tuple[int, bytes, str | None, list[tuple[str, str]] | None]
-    | HttpFetchResponse
-)
-# What every networked function accepts as ``http``: any protocol client, the
-# built-in ``ReqwestClient``, or ``None`` for the process-wide default client.
-_HttpArg = HttpClientProtocol | ReqwestClient | None
-# What a networked function accepts as ``http`` when it sends request headers on
-# GET (``rp.fetch_userinfo(method="GET")``).
-_HttpHeadersArg = (
-    HttpClientWithHeadersProtocol
-    | HttpClientGetWithHeadersProtocol
-    | ReqwestClient
-    | None
-)
+from typing import Any, Protocol, TypeAlias
 
 class HttpClientProtocol(Protocol):
     """Outbound HTTP client protocol accepted wherever ``http=`` is taken.
@@ -288,3 +261,26 @@ class ReqwestClient:
     ) -> tuple[int, bytes, str | None]:
         """Issue a form-encoded POST. Returns ``(status, body, content_type)``."""
     def __repr__(self) -> str: ...
+
+# Stub-only aliases (underscore-prefixed so they are not expected at runtime).
+# What a client method may return: the ``(status, body, content_type)`` tuple,
+# the same with an optional 4th ``headers`` element (response ``(name, value)``
+# pairs), or an ``HttpFetchResponse`` (see ``extract_fetch`` in
+# ``src/http.rs``). Report headers if you can: ``rp.JwksCache`` needs
+# ``Cache-Control`` / ``Age`` to honour the OP's cache lifetime.
+_FetchResult: TypeAlias = (
+    tuple[int, bytes, str | None]
+    | tuple[int, bytes, str | None, list[tuple[str, str]] | None]
+    | HttpFetchResponse
+)
+# What every networked function accepts as ``http``: any protocol client, the
+# built-in ``ReqwestClient``, or ``None`` for the process-wide default client.
+_HttpArg: TypeAlias = HttpClientProtocol | ReqwestClient | None  # noqa: PYI047 (imported by other stubs)
+# What a networked function accepts as ``http`` when it sends request headers on
+# GET (``rp.fetch_userinfo(method="GET")``).
+_HttpHeadersArg: TypeAlias = (  # noqa: PYI047 (imported by other stubs)
+    HttpClientWithHeadersProtocol
+    | HttpClientGetWithHeadersProtocol
+    | ReqwestClient
+    | None
+)
