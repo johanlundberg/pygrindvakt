@@ -205,10 +205,13 @@ def verify_id_token(
       tokens lacking the claim (and need the matching value, else
       ``BadRequestError``). ``EdDSA`` tokens carrying a hash claim cannot be
       checked (``CryptoError``).
-    * ``strict_hashes``: an id_token carrying ``at_hash`` / ``c_hash`` without
-      the matching ``access_token`` / ``authorization_code`` raises
-      ``AuthnError`` instead of being accepted unverified. Implicit / hybrid
-      flows must pass the values (with ``require_*``) or set this.
+    * ``strict_hashes``: rejects (``AuthnError``) an id_token carrying
+      ``at_hash`` / ``c_hash`` that cannot be checked (no matching
+      ``access_token`` / ``authorization_code``), and requires ``at_hash`` /
+      ``c_hash`` whenever ``access_token`` / ``authorization_code`` is passed,
+      as if ``require_*`` were set. Code-flow callers who pass ``access_token``
+      but whose OP omits ``at_hash`` must leave it off. ``EdDSA`` tokens cannot
+      satisfy the requirement.
     """
 
 class JwksCache:

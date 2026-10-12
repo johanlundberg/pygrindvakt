@@ -1041,7 +1041,7 @@ impl IdTokenPolicy {
         require_c_hash: bool,
         strict_hashes: bool,
     ) -> PyResult<Self> {
-        let policy = Self {
+        let mut policy = Self {
             algorithms: parse_algorithms(allowed_algorithms)?,
             trusted_additional_audiences: trusted_additional_audiences.unwrap_or_default(),
             leeway: seconds("leeway", leeway)?,
@@ -1065,6 +1065,11 @@ impl IdTokenPolicy {
                 "require_c_hash needs an authorization_code to check against".into(),
             )));
         }
+        // `strict_hashes` requires the claim whenever the value to bind it to
+        // is in hand (blocks token substitution by omission). Applied after
+        // the checks above so explicit-flag misuse still raises.
+        policy.require_at_hash |= policy.strict_hashes && policy.access_token.is_some();
+        policy.require_c_hash |= policy.strict_hashes && policy.authorization_code.is_some();
         if policy.leeway.is_some_and(|l| l > grp::MAX_ID_TOKEN_LEEWAY) {
             return Err(err(RsError::BadRequest(format!(
                 "id_token leeway must be at most {} seconds",
@@ -1169,11 +1174,14 @@ impl IdTokenPolicy {
 ///   additionally reject tokens without the claim (they need the matching
 ///   value, else `BadRequestError`). An `EdDSA` token carrying a hash claim
 ///   cannot be checked (`CryptoError`).
-/// * `strict_hashes`: reject (`AuthnError`) an id_token that carries
-///   `at_hash` / `c_hash` when the matching `access_token` /
-///   `authorization_code` is not given. Without it such a claim is ignored,
-///   so implicit / hybrid flows must pass the values (with `require_*`) or
-///   set this.
+/// * `strict_hashes`: reject (`AuthnError`) an id_token carrying `at_hash` /
+///   `c_hash` that cannot be checked (no matching `access_token` /
+///   `authorization_code`), and require `at_hash` / `c_hash` whenever
+///   `access_token` / `authorization_code` is passed (as if `require_*_hash`
+///   were set). Without it such a claim is ignored. Code-flow callers who pass
+///   `access_token` but whose OP omits `at_hash` must leave it off. An
+///   `EdDSA` token cannot satisfy the requirement (`AuthnError` if the claim
+///   is absent, `CryptoError` if present).
 #[pyfunction]
 #[pyo3(signature = (jwks, id_token, issuer, client_id, expected_nonce, allowed_algorithms,
                     trusted_additional_audiences = None, unsafe_skip_nonce_check = false, *,

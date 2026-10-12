@@ -721,6 +721,29 @@ def test_cache_strict_hashes_is_forwarded():
         verify(cache, tok, strict_hashes=True)
 
 
+def test_cache_strict_hashes_requires_claims_when_values_given():
+    import base64
+    import hashlib
+
+    def hh(v):
+        d = hashlib.sha256(v.encode()).digest()
+        return base64.urlsafe_b64encode(d[:16]).rstrip(b"=").decode()
+
+    k1 = make_key("k1")
+    cache, _ = make_cache(ScriptedHttp(jwks_doc(k1)))
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        verify(cache, id_token(k1), access_token="at", strict_hashes=True)
+    with pytest.raises(AuthnError, match="missing c_hash"):
+        verify(cache, id_token(k1, at_hash=hh("at")), access_token="at",
+               authorization_code="code", strict_hashes=True)
+    ok = id_token(k1, at_hash=hh("at"), c_hash=hh("code"))
+    assert verify(cache, ok, access_token="at", authorization_code="code", strict_hashes=True)
+    assert verify(cache, id_token(k1), strict_hashes=True)
+    assert verify(cache, id_token(k1), access_token="at")  # default lenient
+    assert verify(cache, id_token(k1, at_hash=hh("at")), access_token="at",
+                  require_at_hash=True, strict_hashes=True)
+
+
 def test_cache_argument_errors_do_not_fetch():
     k1 = make_key("k1")
     http = ScriptedHttp(jwks_doc(k1))

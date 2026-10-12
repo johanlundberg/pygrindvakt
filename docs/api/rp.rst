@@ -433,10 +433,18 @@ Finishing the flow
 
    ``strict_hashes``
       By default an ``at_hash`` / ``c_hash`` claim is **ignored** when the
-      matching ``access_token`` / ``authorization_code`` is not passed, so a
-      missing binding goes unnoticed. With ``strict_hashes=True`` such a token
-      raises :class:`pygrindvakt.AuthnError` instead. Implicit and hybrid
-      flows must pass the values (with ``require_*_hash``) or set this.
+      matching ``access_token`` / ``authorization_code`` is not passed, and a
+      missing claim is accepted. With ``strict_hashes=True`` the token is
+      rejected with :class:`pygrindvakt.AuthnError` if it carries a hash claim
+      that cannot be checked, and ``at_hash`` / ``c_hash`` is required whenever
+      ``access_token`` / ``authorization_code`` is passed (as if
+      ``require_at_hash`` / ``require_c_hash`` were set; no
+      :class:`pygrindvakt.BadRequestError` when the value is absent). With
+      neither value passed and no hash claim, nothing is required. Code-flow
+      callers who pass ``access_token`` but whose OP omits ``at_hash`` must
+      leave ``strict_hashes`` off. An ``EdDSA`` token cannot satisfy the
+      requirement (``AuthnError`` if the claim is absent, ``CryptoError`` if
+      present).
 
    The hash is computed with the SHA-2 variant matching the token's ``alg``.
    ``EdDSA`` defines none: an ``EdDSA`` token that carries ``at_hash`` /

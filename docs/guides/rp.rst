@@ -254,7 +254,11 @@ for signed UserInfo responses. Extra checks are keyword options on both:
    ``authorization_code`` + ``require_c_hash=True`` (or set
    ``strict_hashes=True``): ``verify_id_token`` does not notice a missing
    ``at_hash`` / ``c_hash`` binding otherwise, and by default ignores a hash
-   claim when no value is given to check it against.
+   claim when no value is given to check it against. ``strict_hashes=True``
+   rejects hash claims it cannot check and requires ``at_hash`` / ``c_hash``
+   whenever you pass ``access_token`` / ``authorization_code``. Code-flow
+   callers who pass ``access_token`` but whose OP omits ``at_hash`` must leave
+   it off.
 
 .. code-block:: python
 

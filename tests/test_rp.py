@@ -1509,10 +1509,45 @@ def test_verify_strict_hashes(op_key):
     assert _vo(op_key, claims, access_token=at, strict_hashes=True)["sub"] == "alice"
     with pytest.raises(AuthnError, match="c_hash"):
         _vo(op_key, _co(c_hash="x"), strict_hashes=True)
-    # No hash claims: strict_hashes is harmless.
+    # No values and no hash claims: nothing required, no BadRequestError.
     assert _vo(op_key, _co(), strict_hashes=True)["sub"] == "alice"
     # Default unchanged.
     assert _vo(op_key, claims)["sub"] == "alice"
+    assert _vo(op_key, _co(), access_token=at)["sub"] == "alice"
+
+
+def test_verify_strict_hashes_requires_claims_when_values_given(op_key):
+    at, code = "the-access-token", "the-code"
+    # Value passed, claim absent: required.
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        _vo(op_key, _co(), access_token=at, strict_hashes=True)
+    with pytest.raises(AuthnError, match="missing c_hash"):
+        _vo(op_key, _co(), authorization_code=code, strict_hashes=True)
+    # Only one claim present while both values are passed.
+    with pytest.raises(AuthnError, match="missing c_hash"):
+        _vo(op_key, _co(at_hash=_half_hash(at)), access_token=at, authorization_code=code,
+            strict_hashes=True)
+    # Both valid.
+    both = _co(at_hash=_half_hash(at), c_hash=_half_hash(code))
+    assert _vo(op_key, both, access_token=at, authorization_code=code,
+               strict_hashes=True)["sub"] == "alice"
+    # Wrong value still mismatches.
+    with pytest.raises(AuthnError, match="at_hash mismatch"):
+        _vo(op_key, both, access_token="other", authorization_code=code, strict_hashes=True)
+    # Only access_token passed: c_hash claim is unverifiable, at_hash required.
+    with pytest.raises(AuthnError, match="id_token carries c_hash but no value was supplied"):
+        _vo(op_key, both, access_token=at, strict_hashes=True)
+    only_at = _co(at_hash=_half_hash(at))
+    assert _vo(op_key, only_at, access_token=at, strict_hashes=True)["sub"] == "alice"
+    # Explicit require_* combos still work.
+    assert _vo(op_key, only_at, access_token=at, require_at_hash=True,
+               strict_hashes=True)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        _vo(op_key, _co(), access_token=at, require_at_hash=True, strict_hashes=True)
+    with pytest.raises(BadRequestError, match="require_at_hash needs an access_token"):
+        _vo(op_key, _co(), require_at_hash=True, strict_hashes=True)
+    # strict_hashes off: absent claim still accepted.
+    assert _vo(op_key, _co(), access_token=at, authorization_code=code)["sub"] == "alice"
 
 
 def test_verify_leeway_makes_expired_token_pass(op_key):
@@ -1620,6 +1655,13 @@ def test_verify_hash_with_eddsa(op_key):
     # A hash claim present with a supplied value cannot be checked.
     with pytest.raises(CryptoError, match="token-hash"):
         verify(_co(at_hash="x"), access_token="at")
+    # strict_hashes + value: claim required, which EdDSA cannot provide.
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        verify(_co(), access_token="at", strict_hashes=True)
+    with pytest.raises(CryptoError, match="token-hash"):
+        verify(_co(at_hash="x"), access_token="at", strict_hashes=True)
+    # strict_hashes without values: unchanged.
+    assert verify(_co(), strict_hashes=True)["sub"] == "alice"
 
 
 def test_verify_trusted_additional_audience_keyword(op_key):

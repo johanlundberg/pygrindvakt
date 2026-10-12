@@ -26,11 +26,16 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 ### Security
 
 - `rp.verify_id_token` and `JwksCache.verify_id_token` gain keyword-only
-  `strict_hashes: bool = False`. When true, an id_token carrying `at_hash` /
-  `c_hash` without the matching `access_token` / `authorization_code` raises
-  `AuthnError` instead of being accepted unverified (the default keeps the
-  lenient behaviour). Implicit / hybrid flows must pass the values with
-  `require_*_hash`, or set `strict_hashes=True`.
+  `strict_hashes: bool = False`. When true, it rejects (`AuthnError`) an
+  id_token carrying `at_hash` / `c_hash` that cannot be checked (no matching
+  `access_token` / `authorization_code`), and requires `at_hash` / `c_hash`
+  whenever `access_token` / `authorization_code` is passed (as if
+  `require_at_hash` / `require_c_hash` were set), so an id_token not bound to
+  the token in hand is refused. With neither value passed and no hash claim,
+  nothing is required. `EdDSA` tokens cannot satisfy the requirement. Implicit
+  / hybrid flows should pass the values with `require_*_hash` or set
+  `strict_hashes=True`; code-flow callers who pass `access_token` but whose OP
+  omits `at_hash` must leave it off. The default keeps the lenient behaviour.
 - `rp.end_session_url` accepts `post_logout_redirect_uri` only when `client`
   is given and the value exactly equals an entry of the new
   `RpClient(..., post_logout_redirect_uris=[...])` registration; otherwise
