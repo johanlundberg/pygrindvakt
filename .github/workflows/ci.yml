@@ -9,6 +9,7 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'pyproject.toml'
+      - 'uv.lock'
       - 'build-wheels.sh'
       - '.github/workflows/**'
       - '.github/scripts/**'
@@ -116,8 +117,7 @@ jobs:
 
     - name: Run mypy
       run: |
-        uv venv
-        uv pip install mypy
+        uv sync --frozen --only-group dev
         MYPYPATH=python .venv/bin/mypy --strict tests/typecheck_usage.py
 
   # Lint + format check, same as `just lint` and `just format-check`.
@@ -135,8 +135,7 @@ jobs:
 
     - name: Run ruff
       run: |
-        uv venv
-        uv pip install "ruff==0.16.10"
+        uv sync --frozen --only-group dev
         .venv/bin/ruff check python tests examples
         .venv/bin/ruff format --check python tests examples
 
