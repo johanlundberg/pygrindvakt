@@ -431,6 +431,22 @@ def test_refresh_first_fetch_then_rate_limited():
     assert http.calls == 2
 
 
+def test_refresh_after_failed_first_fetch_is_rate_limited():
+    """A failed attempt counts: an unavailable endpoint must not be hammered."""
+    http = ScriptedHttp({"keys": []})
+    http.error = RuntimeError("down")
+    cache, clock = make_cache(http, min_refresh_interval=30)
+    with pytest.raises(InternalError):
+        cache.refresh()
+    assert http.calls == 1
+    cache.refresh()  # no snapshot, but the failed attempt is within the interval
+    assert http.calls == 1
+    clock.advance(31)
+    with pytest.raises(InternalError):
+        cache.refresh()
+    assert http.calls == 2
+
+
 def test_refresh_failure_keeps_cached_set():
     k1 = make_key("k1")
     http = ScriptedHttp(jwks_doc(k1))

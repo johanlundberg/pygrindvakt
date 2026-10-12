@@ -1450,7 +1450,7 @@ impl JwksCache {
     /// a silent no-op. A failed fetch raises and keeps the cached set.
     fn refresh(&self, py: Python<'_>) -> PyResult<()> {
         let _flight = self.begin_flight(py);
-        if self.snapshot().is_some() && self.rate_limited(self.now()) {
+        if self.rate_limited(self.now()) {
             return Ok(());
         }
         self.fetch(py).map(|_| ())
