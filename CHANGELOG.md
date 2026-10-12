@@ -54,12 +54,15 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 ### Changed
 
 - `JwksCache` now emits one `UserWarning` (per cache, on its first fetch) when
-  the `HttpClient` returns a response with no headers at all. Such a client
-  cannot report `Cache-Control` / `Age`, so the cache silently used
+  the `HttpClient` returns a response with no headers at all. Without headers
+  the cache cannot see `Cache-Control` / `Age`, so it silently used
   `default_ttl` and a revoked key could stay trusted for that long. The
-  built-in client is unaffected. Docs now state that `Cache-Control` is
-  honoured only when the client reports response headers, and that
-  `no-store` / `no-cache` / `max-age=0` are floored to `min_ttl`.
+  built-in client is unaffected, and a custom client avoids the warning and
+  gets `Cache-Control` / `Age` handling by returning headers (4-tuple or
+  `HttpFetchResponse(headers=...)`; see "Python `HttpClient` adapters can
+  report response headers"). Docs now state that `Cache-Control` is honoured
+  only when the client reports response headers, and that `no-store` /
+  `no-cache` / `max-age=0` are floored to `min_ttl`.
 
 - **Breaking:** `end_session_endpoint` and related OIDC extension members
   (`revocation_endpoint`, `introspection_endpoint`,
@@ -104,7 +107,9 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `jwks=` by `rp.verify_id_token` and `rp.fetch_userinfo`; the `issuer`
   argument must equal the cache's issuer (`BadRequestError` otherwise, before
   any request), so one provider's keys cannot vouch for another's `iss`. A Python
-  `HttpClient` cannot report response headers, so it always gets `default_ttl`.
+  `HttpClient` gets `Cache-Control` / `Age` handling only if it reports response
+  headers (see "Python `HttpClient` adapters can report response headers");
+  without headers the cache uses `default_ttl` and warns once.
 - `UnknownKeyError(JoseError)`, `code == "unknown_kid"`, `status_hint` 401.
 - `rp.verify_id_token` keyword-only options `leeway` (<= 300), `max_age`
   (checked against `auth_time`, which must be present), `acr_values`,
@@ -203,8 +208,8 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   rejected, and `OAuthError` wire descriptions are normalized (upstream
   hardening).
 - The built-in `ReqwestClient` now records lower-cased response headers on
-  the internal fetch response; Python HTTP clients supply none. Headers are
-  not exposed on the Python `HttpFetchResponse`.
+  the internal fetch response. Python HTTP clients may supply headers too (see
+  "Python `HttpClient` adapters can report response headers").
 - `py.typed` is now empty (the package is fully typed) instead of `partial`.
 - The `http` argument of `rp`, `federation` and `discovery` functions is typed
   as `HttpClientProtocol | ReqwestClient | None` instead of `Any | None`, and
