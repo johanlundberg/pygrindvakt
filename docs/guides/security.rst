@@ -144,6 +144,13 @@ Everything else should become a generic ``server_error``:
        log.exception("token endpoint failure")             # str(e) goes to the log
        return to_flask(OAuthError("server_error").to_response())
 
+The structured attributes on upstream failures need the same care.
+``exc.upstream_status`` and ``exc.upstream_error`` (the OAuth ``error`` code)
+are fine to log or branch on, but ``exc.upstream_error_description`` and
+``exc.upstream_body`` are free text from the upstream and may echo secrets or
+personal data. Escaping makes them safe to print, not safe to disclose: do not
+log them verbatim and never return them to end users.
+
 On the RP side the same applies to :class:`pygrindvakt.AuthnError` raised by
 :func:`~pygrindvakt.rp.exchange_code` or
 :func:`~pygrindvakt.rp.verify_id_token`: log it, show the user a generic

@@ -30,6 +30,41 @@ methods.
    including the ``client_secret`` and authorization code, cross-origin), and
    for bounding response sizes. The built-in client does all three.
 
+Redirects and credentials
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+grindvakt validates the URLs it requests but cannot validate where a server
+redirects to, so the client must not leak credentials:
+
+* ``post_form`` carries ``client_secret``, authorization codes, PKCE verifiers
+  and ``Authorization`` headers. It must not follow cross-origin redirects at
+  all, including ``307`` / ``308``.
+* GET with headers carries ``Authorization: Bearer``. It must not follow
+  redirects, or must strip ``Authorization`` on a cross-origin redirect.
+
+The built-in :class:`ReqwestClient` never follows redirects for any request
+(``GET``, ``GET`` with headers, ``POST``); a ``3xx`` is returned as an ordinary
+response and callers treat it as a failure. An injected client is responsible
+for the same policy.
+
+Request headers on GET
+~~~~~~~~~~~~~~~~~~~~~~
+
+``rp.fetch_userinfo(method="GET")`` sends the access token as a header, so the
+client must accept request headers on GET. This is decided **once**, when the
+client is first used, not by calling and catching ``TypeError``. A Python client
+supports headers if either
+
+* it has a callable ``get_with_headers(url, headers)`` (preferred when
+  present), or
+* its ``get`` accepts a ``headers`` parameter that can be passed by keyword (positional-only or ``*headers`` does not count; a ``**kwargs`` parameter also
+  counts), and is called as ``get(url, headers=[(name, value), ...])``.
+
+``headers`` is a list of ``(name, value)`` pairs. A client that supports
+neither raises :class:`~pygrindvakt.ConfigError` when a GET with headers is
+requested; plain ``get`` and ``post_form`` are unaffected. The type-checking
+protocol for such a client is ``HttpClientWithHeadersProtocol`` (stub-only).
+
 Inbound request
 ---------------
 
@@ -175,15 +210,24 @@ Outbound HTTP client protocol
    methods is accepted, and the methods are checked for existence when the
    object is first passed (``TypeError`` otherwise).
 
-   Both methods may return either a ``(status, body, content_type)`` tuple or
-   an :class:`HttpFetchResponse`. ``body`` must be ``bytes`` (not
+   Both methods may return either a ``(status, body, content_type)`` tuple, a
+   ``(status, body, content_type, headers)`` tuple, or an
+   :class:`HttpFetchResponse`. ``headers`` is an optional list of response
+   ``(name, value)`` string pairs (or ``None``); names are lower-cased, order
+   and repeated headers are kept, and a wrongly shaped value is reported like
+   any other bad return (:class:`pygrindvakt.InternalError`). Report headers
+   whenever the underlying library exposes them: :class:`pygrindvakt.rp.JwksCache`
+   reads ``Cache-Control`` and ``Age`` from them, and without any it warns
+   and falls back to ``default_ttl``. ``body`` must be ``bytes`` (not
    ``bytearray`` or ``memoryview``). An exception raised by either method is
    logged through ``sys.unraisablehook`` and reported to the caller as
    :class:`pygrindvakt.InternalError`.
 
    .. py:method:: get(url: str) -> tuple[int, bytes, str | None]
 
-      Issue a GET and return ``(status, body, content_type)``.
+      Issue a GET and return ``(status, body, content_type)``. Optionally
+      also ``get(url, headers=...)`` or ``get_with_headers(url, headers)``;
+      see *Request headers on GET* above.
 
    .. py:method:: post_form(url: str, form: list[tuple[str, str]], headers: list[tuple[str, str]]) -> tuple[int, bytes, str | None]
 
@@ -191,8 +235,7 @@ Outbound HTTP client protocol
       request ``headers`` (for example ``Authorization`` for
       ``client_secret_basic``) and return ``(status, body, content_type)``.
       ``form`` may be empty: :func:`pygrindvakt.rp.fetch_userinfo` sends the
-      bearer token this way because the protocol has no per-request headers
-      on ``get``.
+      bearer token this way by default (``method="POST"``).
 
    The implementation runs on the thread that is driving the pygrindvakt
    call, holding the GIL (so a client shared across threads must be
@@ -225,7 +268,7 @@ Outbound HTTP client protocol
 
       md = rp.discover(HttpxClient("/etc/ssl/private-ca.pem"), "https://op.example.com")
 
-.. py:class:: HttpFetchResponse(status: int, body: bytes, content_type: str | None = None)
+.. py:class:: HttpFetchResponse(status: int, body: bytes, content_type: str | None = None, headers: list[tuple[str, str]] | None = None)
 
    The result of an outbound fetch made through an ``HttpClient``. A Python
    client may return one of these instead of the tuple.
@@ -236,6 +279,11 @@ Outbound HTTP client protocol
       :type: bytes
    .. py:attribute:: content_type
       :type: str | None
+   .. py:attribute:: headers
+      :type: list[tuple[str, str]]
+
+      Read-only response ``(name, value)`` pairs; names are lower-cased,
+      order and repeats kept. Empty when none were given.
 
    .. py:method:: text() -> str
 
@@ -298,10 +346,13 @@ Built-in client
    :class:`HttpClientProtocol` itself, which makes it usable from your own
    code for fetches that need the same hardening.
 
-   .. py:method:: get(url: str) -> tuple[int, bytes, str | None]
+   .. py:method:: get(url: str, headers: list[tuple[str, str]] | None = None) -> tuple[int, bytes, str | None]
 
-      Issue a GET. Returns ``(status, body, content_type)``. A ``3xx`` comes
-      back as-is (not followed). Raises :class:`pygrindvakt.InternalError` on
+      Issue a GET, optionally with request ``headers`` as ``(name, value)``
+      pairs. Returns ``(status, body, content_type)``. A ``3xx`` comes
+      back as-is (not followed), so the headers are never forwarded to a
+      redirect target. An invalid header name or value raises
+      :class:`pygrindvakt.BadRequestError`. Raises :class:`pygrindvakt.InternalError` on
       connection failure or when the body exceeds ``max_response_bytes``.
 
    .. py:method:: post_form(url: str, form: list[tuple[str, str]], headers: list[tuple[str, str]] | None = None) -> tuple[int, bytes, str | None]

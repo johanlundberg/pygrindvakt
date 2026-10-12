@@ -163,8 +163,9 @@ then exchange the returned code and verify the id_token.
    tokens_ = rp.exchange_code(http_client, info, me, code, code_verifier=verifier)
    jwks = rp.fetch_jwks(http_client, info.jwks_uri, info.issuer)
    claims = rp.verify_id_token(jwks, tokens_.id_token, info.issuer, "demo", nonce, ["ES256"])
-   userinfo = rp.fetch_userinfo(http_client, info.userinfo_endpoint, tokens_.access_token,
-                                claims["sub"], info.issuer)
+   if info.userinfo_endpoint is not None:  # OPs may omit UserInfo
+       userinfo = rp.fetch_userinfo(http_client, info.userinfo_endpoint, tokens_.access_token,
+                                    claims["sub"], info.issuer)
 
 ``verify_id_token`` **requires** the expected nonce and an explicit signing
 algorithm allowlist. Passing ``None`` for the nonce raises

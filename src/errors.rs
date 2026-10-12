@@ -1,16 +1,21 @@
 //! Exception hierarchy for pygrindvakt.
 //!
 //! ```text
-//! GrindvaktError(Exception)            status_hint: int (class attribute)
+//! GrindvaktError(Exception)            status_hint: int, code: str (class attributes;
+//!                                      `code` is overridden per instance when known)
 //! ├── BadRequestError (400)            grindvakt::Error::BadRequest
-//! ├── AuthnError (401)                 grindvakt::Error::Authn
+//! ├── AuthnError (401)                 grindvakt::Error::Authn, and
+//! │                                    Error::UpstreamHttp from token/UserInfo
 //! ├── StateError (500)                 grindvakt::Error::State
 //! ├── ConfigError (500)                grindvakt::Error::Config
 //! ├── CryptoError (500)                grindvakt::Error::Crypto
 //! ├── AttributeMappingError (500)      grindvakt::Error::Attribute
 //! ├── JoseError (500)                  grindvakt::Error::Jose
+//! │   └── UnknownKeyError (401)        raised by rp.JwksCache (no upstream variant)
 //! ├── JsonError (500)                  grindvakt::Error::Json
-//! ├── InternalError (500)              grindvakt::Error::Internal
+//! ├── InternalError (500)              grindvakt::Error::Internal, and
+//! │                                    other Error::UpstreamHttp (JWKS, discovery,
+//! │                                    federation fetches)
 //! ├── NoBoundEndpointError (404)       grindvakt::Error::NoBoundEndpoint
 //! ├── UnknownModuleError (404)         grindvakt::Error::UnknownModule
 //! ├── OAuthError                       grindvakt::OAuthError (defined in Python,
@@ -90,6 +95,12 @@ create_exception!(
 );
 create_exception!(
     pygrindvakt,
+    UnknownKeyError,
+    JoseError,
+    "The token's `kid` names no key in the issuer's JWK Set, even after a refresh."
+);
+create_exception!(
+    pygrindvakt,
     JsonError,
     GrindvaktError,
     "JSON (de)serialization error."
@@ -144,9 +155,58 @@ create_exception!(
     "The replay store failed; the proof could not be evaluated."
 );
 
+/// Set the machine-readable `code` on a freshly built exception, overriding
+/// the class-level default.
+pub fn with_code(py: Python<'_>, e: PyErr, code: &str) -> PyErr {
+    // Setting an attribute on a plain exception instance cannot realistically
+    // fail; if it does the class-level default still applies.
+    let _ = e.value(py).setattr("code", code);
+    e
+}
+
+fn set_opt<T: for<'py> IntoPyObject<'py>>(py: Python<'_>, e: &PyErr, name: &str, v: Option<T>) {
+    if let Some(v) = v {
+        let _ = e.value(py).setattr(name, v);
+    }
+}
+
 /// Map a `grindvakt::Error` onto the typed exception hierarchy.
+///
+/// Every exception carries a `code` (class default, overridden per instance
+/// where a precise code is known). Upstream HTTP failures also expose the
+/// sanitized `upstream_*` attributes.
 pub fn err(e: RsError) -> PyErr {
     let msg = e.to_string();
+    // Upstream HTTP failures (token, UserInfo, JWKS, discovery, federation
+    // fetches) used to surface as `Authn` or `Internal`; keep that mapping.
+    if let RsError::UpstreamHttp(u) = &e {
+        let auth = e.is_auth_failure();
+        let exc = if auth {
+            AuthnError::new_err(msg)
+        } else {
+            InternalError::new_err(msg)
+        };
+        return Python::attach(|py| {
+            // Only token/UserInfo failures adopt the upstream OAuth code;
+            // metadata fetches (JWKS, discovery, federation) are `upstream_http`.
+            let code = match (&u.error, auth) {
+                (Some(c), true) => Some(c.clone()),
+                (_, false) => Some("upstream_http".to_string()),
+                (None, true) => None,
+            };
+            set_opt(py, &exc, "code", code);
+            set_opt(py, &exc, "upstream_status", u.status);
+            set_opt(py, &exc, "upstream_error", u.error.clone());
+            set_opt(
+                py,
+                &exc,
+                "upstream_error_description",
+                u.error_description.clone(),
+            );
+            set_opt(py, &exc, "upstream_body", u.body.clone());
+            exc
+        });
+    }
     match e {
         RsError::NoBoundEndpoint(_) => NoBoundEndpointError::new_err(msg),
         RsError::UnknownModule(_) => UnknownModuleError::new_err(msg),
@@ -158,7 +218,9 @@ pub fn err(e: RsError) -> PyErr {
         RsError::Attribute(_) => AttributeMappingError::new_err(msg),
         RsError::Jose(_) => JoseError::new_err(msg),
         RsError::Json(_) => JsonError::new_err(msg),
-        RsError::Internal(_) => InternalError::new_err(msg),
+        // `UpstreamHttp` is handled above; `Error` is `#[non_exhaustive]`, so
+        // any future variant maps to the generic internal error.
+        _ => InternalError::new_err(msg),
     }
 }
 
@@ -301,29 +363,43 @@ fn oauth_error_http_status(code: &str) -> PyResult<u16> {
 /// Register exception types (and the OAuthError helpers) on the top-level module.
 pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! add {
-        ($name:ident, $status:expr) => {{
+        ($name:ident, $status:expr, $code:expr) => {{
             let t = py.get_type::<$name>();
             t.setattr("status_hint", $status)?;
+            t.setattr("code", $code)?;
             m.add(stringify!($name), t)?;
         }};
     }
-    add!(GrindvaktError, 500u16);
-    add!(BadRequestError, 400u16);
-    add!(AuthnError, 401u16);
-    add!(StateError, 500u16);
-    add!(ConfigError, 500u16);
-    add!(CryptoError, 500u16);
-    add!(AttributeMappingError, 500u16);
-    add!(JoseError, 500u16);
-    add!(JsonError, 500u16);
-    add!(InternalError, 500u16);
-    add!(NoBoundEndpointError, 404u16);
-    add!(UnknownModuleError, 404u16);
-    add!(DpopError, 400u16);
-    add!(DpopInvalidError, 400u16);
-    add!(DpopReplayError, 400u16);
-    add!(DpopNonceRequiredError, 400u16);
-    add!(DpopServerError, 500u16);
+    add!(GrindvaktError, 500u16, "internal");
+    add!(BadRequestError, 400u16, "bad_request");
+    add!(AuthnError, 401u16, "authn");
+    add!(StateError, 500u16, "state");
+    add!(ConfigError, 500u16, "config");
+    add!(CryptoError, 500u16, "crypto");
+    add!(AttributeMappingError, 500u16, "attribute");
+    add!(JoseError, 500u16, "jose");
+    add!(UnknownKeyError, 401u16, "unknown_kid");
+    add!(JsonError, 500u16, "json");
+    add!(InternalError, 500u16, "internal");
+    add!(NoBoundEndpointError, 404u16, "no_bound_endpoint");
+    add!(UnknownModuleError, 404u16, "unknown_module");
+    add!(DpopError, 400u16, "dpop");
+    add!(DpopInvalidError, 400u16, "invalid_dpop_proof");
+    add!(DpopReplayError, 400u16, "dpop_replay");
+    add!(DpopNonceRequiredError, 400u16, "use_dpop_nonce");
+    add!(DpopServerError, 500u16, "dpop_server");
+
+    // Upstream HTTP details (sanitized by grindvakt); `None` unless the error
+    // came from an upstream response. Inherited by every subclass.
+    let base = py.get_type::<GrindvaktError>();
+    for name in [
+        "upstream_status",
+        "upstream_error",
+        "upstream_error_description",
+        "upstream_body",
+    ] {
+        base.setattr(name, py.None())?;
+    }
 
     m.add_function(wrap_pyfunction!(oauth_error_response, m)?)?;
     m.add_function(wrap_pyfunction!(oauth_error_redirect, m)?)?;

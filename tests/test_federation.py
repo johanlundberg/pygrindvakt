@@ -540,9 +540,9 @@ def test_resolve_tries_each_trust_anchor(fed):
 
 
 def test_resolve_response_non_200(fed):
-    """A non-200 from the resolve endpoint is an AuthnError naming the status."""
+    """A non-200 from the resolve endpoint is an InternalError naming the status."""
     http = FakeHttpClient({TA + WELL_KNOWN: (200, fed.ta_ec, "application/entity-statement+jwt")})
-    with pytest.raises(pygrindvakt.AuthnError, match="returned 404"):
+    with pytest.raises(pygrindvakt.InternalError, match="returned 404"):
         federation.resolve_via_trust_anchors(http, LEAF, fed.trust_anchors())
 
 

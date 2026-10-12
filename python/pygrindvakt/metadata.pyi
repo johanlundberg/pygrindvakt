@@ -9,16 +9,80 @@ class ProviderMetadata:
     ``ProviderMetadata(issuer, base)`` fills in the standard endpoints under
     ``base`` (``/authorization``, ``/token``, ``/userinfo``, ``/jwks``) and
     sensible defaults; every field is settable. Unknown / extension fields
-    live in ``extra``. Protocol-owned fields and unimplemented logout metadata
-    are rejected when supplied through ``extra``.
+    live in ``extra``. Protocol-owned fields are rejected when supplied through
+    ``extra``, and known OIDC extension members (``acr_values_supported``,
+    ``revocation_endpoint``, ``end_session_endpoint``, ...) must have their
+    documented JSON type (``ValueError`` otherwise). Their typed properties
+    return ``None`` when the member is absent (not an empty list / ``False``).
+    ``extra`` / ``set_extra_field`` / ``from_dict`` and the typed setters
+    type-check these members, and additionally validate URL-typed ones: the
+    five modelled fields (``authorization_endpoint``, ``token_endpoint``,
+    ``jwks_uri``, ``userinfo_endpoint``, ``registration_endpoint``; also in
+    the constructor, for the endpoints built from ``base``), every extension
+    ``*_endpoint`` and ``check_session_iframe``: absolute https URL (loopback
+    http for a loopback issuer), no userinfo, no fragment, no control
+    characters (``ValueError`` naming the member). Assigning ``issuer``
+    re-validates all of them against the new issuer (old issuer kept on
+    failure). The issuer itself must be a valid issuer URL (constructor,
+    ``from_dict`` and the ``issuer`` setter raise ``ValueError`` otherwise);
+    a constructor ``base`` whose derived endpoints are invalid raises
+    ``ValueError`` (``base "..." yields an invalid endpoint: ...``). An
+    empty-string ``userinfo_endpoint`` / ``registration_endpoint`` makes
+    ``from_dict`` raise; ``authorization_endpoint`` query parameters are not
+    checked. The host is NOT compared with the issuer here; an OP may
+    publish any https host, and ``base`` may be on another host. The RP-side decision is made by
+    ``rp.ProviderInfo``, which binds ``end_session_endpoint`` to the issuer's
+    origin unless ``allow_cross_origin_end_session=True``. The other URL
+    members (revocation, introspection, PAR, ``check_session_iframe``) are not
+    origin-checked anywhere.
+    ``service_documentation``, ``op_policy_uri`` and ``op_tos_uri`` are
+    type-checked only. ``Provider`` warns (``UserWarning``) when asked to
+    advertise logout/revocation/introspection/PAR/session members it does not
+    implement. ``end_session_endpoint`` is validated again, and origin-bound,
+    by ``rp.ProviderInfo`` and ``rp.end_session_url``. Documents from ``rp.discover`` are not type-checked:
+    a malformed known member makes the getter return ``None`` while ``raw`` /
+    ``to_dict()`` keep the original (and ``from_dict(to_dict())`` then raises
+    ``ValueError``).
     """
 
     def __init__(self, issuer: str, base: str | None = ...) -> None: ...
     @staticmethod
     def from_dict(d: dict[str, Any]) -> ProviderMetadata:
-        """Build from a discovery-document dict."""
-    def to_dict(self) -> dict[str, Any]:
-        """The discovery document as a dict."""
+        """Build from a discovery-document dict; the dict is kept as ``raw``."""
+    def to_dict(self, *, exclude_defaults: bool = False) -> dict[str, Any]:
+        """The discovery document as a dict.
+
+        With ``exclude_defaults=True``, members equal to their OIDC Discovery
+        / RFC 8414 / RFC 9126 default are omitted (not "omit falsy"):
+        ``None``, ``false`` for flags that default to false, ``true`` for
+        ``request_uri_parameter_supported`` (``false`` is kept), and ``[]``
+        for lists with no spec default. ``[]`` is kept for
+        ``response_modes_supported``, ``grant_types_supported``,
+        ``token_endpoint_auth_methods_supported``, ``claim_types_supported``
+        (non-empty defaults; ``[]`` means "none") and required lists.
+        Unknown extras are always kept. Limit: the full ``to_dict()`` emits
+        ``[]`` for absent modes/grant types/auth methods and required lists (upstream cannot
+        represent absence; needs ``Option<Vec<_>>``); ``exclude_defaults=True``
+        keeps them absent when ``raw`` shows the source lacked them and the
+        value is still ``[]``. Constructor-built metadata has no ``raw``.
+        """
+    @property
+    def raw(self) -> dict[str, Any] | None:
+        """Source document (``from_dict`` input or ``rp.discover`` response
+        body), or ``None`` if built with the constructor. A snapshot: setters
+        do not change it.
+
+        Unvalidated: for display / audit, NOT for reading policy. Known
+        extension members read from ``raw`` bypass the type checks of the
+        typed properties, so use those instead. A malformed member from
+        discovery reads back ``None`` from its typed getter, is re-emitted
+        verbatim by ``to_dict()``, and then makes ``from_dict()`` raise
+        (see ``test_discovered_malformed_known_extra_getter_none_roundtrip_raises``).
+        """
+    @property
+    def end_session_endpoint(self) -> str | None: ...
+    @end_session_endpoint.setter
+    def end_session_endpoint(self, value: str | None) -> None: ...
     @property
     def issuer(self) -> str: ...
     @issuer.setter
@@ -32,9 +96,9 @@ class ProviderMetadata:
     @token_endpoint.setter
     def token_endpoint(self, value: str) -> None: ...
     @property
-    def userinfo_endpoint(self) -> str: ...
+    def userinfo_endpoint(self) -> str | None: ...
     @userinfo_endpoint.setter
-    def userinfo_endpoint(self, value: str) -> None: ...
+    def userinfo_endpoint(self, value: str | None) -> None: ...
     @property
     def jwks_uri(self) -> str: ...
     @jwks_uri.setter
@@ -98,3 +162,99 @@ class ProviderMetadata:
     def extra(self, value: dict[str, Any]) -> None: ...
     def set_extra_field(self, key: str, value: Any) -> None:
         """Set one non-protocol extension field."""
+    @property
+    def acr_values_supported(self) -> list[str] | None: ...
+    @acr_values_supported.setter
+    def acr_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def claim_types_supported(self) -> list[str] | None: ...
+    @claim_types_supported.setter
+    def claim_types_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def display_values_supported(self) -> list[str] | None: ...
+    @display_values_supported.setter
+    def display_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def ui_locales_supported(self) -> list[str] | None: ...
+    @ui_locales_supported.setter
+    def ui_locales_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def claims_locales_supported(self) -> list[str] | None: ...
+    @claims_locales_supported.setter
+    def claims_locales_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def userinfo_signing_alg_values_supported(self) -> list[str] | None: ...
+    @userinfo_signing_alg_values_supported.setter
+    def userinfo_signing_alg_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def userinfo_encryption_alg_values_supported(self) -> list[str] | None: ...
+    @userinfo_encryption_alg_values_supported.setter
+    def userinfo_encryption_alg_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def userinfo_encryption_enc_values_supported(self) -> list[str] | None: ...
+    @userinfo_encryption_enc_values_supported.setter
+    def userinfo_encryption_enc_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def id_token_encryption_alg_values_supported(self) -> list[str] | None: ...
+    @id_token_encryption_alg_values_supported.setter
+    def id_token_encryption_alg_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def id_token_encryption_enc_values_supported(self) -> list[str] | None: ...
+    @id_token_encryption_enc_values_supported.setter
+    def id_token_encryption_enc_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def request_object_signing_alg_values_supported(self) -> list[str] | None: ...
+    @request_object_signing_alg_values_supported.setter
+    def request_object_signing_alg_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def token_endpoint_auth_signing_alg_values_supported(self) -> list[str] | None: ...
+    @token_endpoint_auth_signing_alg_values_supported.setter
+    def token_endpoint_auth_signing_alg_values_supported(self, value: list[str] | None) -> None: ...
+    @property
+    def request_uri_parameter_supported(self) -> bool | None: ...
+    @request_uri_parameter_supported.setter
+    def request_uri_parameter_supported(self, value: bool | None) -> None: ...
+    @property
+    def require_request_uri_registration(self) -> bool | None: ...
+    @require_request_uri_registration.setter
+    def require_request_uri_registration(self, value: bool | None) -> None: ...
+    @property
+    def require_pushed_authorization_requests(self) -> bool | None: ...
+    @require_pushed_authorization_requests.setter
+    def require_pushed_authorization_requests(self, value: bool | None) -> None: ...
+    @property
+    def frontchannel_logout_supported(self) -> bool | None: ...
+    @frontchannel_logout_supported.setter
+    def frontchannel_logout_supported(self, value: bool | None) -> None: ...
+    @property
+    def backchannel_logout_supported(self) -> bool | None: ...
+    @backchannel_logout_supported.setter
+    def backchannel_logout_supported(self, value: bool | None) -> None: ...
+    @property
+    def revocation_endpoint(self) -> str | None: ...
+    @revocation_endpoint.setter
+    def revocation_endpoint(self, value: str | None) -> None: ...
+    @property
+    def introspection_endpoint(self) -> str | None: ...
+    @introspection_endpoint.setter
+    def introspection_endpoint(self, value: str | None) -> None: ...
+    @property
+    def pushed_authorization_request_endpoint(self) -> str | None: ...
+    @pushed_authorization_request_endpoint.setter
+    def pushed_authorization_request_endpoint(self, value: str | None) -> None: ...
+    @property
+    def check_session_iframe(self) -> str | None: ...
+    @check_session_iframe.setter
+    def check_session_iframe(self, value: str | None) -> None: ...
+    @property
+    def service_documentation(self) -> str | None: ...
+    @service_documentation.setter
+    def service_documentation(self, value: str | None) -> None: ...
+    @property
+    def op_policy_uri(self) -> str | None: ...
+    @op_policy_uri.setter
+    def op_policy_uri(self, value: str | None) -> None: ...
+    @property
+    def op_tos_uri(self) -> str | None: ...
+    @op_tos_uri.setter
+    def op_tos_uri(self, value: str | None) -> None: ...

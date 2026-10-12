@@ -3,8 +3,18 @@ types, the outbound ``HttpClient`` protocol, and the built-in reqwest client.
 
 SECURITY: an injected ``HttpClientProtocol`` implementation is responsible for
 timeouts, for *not* following redirects (a 307/308 would re-send token-endpoint
-form bodies cross-origin), and for bounding response sizes. The built-in
-``ReqwestClient`` does all three.
+form bodies and Bearer tokens cross-origin), and for bounding response sizes.
+The built-in ``ReqwestClient`` never follows redirects (for any request type)
+and does all three.
+
+Request headers on GET (needed by ``rp.fetch_userinfo(method="GET")``) are
+optional. Whether an injected client supports them is decided once, when the
+client is first used: it does if its ``get`` accepts a ``headers`` parameter
+passable by keyword (positional-only and ``*headers`` do not count; a ``**kwargs`` parameter also counts) or it has a callable
+``get_with_headers(url, headers)`` (preferred when present). pygrindvakt never
+calls ``get`` and falls back on ``TypeError``. A client without support raises
+``ConfigError`` only when a GET with headers is requested. See
+``HttpClientWithHeadersProtocol``.
 
 NAME SHADOWING: ``from pygrindvakt import http`` rebinds the name ``http`` in
 the importing module and shadows the standard-library ``http`` package there
@@ -20,18 +30,36 @@ thread-safe itself.
 from typing import Any, Protocol
 
 # Stub-only aliases (underscore-prefixed so they are not expected at runtime).
-# What a client method may return: the ``(status, body, content_type)`` tuple or
-# an ``HttpFetchResponse`` (see ``extract_fetch`` in ``src/http.rs``).
-_FetchResult = tuple[int, bytes, str | None] | HttpFetchResponse
+# What a client method may return: the ``(status, body, content_type)`` tuple,
+# the same with an optional 4th ``headers`` element (response ``(name, value)``
+# pairs), or an ``HttpFetchResponse`` (see ``extract_fetch`` in
+# ``src/http.rs``). Report headers if you can: ``rp.JwksCache`` needs
+# ``Cache-Control`` / ``Age`` to honour the OP's cache lifetime.
+_FetchResult = (
+    tuple[int, bytes, str | None]
+    | tuple[int, bytes, str | None, list[tuple[str, str]] | None]
+    | HttpFetchResponse
+)
 # What every networked function accepts as ``http``: any protocol client, the
 # built-in ``ReqwestClient``, or ``None`` for the process-wide default client.
 _HttpArg = HttpClientProtocol | ReqwestClient | None
+# What a networked function accepts as ``http`` when it sends request headers on
+# GET (``rp.fetch_userinfo(method="GET")``).
+_HttpHeadersArg = (
+    HttpClientWithHeadersProtocol
+    | HttpClientGetWithHeadersProtocol
+    | ReqwestClient
+    | None
+)
 
 class HttpClientProtocol(Protocol):
     """Outbound HTTP client protocol accepted wherever ``http=`` is taken.
 
     Either method may return an ``HttpFetchResponse`` or the
-    ``(status, body, content_type)`` tuple. Exceptions are logged via
+    ``(status, body, content_type[, headers])`` tuple, where ``headers`` is a
+    list of response ``(name, value)`` pairs (names are lower-cased, order and
+    repeats kept). Return them when you can: without response headers
+    ``rp.JwksCache`` cannot see ``Cache-Control`` and warns. Exceptions are logged via
     ``sys.unraisablehook`` and reported as ``InternalError``.
 
     The implementation runs on the thread driving the pygrindvakt call, holding
@@ -46,6 +74,33 @@ class HttpClientProtocol(Protocol):
         url: str,
         form: list[tuple[str, str]],
         headers: list[tuple[str, str]],
+    ) -> _FetchResult: ...
+
+class HttpClientWithHeadersProtocol(HttpClientProtocol, Protocol):
+    """An ``HttpClientProtocol`` whose ``get`` also accepts request headers.
+
+    Stub-only. Needed for ``rp.fetch_userinfo(method="GET")``. A client may
+    instead provide ``get_with_headers(url, headers)``; if present it is
+    preferred. The client must not follow redirects, or must strip
+    ``Authorization`` on a cross-origin redirect: the headers carry the access
+    token.
+    """
+
+    def get(
+        self, url: str, headers: list[tuple[str, str]] | None = None
+    ) -> _FetchResult: ...
+
+class HttpClientGetWithHeadersProtocol(HttpClientProtocol, Protocol):
+    """An ``HttpClientProtocol`` that also provides
+    ``get_with_headers(url, headers)``.
+
+    Stub-only. The alternative to ``HttpClientWithHeadersProtocol`` for
+    clients whose ``get`` takes no ``headers``; preferred over ``get`` at
+    runtime when present.
+    """
+
+    def get_with_headers(
+        self, url: str, headers: list[tuple[str, str]]
     ) -> _FetchResult: ...
 
 class HttpRequestData:
@@ -159,7 +214,16 @@ class Response:
 class HttpFetchResponse:
     """The result of an outbound fetch made through an ``HttpClient``."""
 
-    def __init__(self, status: int, body: bytes, content_type: str | None = ...) -> None: ...
+    def __init__(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str | None = ...,
+        headers: list[tuple[str, str]] | None = ...,
+    ) -> None: ...
+    @property
+    def headers(self) -> list[tuple[str, str]]:
+        """Response ``(name, value)`` pairs, names lower-cased; empty if none."""
     @property
     def status(self) -> int: ...
     @property
@@ -200,8 +264,15 @@ class ReqwestClient:
         max_response_bytes: int = ...,
         user_agent: str | None = ...,
     ) -> None: ...
-    def get(self, url: str) -> tuple[int, bytes, str | None]:
-        """Issue a GET. Returns ``(status, body, content_type)``."""
+    def get(
+        self, url: str, headers: list[tuple[str, str]] | None = ...
+    ) -> tuple[int, bytes, str | None]:
+        """Issue a GET, optionally with request headers.
+
+        Returns ``(status, body, content_type)``. Redirects are never followed,
+        so the headers are only sent to ``url``. An invalid header name or
+        value raises ``BadRequestError``.
+        """
     def post_form(
         self,
         url: str,

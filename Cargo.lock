@@ -403,10 +403,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "cryptoki"
-version = "0.12.0"
+name = "crypto-primes"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff765b99fc49f3116c9a908484486a2b92fd73c48da45c3a69716471c6cc56c6"
+checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
+dependencies = [
+ "crypto-bigint 0.7.5",
+ "rand_core 0.10.1",
+]
+
+[[package]]
+name = "cryptoki"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "625cf4599c43d69a16996ce2573fc80745a0b0300c962f0bfa11d55b6cab2b2d"
 dependencies = [
  "bitflags",
  "cryptoki-sys",
@@ -836,9 +846,9 @@ dependencies = [
 
 [[package]]
 name = "grindvakt"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "336502ec66978f1bf6a5d16254fd9e466f8fd11f44d6251ed14c876c81431aa2"
+checksum = "2445878fda4db9b6c30a5737435ab8b9e53d228ee59d2851ebf5c1b883a6adda"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1176,9 +1186,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jose-rs"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84acd32fa382a62530a4720e372bd8e900ebff818bd9bc340e9810622411c2f6"
+checksum = "aa2e8bb1c0eeea62f749906ef26c3bc1620a7ff46231f3803fd9e19043df34c8"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -1246,15 +1256,16 @@ dependencies = [
 
 [[package]]
 name = "kryptering"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35eb0c42bd90483295061d56a4fbfaeb2dfe817e3e98b3244039cc13ed1fbd15"
+checksum = "246fc275192d5342930279ed2070daf15204ca2e6158e91daaa3eaff78a5477d"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
  "aes-kw",
  "cbc 0.2.1",
  "crypto-bigint 0.7.5",
+ "crypto-primes",
  "cryptoki",
  "des",
  "digest 0.10.7",
@@ -1378,6 +1389,7 @@ dependencies = [
  "pkcs8 0.11.0",
  "shake",
  "signature 3.0.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -1672,6 +1684,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2268,6 +2281,7 @@ dependencies = [
  "signature 3.0.0",
  "typenum",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]

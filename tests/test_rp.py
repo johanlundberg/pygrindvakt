@@ -17,6 +17,9 @@ import pytest
 
 from pygrindvakt import (
     AuthnError,
+    BadRequestError,
+    ConfigError,
+    CryptoError,
     GrindvaktError,
     InternalError,
     OAuthError,
@@ -59,6 +62,7 @@ def in_thread(fn, *args, **kwargs):
     if "error" in box:
         raise box["error"]
     return box["value"]
+ALT_REDIRECT_URI = "https://rp.example.com/alt-cb"
 
 
 class FakeHttpClient:
@@ -67,6 +71,7 @@ class FakeHttpClient:
     def __init__(self, op):
         self.op = op
         self.calls: list[tuple[str, str]] = []
+        self.forms: list[list[tuple[str, str]]] = []
 
     @staticmethod
     def _json(value, status=200):
@@ -87,6 +92,7 @@ class FakeHttpClient:
 
     def post_form(self, url, form, headers):
         self.calls.append(("POST", url))
+        self.forms.append(list(form))
         hdrs = {k.lower(): v for k, v in headers}
         if url == f"{ISSUER}/token":
             try:
@@ -129,7 +135,7 @@ def op_key():
 @pytest.fixture
 def op(op_key):
     md = metadata.ProviderMetadata(ISSUER)
-    c = client.Client(CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uris=[REDIRECT_URI])
+    c = client.Client(CLIENT_ID, client_secret=CLIENT_SECRET, redirect_uris=[REDIRECT_URI, ALT_REDIRECT_URI])
     return provider.Provider(
         md, op_key, client.InMemoryClientStore([c]), tokens.TokenCodec("op-secret"),
         token_use_store=provider.InMemoryTokenUseStore(),
@@ -148,7 +154,9 @@ def prov(http):
 
 @pytest.fixture
 def rpc():
-    return rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET)
+    return rp.RpClient(
+        CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET, redirect_uris=[ALT_REDIRECT_URI]
+    )
 
 
 @pytest.fixture
@@ -413,6 +421,201 @@ def test_authorization_url_rejects_reserved_and_ambiguous_extras(prov, rpc):
     assert len(parse_qs(urlsplit(url).query)["resource"]) == 2
 
 
+# --- redirect_uri override ----------------------------------------------------------
+
+
+def test_redirect_uri_override_in_authorization_url_and_jar(prov, rpc, rp_key):
+    url = rp.authorization_url(prov, rpc, "st", "n", redirect_uri=ALT_REDIRECT_URI)
+    assert parse_qs(urlsplit(url).query)["redirect_uri"] == [ALT_REDIRECT_URI]
+    assert rpc.redirect_uri == REDIRECT_URI  # the client itself is unchanged
+    jar = rp.signed_request_object(prov, rpc, rp_key, "st", "n", redirect_uri=ALT_REDIRECT_URI)
+    import base64
+
+    claims = json.loads(base64.urlsafe_b64decode(jar.split(".")[1] + "=="))
+    assert claims["redirect_uri"] == ALT_REDIRECT_URI
+
+
+def test_redirect_uri_override_reaches_token_request(op, http, prov, rpc):
+    state, nonce, verifier = util.random_token(), util.random_token(), util.random_token(48)
+    url = rp.authorization_url(
+        prov, rpc, state, nonce, pkce.s256_challenge(verifier), redirect_uri=ALT_REDIRECT_URI
+    )
+    req = request.AuthorizationRequest.from_params(
+        [(k, v[0]) for k, v in parse_qs(urlsplit(url).query).items()]
+    )
+    op.validate_authorization_request(req)
+    resp = op.authorization_redirect(req, "alice", {"email": ["a@b"]})
+    code = parse_qs(urlsplit(resp.header("location")).query)["code"][0]
+    ts = rp.exchange_code(http, prov, rpc, code, verifier, redirect_uri=ALT_REDIRECT_URI)
+    assert ts.id_token
+    assert ("redirect_uri", ALT_REDIRECT_URI) in http.forms[-1]
+    assert ("redirect_uri", REDIRECT_URI) not in http.forms[-1]
+
+
+def _all_overrides(prov, client, rp_key, uri):
+    """Run every per-call override entry point; yield one callable each."""
+    return [
+        lambda: rp.authorization_url(prov, client, "st", "n", redirect_uri=uri),
+        lambda: rp.signed_request_object(prov, client, rp_key, "st", "n", redirect_uri=uri),
+        lambda: rp.begin(prov, client, redirect_uri=uri),
+        lambda: rp.exchange_code(RaisingHttpClient(), prov, client, "code", "v" * 43, redirect_uri=uri),
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://evil.example/steal",
+        "http://evil.example/cb",
+        REDIRECT_URI + "/",
+        REDIRECT_URI.upper(),
+        ALT_REDIRECT_URI + "/",
+        ALT_REDIRECT_URI + "?x=1",
+        ALT_REDIRECT_URI.replace("rp.example.com", "rp.example.com:8443"),
+        ALT_REDIRECT_URI.replace("https://rp", "https://RP"),
+    ],
+)
+def test_unregistered_redirect_uri_override_rejected(prov, rpc, rp_key, bad):
+    for call in _all_overrides(prov, rpc, rp_key, bad):
+        with pytest.raises(BadRequestError, match="redirect_uris"):
+            call()
+
+
+def test_unregistered_override_error_names_escape_hatch(prov, rpc):
+    with pytest.raises(BadRequestError, match="allow_unregistered_redirect_uri"):
+        rp.authorization_url(prov, rpc, "st", "n", redirect_uri="https://evil.example/steal")
+
+
+def test_configured_redirect_uri_override_is_noop(prov, rpc, rp_key):
+    plain = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET)
+    url = rp.authorization_url(prov, plain, "st", "n", redirect_uri=REDIRECT_URI)
+    assert parse_qs(urlsplit(url).query)["redirect_uri"] == [REDIRECT_URI]
+    rp.signed_request_object(prov, plain, rp_key, "st", "n", redirect_uri=REDIRECT_URI)
+    rp.begin(prov, plain, redirect_uri=REDIRECT_URI)
+
+
+def test_redirect_uris_properties_and_repr():
+    c = rp.RpClient("c", REDIRECT_URI, redirect_uris=[ALT_REDIRECT_URI])
+    assert c.redirect_uris == (ALT_REDIRECT_URI,)
+    assert c.allow_unregistered_redirect_uri is False
+    assert "redirect_uris=" in repr(c)
+    d = rp.RpClient("c", REDIRECT_URI, allow_unregistered_redirect_uri=True)
+    assert d.redirect_uris == ()
+    assert d.allow_unregistered_redirect_uri is True
+    assert "allow_unregistered_redirect_uri=True" in repr(d)
+
+
+def test_allow_unregistered_redirect_uri_accepts_valid_https(prov, rp_key):
+    c = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET,
+                    allow_unregistered_redirect_uri=True)
+    uri = "https://other.example/dyn"
+    url = rp.authorization_url(prov, c, "st", "n", redirect_uri=uri)
+    assert parse_qs(urlsplit(url).query)["redirect_uri"] == [uri]
+    rp.signed_request_object(prov, c, rp_key, "st", "n", redirect_uri=uri)
+    rp.begin(prov, c, redirect_uri=uri)
+    for bad in ("https://other.example/dyn#frag", "http://other.example/cb", "/relative", ""):
+        for call in _all_overrides(prov, c, rp_key, bad):
+            with pytest.raises(BadRequestError):
+                call()
+    url = rp.authorization_url(prov, c, "st", "n", redirect_uri="http://127.0.0.1:8080/cb")
+    assert "127.0.0.1" in url
+
+
+def test_loopback_http_registered_override_accepted(prov):
+    c = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET,
+                    redirect_uris=["http://localhost:8080/cb", "http://[::1]:9/cb",
+                                   "com.example.app:/oauth2redirect"])
+    for uri in c.redirect_uris:
+        url = rp.authorization_url(prov, c, "st", "n", redirect_uri=uri)
+        assert parse_qs(urlsplit(url).query)["redirect_uri"] == [uri]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["https://rp.example.com/cb#frag", "/relative", "", "http://rp.example.com/cb",
+     "http://10.0.0.1/cb"],
+)
+def test_redirect_uris_validated_at_construction(bad):
+    with pytest.raises(GrindvaktError):
+        rp.RpClient(CLIENT_ID, REDIRECT_URI, redirect_uris=[bad])
+
+
+@pytest.mark.parametrize("bad", ["https://rp.example.com/cb#frag", "/relative", ""])
+def test_redirect_uri_override_rejected(prov, rpc, rp_key, bad):
+    with pytest.raises(BadRequestError):
+        rp.authorization_url(prov, rpc, "st", "n", redirect_uri=bad)
+    with pytest.raises(BadRequestError):
+        rp.signed_request_object(prov, rpc, rp_key, "st", "n", redirect_uri=bad)
+    with pytest.raises(BadRequestError):
+        rp.exchange_code(RaisingHttpClient(), prov, rpc, "code", "v" * 43, redirect_uri=bad)
+    with pytest.raises(BadRequestError):
+        rp.begin(prov, rpc, redirect_uri=bad)
+
+
+# --- begin ----------------------------------------------------------------------------
+
+
+def test_begin_returns_url_state_nonce_verifier(prov, rpc):
+    url, state, nonce, verifier = rp.begin(prov, rpc)
+    q = parse_qs(urlsplit(url).query)
+    assert q["state"] == [state]
+    assert q["nonce"] == [nonce]
+    assert q["code_challenge_method"] == ["S256"]
+    assert q["code_challenge"] == [pkce.s256_challenge(verifier)]
+    assert pkce.verify(verifier, q["code_challenge"][0], "S256")
+    assert len(verifier) == 64
+    assert len(state) == len(nonce) == 43
+
+
+def test_begin_values_are_fresh(prov, rpc):
+    a = rp.begin(prov, rpc)
+    b = rp.begin(prov, rpc)
+    for i in (1, 2, 3):
+        assert a[i] != b[i]
+
+
+def test_begin_extra_and_override(prov, rpc):
+    url, *_ = rp.begin(prov, rpc, extra={"prompt": "login"}, redirect_uri=ALT_REDIRECT_URI)
+    q = parse_qs(urlsplit(url).query)
+    assert q["prompt"] == ["login"]
+    assert q["redirect_uri"] == [ALT_REDIRECT_URI]
+
+
+def test_begin_pkce_false(prov, rpc):
+    url, _, _, verifier = rp.begin(prov, rpc, pkce=False)
+    assert verifier is None
+    assert "code_challenge" not in parse_qs(urlsplit(url).query)
+
+
+def test_begin_pkce_false_refused_for_public_client(prov):
+    public = rp.RpClient("public", REDIRECT_URI, auth_method="none")
+    with pytest.raises(BadRequestError, match="PKCE"):
+        rp.begin(prov, public, pkce=False)
+    url, *_ = rp.begin(prov, public)
+    assert "code_challenge" in parse_qs(urlsplit(url).query)
+
+
+def test_begin_with_request_object(prov, rpc, rp_key):
+    url, *_ = rp.begin(prov, rpc, request_object_key=rp_key)
+    q = parse_qs(urlsplit(url).query)
+    assert q["request"][0].count(".") == 2
+
+
+def test_begin_then_exchange_code_flow(op, http, prov, rpc):
+    url, state, nonce, verifier = rp.begin(prov, rpc)
+    req = request.AuthorizationRequest.from_params(
+        [(k, v[0]) for k, v in parse_qs(urlsplit(url).query).items()]
+    )
+    op.validate_authorization_request(req)
+    resp = op.authorization_redirect(req, "alice", {"email": ["a@b"]})
+    q = parse_qs(urlsplit(resp.header("location")).query)
+    assert q["state"] == [state]
+    ts = rp.exchange_code(http, prov, rpc, q["code"][0], verifier)
+    jwks = rp.fetch_jwks(http, prov.jwks_uri, prov.issuer)
+    claims = rp.verify_id_token(jwks, ts.id_token, ISSUER, CLIENT_ID, nonce, ["ES256"])
+    assert claims["sub"] == "alice"
+
+
 # --- full code flow -----------------------------------------------------------------
 
 
@@ -468,8 +671,10 @@ def test_exchange_code_method_mismatch_is_refused(op, http, prov):
     rpc = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret=CLIENT_SECRET, auth_method="client_secret_post")
     verifier = util.random_token(48)
     code = run_authorization(op, prov, rpc, "st", "n", verifier)
-    with pytest.raises(AuthnError, match="invalid_client"):
+    with pytest.raises(AuthnError, match="token endpoint returned 401") as ei:
         rp.exchange_code(http, prov, rpc, code, verifier)
+    assert ei.value.code == "invalid_client"
+    assert ei.value.upstream_status == 401
 
 
 def test_exchange_code_wrong_secret_raises_authn(op, http, prov):
@@ -722,3 +927,799 @@ def test_claims_to_attributes_shape():
     )
     assert out == {"a": ["x"], "b": ["y", "z"], "n": ["3"], "t": ["true"]}
     assert rp.claims_to_attributes({}) == {}
+
+
+# --- userinfo: GET, signed JWT, endpoint policy --------------------------------
+
+UI_URL = f"{ISSUER}/userinfo"
+
+
+class UserinfoRecorder:
+    """Python client with header support on ``get``; records every request."""
+
+    def __init__(self, status=200, body=b'{"sub":"alice","name":"A"}', ctype="application/json"):
+        self.calls = []
+        self.resp = (status, body, ctype)
+
+    def get(self, url, headers=None):
+        self.calls.append(("GET", url, headers))
+        return self.resp
+
+    def post_form(self, url, form, headers):
+        self.calls.append(("POST", url, form, headers))
+        return self.resp
+
+
+def ui(http, **kw):
+    return rp.fetch_userinfo(http, UI_URL, "tok", "alice", ISSUER, **kw)
+
+
+def test_userinfo_post_default_unchanged():
+    c = UserinfoRecorder()
+    assert ui(c)["name"] == "A"
+    assert c.calls == [("POST", UI_URL, [], [("authorization", "Bearer tok")])]
+
+
+def test_userinfo_get_sends_authorization_header():
+    c = UserinfoRecorder()
+    assert ui(c, method="GET")["sub"] == "alice"
+    assert c.calls == [("GET", UI_URL, [("authorization", "Bearer tok")])]
+
+
+def test_userinfo_get_with_get_with_headers_preferred():
+    class Both(UserinfoRecorder):
+        def get_with_headers(self, url, headers):
+            self.calls.append(("GWH", url, headers))
+            return self.resp
+
+    c = Both()
+    ui(c, method="GET")
+    assert c.calls == [("GWH", UI_URL, [("authorization", "Bearer tok")])]
+
+
+def test_userinfo_get_with_kwargs_get():
+    class Kw:
+        def get(self, url, **kwargs):
+            self.kw = kwargs
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    c = Kw()
+    ui(c, method="GET")
+    assert c.kw == {"headers": [("authorization", "Bearer tok")]}
+
+
+def test_userinfo_get_client_without_header_support_is_config_error():
+    from pygrindvakt import ConfigError
+
+    class Plain:
+        called = False
+
+        def get(self, url):
+            Plain.called = True
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, url, form, headers):
+            return 200, b'{"sub":"alice"}', "application/json"
+
+    with pytest.raises(ConfigError, match="request headers"):
+        ui(Plain(), method="GET")
+    assert not Plain.called  # decided up front, never call-and-fall-back
+    assert ui(Plain())["sub"] == "alice"  # POST still fine
+
+
+def test_userinfo_get_positional_only_or_var_positional_headers_is_unsupported():
+    """`headers` must be passable by keyword; the adapter calls get(url, headers=...)."""
+    from pygrindvakt import ConfigError
+
+    class PosOnly:
+        called = False
+
+        def get(self, url, headers=None, /):
+            PosOnly.called = True
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    class VarPos:
+        called = False
+
+        def get(self, url, *headers):
+            VarPos.called = True
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    for cls in (PosOnly, VarPos):
+        with pytest.raises(ConfigError, match="request headers"):
+            ui(cls(), method="GET")
+        assert not cls.called
+
+
+def test_userinfo_get_keyword_only_and_var_keyword_named_headers_are_supported():
+    class KwOnly:
+        def get(self, url, *, headers=None):
+            self.h = headers
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    class VarKwHeaders:
+        def get(self, url, **headers):
+            self.h = headers
+            return 200, b'{"sub":"alice"}', "application/json"
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    for cls in (KwOnly, VarKwHeaders):
+        c = cls()
+        ui(c, method="GET")
+        h = c.h["headers"] if cls is VarKwHeaders else c.h
+        assert h == [("authorization", "Bearer tok")]
+
+
+def test_userinfo_get_typeerror_inside_client_is_not_swallowed():
+    class Boom:
+        def get(self, url, headers=None):
+            raise TypeError("inside client")
+
+        def post_form(self, *a):
+            raise AssertionError
+
+    with pytest.raises(InternalError) as e:
+        ui(Boom(), method="GET")
+    assert e.value.code == "transport"
+
+
+def test_userinfo_invalid_method_and_trust_values():
+    c = UserinfoRecorder()
+    with pytest.raises(ValueError, match="method"):
+        ui(c, method="PUT")
+    with pytest.raises(ValueError, match="trust"):
+        ui(c, trust="bogus")
+    with pytest.raises(ValueError, match="requires typ"):
+        ui(c, trust="typed")
+    with pytest.raises(ValueError, match="only used"):
+        ui(c, trust="dedicated_keys", typ="userinfo+jwt")
+
+
+def test_userinfo_endpoint_none_is_config_error():
+    from pygrindvakt import ConfigError
+
+    with pytest.raises(ConfigError, match="does not advertise a userinfo_endpoint"):
+        rp.fetch_userinfo(UserinfoRecorder(), None, "tok", "alice", ISSUER)
+
+
+def test_userinfo_get_real_server_sends_authorization():
+    import http.server as hs
+
+    seen = []
+
+    class H(hs.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"sub":"alice"}')
+
+    srv = hs.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    try:
+        out = rp.fetch_userinfo(None, f"{base}/userinfo", "tok", "alice", base, method="GET")
+        assert out == {"sub": "alice"} and seen == ["Bearer tok"]
+    finally:
+        srv.shutdown()
+
+
+def _jwt_claims(**over):
+    now = int(time.time())
+    claims = {"iss": ISSUER, "sub": "alice", "aud": CLIENT_ID, "iat": now, "name": "A"}
+    claims.update(over)
+    return {k: v for k, v in claims.items() if v is not None}
+
+
+def _signed(op_key, claims, typ=None):
+    return UserinfoRecorder(body=jwt.sign(op_key, claims, typ).encode(), ctype="application/jwt")
+
+
+def _verify(c, op_key, trust="dedicated_keys", typ=None, **kw):
+    return ui(c, jwks=op_key.to_public_jwks(), client_id=CLIENT_ID, allowed_algorithms=["ES256"],
+              trust=trust, typ=typ, **kw)
+
+
+def test_userinfo_signed_jwt_accepted_per_trust_mode(op_key):
+    claims = _jwt_claims()
+    for method in ("POST", "GET"):
+        out = _verify(_signed(op_key, claims), op_key, "dedicated_keys", method=method)
+        assert out["name"] == "A" and out["sub"] == "alice"
+    assert _verify(_signed(op_key, claims), op_key, "untyped_shared_key_compat")["sub"] == "alice"
+    typed = _signed(op_key, claims, "userinfo+jwt")
+    assert _verify(typed, op_key, "typed", "userinfo+jwt")["sub"] == "alice"
+
+
+def test_userinfo_typed_rejects_wrong_or_missing_typ(op_key):
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims(), "other+jwt"), op_key, "typed", "userinfo+jwt")
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims()), op_key, "typed", "userinfo+jwt")
+    # typ must identify UserInfo specifically
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims(), "JWT"), op_key, "typed", "JWT")
+
+
+@pytest.mark.parametrize("missing", ["jwks", "client_id", "allowed_algorithms", "trust"])
+def test_userinfo_signed_jwt_fails_closed_without_verification_inputs(op_key, missing):
+    kw = dict(jwks=op_key.to_public_jwks(), client_id=CLIENT_ID,
+              allowed_algorithms=["ES256"], trust="dedicated_keys")
+    del kw[missing]
+    with pytest.raises(AuthnError) as e:
+        ui(_signed(op_key, _jwt_claims()), **kw)
+    assert e.value.code == "userinfo_unverifiable"
+    assert missing in str(e.value)
+    # an empty algorithm list is also unverifiable
+    if missing == "allowed_algorithms":
+        with pytest.raises(AuthnError) as e:
+            ui(_signed(op_key, _jwt_claims()), allowed_algorithms=[], jwks=kw["jwks"],
+               client_id=CLIENT_ID, trust="dedicated_keys")
+        assert e.value.code == "userinfo_unverifiable"
+
+
+def test_userinfo_signed_jwt_rejections(op_key):
+    other = keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid="op-1")
+    cases = {
+        "bad signature": _signed(other, _jwt_claims()),
+        "wrong iss": _signed(op_key, _jwt_claims(iss="https://evil.example")),
+        "wrong aud": _signed(op_key, _jwt_claims(aud="someone-else")),
+        "multi aud": _signed(op_key, _jwt_claims(aud=[CLIENT_ID, "api"])),
+        "sub mismatch": _signed(op_key, _jwt_claims(sub="mallory")),
+        "expired": _signed(op_key, _jwt_claims(exp=int(time.time()) - 3600)),
+        "stale iat": _signed(op_key, _jwt_claims(iat=int(time.time()) - 3600)),
+        "no iat": _signed(op_key, _jwt_claims(iat=None)),
+        "nonce": _signed(op_key, _jwt_claims(nonce="n")),
+        "at_hash": _signed(op_key, _jwt_claims(at_hash="h")),
+        "c_hash": _signed(op_key, _jwt_claims(c_hash="h")),
+        "id_token typ": _signed(op_key, _jwt_claims(), "id_token+jwt"),
+    }
+    for name, c in cases.items():
+        with pytest.raises(GrindvaktError):
+            _verify(c, op_key, "untyped_shared_key_compat")
+            pytest.fail(f"{name} was accepted")
+    # require_exp: a token without exp is refused only when asked
+    assert _verify(_signed(op_key, _jwt_claims()), op_key)["sub"] == "alice"
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, _jwt_claims()), op_key, require_exp=True)
+    ok_exp = _jwt_claims(exp=int(time.time()) + 300)
+    assert _verify(_signed(op_key, ok_exp), op_key, require_exp=True)["sub"] == "alice"
+
+
+def test_userinfo_wrong_content_type_for_signed_body_is_not_trusted(op_key):
+    """A JWT served as JSON is not accepted as claims (no sub in the body)."""
+    body = jwt.sign(op_key, _jwt_claims()).encode()
+    with pytest.raises(GrindvaktError):
+        ui(UserinfoRecorder(body=body, ctype="application/json"))
+
+
+def test_userinfo_max_age_default_and_disabled(op_key):
+    old = _jwt_claims(iat=int(time.time()) - 3600)
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, old), op_key)
+    assert _verify(_signed(op_key, old), op_key, max_age=7200)["sub"] == "alice"
+    undated = _jwt_claims(iat=None)
+    with pytest.raises(GrindvaktError):
+        _verify(_signed(op_key, undated), op_key)
+    assert _verify(_signed(op_key, undated), op_key, max_age=None)["sub"] == "alice"
+    assert _verify(_signed(op_key, old), op_key, max_age=None)["sub"] == "alice"
+
+
+def test_userinfo_jwe_rejected():
+    jwe = b"eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.a.b.c.d"
+    with pytest.raises(AuthnError, match="encrypted") as e:
+        ui(UserinfoRecorder(body=jwe, ctype="application/jwt"))
+    assert e.value.code == "userinfo_encrypted"
+
+
+def test_userinfo_jwks_must_be_a_jwks_dict(op_key):
+    with pytest.raises(Exception):
+        ui(_signed(op_key, _jwt_claims()), jwks="not-a-jwks", client_id=CLIENT_ID,
+           allowed_algorithms=["ES256"], trust="dedicated_keys")
+
+
+# --- RP-Initiated Logout ------------------------------------------------------
+
+
+@pytest.fixture
+def lprov():
+    return rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token",
+                           end_session_endpoint=f"{ISSUER}/logout")
+
+
+def test_provider_info_carries_end_session_endpoint_from_discovery(op, op_key):
+    md = metadata.ProviderMetadata(ISSUER)
+    md.end_session_endpoint = f"{ISSUER}/logout"
+    op2 = provider.Provider(md, op_key, client.InMemoryClientStore([]), tokens.TokenCodec("s"),
+                            token_use_store=provider.InMemoryTokenUseStore())
+    discovered = rp.discover(FakeHttpClient(op2), ISSUER)
+    assert discovered.end_session_endpoint == f"{ISSUER}/logout"
+    assert discovered.raw is not None and discovered.raw["end_session_endpoint"] == f"{ISSUER}/logout"
+    info = rp.ProviderInfo.from_metadata(discovered)
+    assert info.end_session_endpoint == f"{ISSUER}/logout"
+    assert "end_session_endpoint" in repr(info)
+
+
+def test_provider_info_without_end_session_endpoint(prov):
+    assert prov.end_session_endpoint is None
+    with pytest.raises(ConfigError):
+        rp.end_session_url(prov)
+
+
+def test_discover_raw_is_response_body(http):
+    md = rp.discover(http, ISSUER)
+    assert md.raw == http.op.discovery_document()
+
+
+def test_provider_info_rejects_unsafe_end_session_endpoint():
+    for bad in ["http://op.example.com/l", f"{ISSUER}/l#frag", "https://u:p@op.example.com/l"]:
+        with pytest.raises(GrindvaktError):
+            rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token", end_session_endpoint=bad)
+
+
+def test_from_metadata_drops_unsafe_end_session_endpoint():
+    """Login must not depend on logout: a bad advertised endpoint becomes None."""
+    for bad in ["http://evil.example/l", f"{ISSUER}/l#frag", "https://u:p@op.example.com/l", "not a url"]:
+        import json
+
+        body = json.dumps(metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": bad}).encode()
+
+        class Http:
+            def get(self, url):
+                return 200, body, "application/json"
+
+            def post_form(self, url, form, headers):
+                raise AssertionError
+
+        md = rp.discover(Http(), ISSUER)
+        info = rp.ProviderInfo.from_metadata(md)
+        assert info.end_session_endpoint is None
+        assert info.token_endpoint == f"{ISSUER}/token"
+        with pytest.raises(ConfigError, match="different origin than the issuer"):
+            rp.end_session_url(info)
+
+
+def _pi(endpoint, issuer=ISSUER, **kw):
+    return rp.ProviderInfo(issuer, f"{issuer}/authorization", f"{issuer}/token",
+                           end_session_endpoint=endpoint, **kw)
+
+
+def _md_with(endpoint, issuer=ISSUER):
+    return metadata.ProviderMetadata.from_dict(
+        metadata.ProviderMetadata(issuer).to_dict() | {"end_session_endpoint": endpoint})
+
+
+SAME_ORIGIN = [
+    "https://op.example.com/l",
+    "https://op.example.com:443/l",
+    "https://OP.Example.COM/l",
+    "HTTPS://op.example.com/l?x=1",
+]
+CROSS_ORIGIN = [
+    "https://evil.example/logout",
+    "https://sub.op.example.com/l",
+    "https://op.example.com:8443/l",
+    "https://op.example.com./l",
+    "https://op.example.com@evil.example/l",
+    "https://op.example.com.evil.example/l",
+    "https://evil.example/https://op.example.com/l",
+]
+
+
+@pytest.mark.parametrize("ep", SAME_ORIGIN)
+def test_end_session_same_origin_accepted(ep):
+    assert _pi(ep).end_session_endpoint == ep
+    assert rp.ProviderInfo.from_metadata(_md_with(ep)).end_session_endpoint == ep
+
+
+@pytest.mark.parametrize("ep", CROSS_ORIGIN)
+def test_end_session_cross_origin_rejected_and_dropped(ep):
+    with pytest.raises(GrindvaktError):
+        _pi(ep)
+    info = rp.ProviderInfo.from_metadata(_raw_md(ep))
+    assert info.end_session_endpoint is None
+    with pytest.raises(ConfigError, match="different origin than the issuer"):
+        rp.end_session_url(info, id_token_hint="tok")
+
+
+def test_from_metadata_warns_when_dropping_end_session():
+    import warnings
+
+    with pytest.warns(UserWarning, match="different origin than the issuer.*allow_cross_origin_end_session=True"):
+        info = rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/logout"))
+    assert info.end_session_endpoint is None
+    with pytest.warns(UserWarning, match="unsafe"):
+        rp.ProviderInfo.from_metadata(_raw_md("https://op.example.com/l#frag"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        # a warnings filter of "error" must not make login depend on logout
+        dropped = rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/logout"))
+        assert dropped.end_session_endpoint is None
+        rp.ProviderInfo.from_metadata(_raw_md("https://op.example.com/l"))
+        rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/l"), allow_cross_origin_end_session=True)
+        rp.ProviderInfo.from_metadata(rp.discover(_NoEndSession(), ISSUER))
+
+
+class _NoEndSession:
+    def get(self, url):
+        return 200, json.dumps(metadata.ProviderMetadata(ISSUER).to_dict()).encode(), "application/json"
+
+    def post_form(self, url, form, headers):
+        raise AssertionError
+
+
+def test_end_session_constructor_error_says_cross_origin():
+    with pytest.raises(BadRequestError, match="different origin"):
+        _pi("https://evil.example/logout")
+
+
+def test_end_session_explicit_default_port_issuer():
+    iss = "https://op.example.com:443"
+    assert _pi("https://op.example.com/l", issuer=iss).end_session_endpoint == "https://op.example.com/l"
+
+
+def test_end_session_loopback_http_issuer_origin_binding():
+    iss = "http://localhost:8000"
+    assert _pi("http://localhost:8000/l", issuer=iss).end_session_endpoint
+    for bad in ["http://localhost:9000/l", "http://127.0.0.1:8000/l", "http://localhost/l"]:
+        with pytest.raises(GrindvaktError):
+            _pi(bad, issuer=iss)
+    # scheme differs: https on the loopback host/port is still another origin
+    with pytest.raises(GrindvaktError):
+        _pi("https://localhost:8000/l", issuer=iss)
+    v6 = "http://[::1]:8000"
+    assert _pi("http://[::1]:8000/l", issuer=v6).end_session_endpoint
+    with pytest.raises(GrindvaktError):
+        _pi("http://[::1]:8001/l", issuer=v6)
+
+
+def test_end_session_review_poc_now_config_error():
+    md = metadata.ProviderMetadata.from_dict(
+        metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": "https://evil.example/logout"})
+    info = rp.ProviderInfo.from_metadata(md)
+    with pytest.raises(ConfigError):
+        rp.end_session_url(info, id_token_hint="secret-id-token")
+
+
+def test_end_session_cross_origin_opt_in():
+    ep = "https://logout.other.example/l"
+    info = _pi(ep, allow_cross_origin_end_session=True)
+    assert info.end_session_endpoint == ep
+    info2 = rp.ProviderInfo.from_metadata(_md_with(ep), allow_cross_origin_end_session=True)
+    assert info2.end_session_endpoint == ep
+    url = rp.end_session_url(info2, id_token_hint="tok")
+    assert url.startswith("https://logout.other.example/l?") and "id_token_hint=tok" in url
+
+
+def test_end_session_opt_in_still_validates_unsafe():
+    for bad in ["http://evil.example/l", "https://evil.example/l#f", "https://u:p@evil.example/l"]:
+        with pytest.raises(GrindvaktError):
+            _pi(bad, allow_cross_origin_end_session=True)
+        info = rp.ProviderInfo.from_metadata(_raw_md(bad), allow_cross_origin_end_session=True)
+        assert info.end_session_endpoint is None
+
+
+def _raw_md(bad):
+    class Http:
+        def get(self, url):
+            return 200, json.dumps(metadata.ProviderMetadata(ISSUER).to_dict()
+                                   | {"end_session_endpoint": bad}).encode(), "application/json"
+
+        def post_form(self, url, form, headers):
+            raise AssertionError
+
+    return rp.discover(Http(), ISSUER)
+
+
+def _logout_client(*uris):
+    return rp.RpClient(CLIENT_ID, REDIRECT_URI, post_logout_redirect_uris=list(uris))
+
+
+def test_end_session_url_params_and_encoding(lprov):
+    rpc = _logout_client("https://rp.example.com/after?x=1&y=2")
+    url = rp.end_session_url(
+        lprov, id_token_hint="a.b.c", client=rpc,
+        post_logout_redirect_uri="https://rp.example.com/after?x=1&y=2",
+        state="s t&", logout_hint="al ice", ui_locales="sv en", extra={"foo": "b ar"},
+    )
+    parts = urlsplit(url)
+    assert f"{parts.scheme}://{parts.netloc}{parts.path}" == f"{ISSUER}/logout"
+    q = parse_qs(parts.query)
+    assert q == {
+        "id_token_hint": ["a.b.c"], "client_id": [CLIENT_ID],
+        "post_logout_redirect_uri": ["https://rp.example.com/after?x=1&y=2"],
+        "state": ["s t&"], "logout_hint": ["al ice"], "ui_locales": ["sv en"], "foo": ["b ar"],
+    }
+    assert "x=1&y=2" not in parts.query  # the nested URL is percent-encoded
+
+
+def test_end_session_url_minimal_and_existing_query():
+    p = rp.ProviderInfo(ISSUER, f"{ISSUER}/a", f"{ISSUER}/token", end_session_endpoint=f"{ISSUER}/logout?tenant=x")
+    assert rp.end_session_url(p) == f"{ISSUER}/logout?tenant=x"
+    url = rp.end_session_url(p, id_token_hint="h")
+    assert url == f"{ISSUER}/logout?tenant=x&id_token_hint=h"
+    assert rp.end_session_url(p, extra=[("a", "1"), ("a", "2")]).endswith("?tenant=x&a=1&a=2")
+
+
+AFTER = "https://rp.example.com/after"
+
+
+def test_end_session_url_registered_post_logout_accepted(lprov):
+    c = _logout_client(AFTER, "https://rp.example.com/other")
+    assert c.post_logout_redirect_uris == (AFTER, "https://rp.example.com/other")
+    assert "post_logout_redirect_uris" in repr(c)
+    url = rp.end_session_url(lprov, client=c, post_logout_redirect_uri=AFTER)
+    assert parse_qs(urlsplit(url).query)["post_logout_redirect_uri"] == [AFTER]
+    rp.end_session_url(lprov, client=c, id_token_hint="h", post_logout_redirect_uri=AFTER)
+
+
+def test_end_session_url_unregistered_post_logout_rejected(lprov):
+    c = _logout_client(AFTER)
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, client=c, post_logout_redirect_uri="https://evil.example/")
+
+
+@pytest.mark.parametrize("near", [
+    AFTER + "/", AFTER.replace("rp.", "RP."), "HTTPS://rp.example.com/after",
+    AFTER + "?next=1", AFTER + " ",
+])
+def test_end_session_url_near_miss_rejected(lprov, near):
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, client=_logout_client(AFTER), post_logout_redirect_uri=near)
+
+
+def test_end_session_url_hint_only_post_logout_rejected(lprov):
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, id_token_hint="h", post_logout_redirect_uri=AFTER)
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, post_logout_redirect_uri=AFTER)
+
+
+def test_end_session_url_empty_registration_rejects_all(lprov, rpc):
+    assert rpc.post_logout_redirect_uris == ()
+    for c in (rpc, _logout_client()):
+        with pytest.raises(BadRequestError, match="registered on the client"):
+            rp.end_session_url(lprov, client=c, id_token_hint="h", post_logout_redirect_uri=AFTER)
+
+
+def test_end_session_url_request_value_cannot_bypass(lprov):
+    request_args = {"next": "https://evil.example/steal"}
+    with pytest.raises(BadRequestError, match="registered on the client"):
+        rp.end_session_url(lprov, id_token_hint="h", client=_logout_client(AFTER),
+                           post_logout_redirect_uri=request_args["next"])
+
+
+def test_end_session_url_post_logout_syntax_still_validated(lprov):
+    with pytest.raises(BadRequestError):
+        _logout_client(AFTER + "#frag")
+    with pytest.raises(BadRequestError):
+        _logout_client("relative/path")
+    # Without post_logout_redirect_uri nothing changes.
+    rp.end_session_url(lprov, client=_logout_client(AFTER), id_token_hint="h")
+
+
+def test_end_session_url_rejects_reserved_extras_and_empty(lprov):
+    for key in ["id_token_hint", "client_id", "post_logout_redirect_uri", "state", "logout_hint", "ui_locales"]:
+        with pytest.raises(BadRequestError, match="library-controlled"):
+            rp.end_session_url(lprov, extra={key: "x"})
+    with pytest.raises(BadRequestError):
+        rp.end_session_url(lprov, state="")
+    p = rp.ProviderInfo(ISSUER, f"{ISSUER}/a", f"{ISSUER}/token", end_session_endpoint=f"{ISSUER}/logout?state=x")
+    with pytest.raises(BadRequestError, match="library-controlled"):
+        rp.end_session_url(p)
+
+
+# --- verify_id_token options ----------------------------------------------------
+
+
+def _half_hash(value: str, algo: str = "sha256") -> str:
+    import base64
+    import hashlib
+
+    digest = hashlib.new(algo, value.encode()).digest()
+    return base64.urlsafe_b64encode(digest[: len(digest) // 2]).rstrip(b"=").decode()
+
+
+def _co(**extra):
+    now = int(time.time())
+    return {"iss": ISSUER, "sub": "alice", "aud": CLIENT_ID, "iat": now, "exp": now + 300,
+            "nonce": "n", **extra}
+
+
+def _vo(op_key, claims, *args, **kw):
+    token = jwt.sign(op_key, claims)
+    return rp.verify_id_token(op_key.to_public_jwks(), token, ISSUER, CLIENT_ID, "n", ["ES256"],
+                              *args, **kw)
+
+
+def test_verify_options_default_behaviour_unchanged(op_key):
+    """at_hash / c_hash without values to check stay ignored, as before."""
+    claims = _co(at_hash="x", c_hash="y", auth_time=1, acr="whatever")
+    assert _vo(op_key, claims)["sub"] == "alice"
+
+
+def test_verify_strict_hashes(op_key):
+    at = "the-access-token"
+    claims = _co(at_hash=_half_hash(at))
+    with pytest.raises(AuthnError, match="at_hash"):
+        _vo(op_key, claims, strict_hashes=True)
+    assert _vo(op_key, claims, access_token=at, strict_hashes=True)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="c_hash"):
+        _vo(op_key, _co(c_hash="x"), strict_hashes=True)
+    # No values and no hash claims: nothing required, no BadRequestError.
+    assert _vo(op_key, _co(), strict_hashes=True)["sub"] == "alice"
+    # Default unchanged.
+    assert _vo(op_key, claims)["sub"] == "alice"
+    assert _vo(op_key, _co(), access_token=at)["sub"] == "alice"
+
+
+def test_verify_strict_hashes_requires_claims_when_values_given(op_key):
+    at, code = "the-access-token", "the-code"
+    # Value passed, claim absent: required.
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        _vo(op_key, _co(), access_token=at, strict_hashes=True)
+    with pytest.raises(AuthnError, match="missing c_hash"):
+        _vo(op_key, _co(), authorization_code=code, strict_hashes=True)
+    # Only one claim present while both values are passed.
+    with pytest.raises(AuthnError, match="missing c_hash"):
+        _vo(op_key, _co(at_hash=_half_hash(at)), access_token=at, authorization_code=code,
+            strict_hashes=True)
+    # Both valid.
+    both = _co(at_hash=_half_hash(at), c_hash=_half_hash(code))
+    assert _vo(op_key, both, access_token=at, authorization_code=code,
+               strict_hashes=True)["sub"] == "alice"
+    # Wrong value still mismatches.
+    with pytest.raises(AuthnError, match="at_hash mismatch"):
+        _vo(op_key, both, access_token="other", authorization_code=code, strict_hashes=True)
+    # Only access_token passed: c_hash claim is unverifiable, at_hash required.
+    with pytest.raises(AuthnError, match="id_token carries c_hash but no value was supplied"):
+        _vo(op_key, both, access_token=at, strict_hashes=True)
+    only_at = _co(at_hash=_half_hash(at))
+    assert _vo(op_key, only_at, access_token=at, strict_hashes=True)["sub"] == "alice"
+    # Explicit require_* combos still work.
+    assert _vo(op_key, only_at, access_token=at, require_at_hash=True,
+               strict_hashes=True)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        _vo(op_key, _co(), access_token=at, require_at_hash=True, strict_hashes=True)
+    with pytest.raises(BadRequestError, match="require_at_hash needs an access_token"):
+        _vo(op_key, _co(), require_at_hash=True, strict_hashes=True)
+    # strict_hashes off: absent claim still accepted.
+    assert _vo(op_key, _co(), access_token=at, authorization_code=code)["sub"] == "alice"
+
+
+def test_verify_leeway_makes_expired_token_pass(op_key):
+    now = int(time.time())
+    expired = _co(iat=now - 400, exp=now - 100)
+    with pytest.raises(GrindvaktError):
+        _vo(op_key, expired)  # default leeway is 60s
+    with pytest.raises(GrindvaktError):
+        _vo(op_key, expired, leeway=30)
+    assert _vo(op_key, expired, leeway=200)["sub"] == "alice"
+
+
+def test_verify_leeway_above_300_rejected(op_key):
+    assert _vo(op_key, _co(), leeway=300)["sub"] == "alice"
+    with pytest.raises(BadRequestError, match="leeway"):
+        _vo(op_key, _co(), leeway=301)
+    with pytest.raises(ValueError, match="negative"):
+        _vo(op_key, _co(), leeway=-1)
+
+
+def test_verify_max_age_uses_auth_time(op_key):
+    now = int(time.time())
+    assert _vo(op_key, _co(auth_time=now - 10), max_age=60)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="older than max_age"):
+        _vo(op_key, _co(auth_time=now - 120), max_age=60)
+    # iat is fresh but irrelevant: auth_time decides.
+    with pytest.raises(AuthnError, match="older than max_age"):
+        _vo(op_key, _co(iat=now, auth_time=now - 1000), max_age=60)
+    # Float auth_time is accepted; future auth_time beyond leeway is not.
+    assert _vo(op_key, _co(auth_time=float(now - 5)), max_age=60)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="future"):
+        _vo(op_key, _co(auth_time=now + 3600), max_age=60)
+
+
+def test_verify_max_age_requires_auth_time(op_key):
+    with pytest.raises(AuthnError, match="auth_time"):
+        _vo(op_key, _co(), max_age=60)
+    with pytest.raises(AuthnError, match="auth_time"):
+        _vo(op_key, _co(auth_time="soon"), max_age=60)
+    with pytest.raises(ValueError, match="negative"):
+        _vo(op_key, _co(auth_time=1), max_age=-5)
+
+
+def test_verify_acr_allow_list(op_key):
+    assert _vo(op_key, _co(acr="mfa"), acr_values=["pwd", "mfa"])["acr"] == "mfa"
+    with pytest.raises(AuthnError, match="acr"):
+        _vo(op_key, _co(acr="pwd"), acr_values=["mfa"])
+    with pytest.raises(AuthnError, match="acr"):
+        _vo(op_key, _co(), acr_values=["mfa"])
+    with pytest.raises(BadRequestError, match="acr_values"):
+        _vo(op_key, _co(acr="mfa"), acr_values=[])
+
+
+def test_verify_at_hash(op_key):
+    at = "the-access-token"
+    claims = _co(at_hash=_half_hash(at))
+    assert _vo(op_key, claims, access_token=at)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="at_hash mismatch"):
+        _vo(op_key, claims, access_token="another-token")
+    # Present but not checkable by default is still accepted (historic behaviour).
+    assert _vo(op_key, claims)["sub"] == "alice"
+
+
+def test_verify_require_at_hash(op_key):
+    at = "the-access-token"
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        _vo(op_key, _co(), access_token=at, require_at_hash=True)
+    # Without the claim and without the requirement the token is not bound.
+    assert _vo(op_key, _co(), access_token=at)["sub"] == "alice"
+    assert _vo(op_key, _co(at_hash=_half_hash(at)), access_token=at,
+                   require_at_hash=True)["sub"] == "alice"
+
+
+def test_verify_require_at_hash_without_access_token_is_bad_request(op_key):
+    with pytest.raises(BadRequestError, match="require_at_hash"):
+        _vo(op_key, _co(at_hash="x"), require_at_hash=True)
+    with pytest.raises(BadRequestError, match="require_c_hash"):
+        _vo(op_key, _co(c_hash="x"), require_c_hash=True)
+
+
+def test_verify_c_hash(op_key):
+    code = "the-auth-code"
+    claims = _co(c_hash=_half_hash(code))
+    assert _vo(op_key, claims, authorization_code=code)["sub"] == "alice"
+    with pytest.raises(AuthnError, match="c_hash mismatch"):
+        _vo(op_key, claims, authorization_code="other-code")
+    with pytest.raises(AuthnError, match="missing c_hash"):
+        _vo(op_key, _co(), authorization_code=code, require_c_hash=True)
+    assert _vo(op_key, claims, authorization_code=code, require_c_hash=True)["sub"] == "alice"
+
+
+def test_verify_hash_with_eddsa(op_key):
+    """EdDSA has no OIDC hash function: a hash claim cannot be checked."""
+    ed = keys.signing_key_from_jwk(keys.generate_ed25519_jwk(), alg="EdDSA", kid="ed-1")
+    jwks = ed.to_public_jwks()
+
+    def verify(claims, **kw):
+        return rp.verify_id_token(jwks, jwt.sign(ed, claims), ISSUER, CLIENT_ID, "n", ["EdDSA"], **kw)
+
+    # No hash claim in the token: access_token alone is harmless...
+    assert verify(_co(), access_token="at")["sub"] == "alice"
+    # ...but requiring it is impossible to satisfy.
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        verify(_co(), access_token="at", require_at_hash=True)
+    # A hash claim present with a supplied value cannot be checked.
+    with pytest.raises(CryptoError, match="token-hash"):
+        verify(_co(at_hash="x"), access_token="at")
+    # strict_hashes + value: claim required, which EdDSA cannot provide.
+    with pytest.raises(AuthnError, match="missing at_hash"):
+        verify(_co(), access_token="at", strict_hashes=True)
+    with pytest.raises(CryptoError, match="token-hash"):
+        verify(_co(at_hash="x"), access_token="at", strict_hashes=True)
+    # strict_hashes without values: unchanged.
+    assert verify(_co(), strict_hashes=True)["sub"] == "alice"
+
+
+def test_verify_trusted_additional_audience_keyword(op_key):
+    multi = _co(aud=[CLIENT_ID, "https://api.example"], azp=CLIENT_ID)
+    with pytest.raises(AuthnError, match="untrusted audience"):
+        _vo(op_key, multi)
+    assert _vo(op_key, multi, trusted_additional_audiences=["https://api.example"])["sub"] == "alice"

@@ -316,6 +316,51 @@ pub struct Provider {
     token_use_store_obj: Py<PyAny>,
 }
 
+/// Warn (once, listing all names) when the metadata advertises members for
+/// behaviour this engine does not implement. Publishing is still allowed.
+fn warn_unimplemented_members(metadata: &ProviderMetadata) -> PyResult<()> {
+    const ALWAYS: &[&str] = &[
+        "end_session_endpoint",
+        "revocation_endpoint",
+        "introspection_endpoint",
+        "pushed_authorization_request_endpoint",
+        "check_session_iframe",
+    ];
+    const WHEN_TRUE: &[&str] = &[
+        "frontchannel_logout_supported",
+        "backchannel_logout_supported",
+        "require_pushed_authorization_requests",
+    ];
+    let extra = &metadata.inner.extra;
+    let mut names: Vec<&str> = ALWAYS
+        .iter()
+        .copied()
+        .filter(|k| extra.contains_key(*k))
+        .collect();
+    names.extend(
+        WHEN_TRUE
+            .iter()
+            .copied()
+            .filter(|k| extra.get(*k).and_then(serde_json::Value::as_bool) == Some(true)),
+    );
+    if names.is_empty() {
+        return Ok(());
+    }
+    Python::attach(|py| {
+        let msg = std::ffi::CString::new(format!(
+            "Provider does not implement {}; advertising them is a claim you are making about your own front end.",
+            names.join(", ")
+        ))
+        .expect("no NUL in warning");
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+            &msg,
+            1,
+        )
+    })
+}
+
 #[pymethods]
 impl Provider {
     #[new]
@@ -350,6 +395,8 @@ impl Provider {
         if let Some(secs) = client_assertion_max_age {
             p = p.with_client_assertion_max_age(secs);
         }
+        // Last, after every fallible step, so a failing constructor never warns.
+        warn_unimplemented_members(metadata)?;
         Ok(Self {
             inner: Arc::new(p),
             clients_obj: clients.clone().unbind(),

@@ -241,11 +241,12 @@ fn self_published_rp(
     http: Option<&Bound<'_, PyAny>>,
     rp_entity_id: String,
 ) -> PyResult<SelfPublishedRp> {
-    let http = crate::http::extract_http_client(http)?;
+    let (http, failures) = crate::http::extract_http_client(http)?;
     let r = crate::runtime::block_on(py, async move {
         gd::self_published_rp(&http, &rp_entity_id).await
     })?;
-    r.map(SelfPublishedRp::wrap).map_err(err)
+    r.map(SelfPublishedRp::wrap)
+        .map_err(|e| failures.err(py, e))
 }
 
 /// `self_published_rp` reduced to the validated `initiate_login_uri`.
@@ -258,11 +259,11 @@ fn self_published_initiate_login_uri(
     http: Option<&Bound<'_, PyAny>>,
     rp_entity_id: String,
 ) -> PyResult<String> {
-    let http = crate::http::extract_http_client(http)?;
+    let (http, failures) = crate::http::extract_http_client(http)?;
     let r = crate::runtime::block_on(py, async move {
         gd::self_published_initiate_login_uri(&http, &rp_entity_id).await
     })?;
-    r.map_err(err)
+    r.map_err(|e| failures.err(py, e))
 }
 
 /// Build the third-party initiated login URL the user is sent to after

@@ -19,7 +19,7 @@ import os
 import flask
 from flask import Flask, abort, session
 
-from pygrindvakt import GrindvaktError, pkce, rp, util
+from pygrindvakt import GrindvaktError, rp
 from pygrindvakt.http import ReqwestClient
 
 OP_ISSUER = os.environ.get("OP_ISSUER", "http://127.0.0.1:5000")
@@ -51,9 +51,9 @@ def create_app() -> Flask:
     @app.get("/login")
     def login():
         prov = provider_info()
-        state, nonce, verifier = util.random_token(), util.random_token(), util.random_token(48)
+        url, state, nonce, verifier = rp.begin(prov, CLIENT)
         session["oidc"] = {"state": state, "nonce": nonce, "verifier": verifier}
-        return flask.redirect(rp.authorization_url(prov, CLIENT, state, nonce, pkce.s256_challenge(verifier)))
+        return flask.redirect(url)
 
     @app.get("/callback")
     def callback():

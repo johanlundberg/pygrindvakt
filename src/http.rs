@@ -15,10 +15,17 @@
 //!     -> tuple[int, bytes, str | None]
 //! ```
 //!
+//! A client may additionally support request headers on GET (needed for
+//! `fetch_userinfo(method="GET")`), decided once when the client is first
+//! used: either `get(url, headers=...)` (a `headers` parameter or `**kwargs`)
+//! or a callable `get_with_headers(url, headers)`, which is preferred when
+//! present. There is no call-and-retry fallback.
+//!
 //! SECURITY: an injected client is responsible for timeouts, for *not*
-//! following redirects (a 307/308 would re-send token-endpoint form bodies
-//! cross-origin), and for bounding response sizes. The built-in client does all
-//! three.
+//! following redirects (a 307/308 would re-send token-endpoint form bodies and
+//! Bearer tokens cross-origin; at minimum `Authorization` must be stripped on
+//! a cross-origin redirect), and for bounding response sizes. The built-in
+//! client never follows redirects, for any request type, and does all three.
 //!
 //! A Python client runs on the thread driving the call, holding the GIL, so an
 //! instance shared across threads must be thread-safe itself; calling back into
@@ -26,7 +33,7 @@
 //! call (see `runtime::block_on`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,7 +47,7 @@ use grindvakt::Error as RsError;
 use crate::convert::{
     from_py, log_unraisable, new_submodule, parameter_pairs, require_methods, to_py,
 };
-use crate::errors::{err, internal_err};
+use crate::errors::{err, internal_err, with_code, InternalError};
 
 // ---------------------------------------------------------------------------
 // HttpRequestData
@@ -334,6 +341,14 @@ impl Response {
 // HttpFetchResponse
 // ---------------------------------------------------------------------------
 
+/// Lower-case header names (ASCII), keeping order and repeats.
+fn lower_names(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+        .collect()
+}
+
 /// The result of an outbound fetch made through an `HttpClient`.
 #[pyclass(
     module = "pygrindvakt.http",
@@ -349,15 +364,27 @@ pub struct HttpFetchResponse {
 #[pymethods]
 impl HttpFetchResponse {
     #[new]
-    #[pyo3(signature = (status, body, content_type = None))]
-    fn new(status: u16, body: &[u8], content_type: Option<String>) -> Self {
+    #[pyo3(signature = (status, body, content_type = None, headers = None))]
+    fn new(
+        status: u16,
+        body: &[u8],
+        content_type: Option<String>,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Self {
         Self {
             inner: RsFetch {
                 status,
                 body: body.to_vec(),
                 content_type,
+                headers: lower_names(headers.unwrap_or_default()),
             },
         }
+    }
+    /// Response headers as `(name, value)` pairs: names lower-cased, order
+    /// and repeated headers preserved. Empty when the client reports none.
+    #[getter]
+    fn headers(&self) -> Vec<(String, String)> {
+        self.inner.headers.clone()
     }
     #[getter]
     fn status(&self) -> u16 {
@@ -381,11 +408,106 @@ impl HttpFetchResponse {
     }
     fn __repr__(&self) -> String {
         format!(
-            "HttpFetchResponse(status={}, content_type={:?}, body=<{} bytes>)",
+            "HttpFetchResponse(status={}, content_type={:?}, headers={}, body=<{} bytes>)",
             self.inner.status,
             self.inner.content_type,
+            self.inner.headers.len(),
             self.inner.body.len()
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport failure capture
+// ---------------------------------------------------------------------------
+
+/// Why an outbound fetch failed before an HTTP response was obtained.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportKind {
+    Timeout,
+    Connect,
+    TooLarge,
+    Body,
+}
+
+/// The original cause of a failed outbound fetch, kept so it can be chained
+/// as `__cause__` (grindvakt itself only sees `Error::Internal(String)`).
+pub enum TransportFailure {
+    /// The Python `HttpClient` raised this exception.
+    Python(PyErr),
+    /// The built-in client failed.
+    Reqwest { kind: TransportKind, detail: String },
+}
+
+/// Per-call slot for the latest [`TransportFailure`]. Every call to
+/// [`extract_http_client`] creates a fresh slot, so concurrent and nested
+/// calls never see each other's failures.
+#[derive(Clone, Default)]
+pub struct Failures(Arc<Mutex<Option<(String, TransportFailure)>>>);
+
+impl Failures {
+    /// `message` is the exact `Error::Internal` text returned to grindvakt
+    /// for this failure; `err` only attributes the failure to an error that
+    /// carries the same text.
+    fn record(&self, message: String, f: TransportFailure) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((message, f));
+    }
+
+    /// A later successful fetch supersedes an earlier failure (multi-fetch
+    /// flows such as federation resolution may retry other endpoints).
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn take(&self) -> Option<(String, TransportFailure)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Map an error returned by a grindvakt call that used this call's
+    /// client. If it is an `Internal` error and a transport failure was
+    /// captured, raise `InternalError(code="transport")` (or
+    /// `"response_too_large"`) chained to the original exception.
+    pub fn err(&self, py: Python<'_>, e: RsError) -> PyErr {
+        // Always consume the slot. Only attribute the failure to an Internal
+        // error that is the one the failed fetch returned: a tolerated earlier
+        // fetch failure must not be blamed for an unrelated Internal error.
+        let captured = self.take();
+        let RsError::Internal(emitted) = &e else {
+            return err(e);
+        };
+        let Some((_, failure)) = captured.filter(|(m, _)| m == emitted) else {
+            return err(e);
+        };
+        let msg = e.to_string();
+        match failure {
+            TransportFailure::Python(cause) => {
+                let exc = with_code(py, InternalError::new_err(msg), "transport");
+                exc.set_cause(py, Some(cause));
+                exc
+            }
+            TransportFailure::Reqwest { kind, detail } => {
+                let (code, cause): (&str, Option<PyErr>) = match kind {
+                    TransportKind::Timeout => (
+                        "transport",
+                        Some(pyo3::exceptions::PyTimeoutError::new_err(detail)),
+                    ),
+                    TransportKind::Connect => (
+                        "transport",
+                        Some(pyo3::exceptions::PyConnectionError::new_err(detail)),
+                    ),
+                    TransportKind::Body => (
+                        "transport",
+                        Some(pyo3::exceptions::PyOSError::new_err(detail)),
+                    ),
+                    TransportKind::TooLarge => ("response_too_large", None),
+                };
+                let exc = with_code(py, InternalError::new_err(msg), code);
+                if let Some(c) = cause {
+                    exc.set_cause(py, Some(c));
+                }
+                exc
+            }
+        }
     }
 }
 
@@ -446,37 +568,68 @@ impl ReqwestHttpClient {
     }
 }
 
-fn request_error(method: &str, url: &str, error: RsError) -> RsError {
-    RsError::Internal(format!("{method} {url}: {error}"))
+struct RawFailure {
+    kind: TransportKind,
+    detail: String,
 }
 
-async fn into_fetch(mut resp: reqwest::Response, max: usize) -> grindvakt::Result<RsFetch> {
+fn send_failure(method: &str, url: &str, e: &reqwest::Error) -> RawFailure {
+    let kind = if e.is_timeout() {
+        TransportKind::Timeout
+    } else if e.is_connect() {
+        TransportKind::Connect
+    } else {
+        TransportKind::Body
+    };
+    RawFailure {
+        kind,
+        detail: format!("{method} {url}: {e}"),
+    }
+}
+
+async fn into_fetch(
+    method: &str,
+    url: &str,
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<RsFetch, RawFailure> {
+    let too_large = || RawFailure {
+        kind: TransportKind::TooLarge,
+        detail: format!("{method} {url}: outbound response exceeds {max} byte limit"),
+    };
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    // Lower-cased names, in order, repeated headers kept; non-UTF-8 values
+    // are skipped.
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
     if resp.content_length().is_some_and(|l| l > max as u64) {
-        return Err(RsError::Internal(format!(
-            "outbound response exceeds {max} byte limit"
-        )));
+        return Err(too_large());
     }
     // Content-Length is optional and cannot be trusted on its own: stream the
     // body and check before every extension.
     let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| RsError::Internal(format!("reading body: {e}")))?
-    {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        let mut f = send_failure(method, url, &e);
+        f.detail = format!("{method} {url}: reading body: {e}");
+        f
+    })? {
         let new_len = body
             .len()
             .checked_add(chunk.len())
             .filter(|l| *l <= max)
-            .ok_or_else(|| {
-                RsError::Internal(format!("outbound response exceeds {max} byte limit"))
-            })?;
+            .ok_or_else(too_large)?;
         body.reserve(new_len - body.len());
         body.extend_from_slice(&chunk);
     }
@@ -484,21 +637,109 @@ async fn into_fetch(mut resp: reqwest::Response, max: usize) -> grindvakt::Resul
         status,
         body,
         content_type,
+        headers,
     })
 }
 
-#[async_trait]
-impl HttpClient for ReqwestHttpClient {
-    async fn get(&self, url: &str) -> grindvakt::Result<RsFetch> {
+impl ReqwestHttpClient {
+    async fn get_raw(
+        &self,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<RsFetch, RawFailure> {
         let resp = self
             .client()
             .get(url)
+            .headers(headers)
             .send()
             .await
-            .map_err(|e| RsError::Internal(format!("GET {url}: {e}")))?;
-        into_fetch(resp, self.max_response_bytes)
+            .map_err(|e| send_failure("GET", url, &e))?;
+        into_fetch("GET", url, resp, self.max_response_bytes).await
+    }
+
+    async fn post_form_raw(
+        &self,
+        url: &str,
+        form: &[(String, String)],
+        headers: &[(String, String)],
+    ) -> Result<RsFetch, RawFailure> {
+        let mut req = self.client().post(url).form(form);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req
+            .send()
             .await
-            .map_err(|e| request_error("GET", url, e))
+            .map_err(|e| send_failure("POST", url, &e))?;
+        into_fetch("POST", url, resp, self.max_response_bytes).await
+    }
+}
+
+/// Per-call view of the built-in client that records why a fetch failed (see
+/// [`Failures`]). Cheap: one `Arc` clone and one fresh slot per call.
+struct ReqwestCall {
+    client: Arc<ReqwestHttpClient>,
+    failures: Failures,
+}
+
+impl ReqwestCall {
+    fn finish(&self, r: Result<RsFetch, RawFailure>) -> grindvakt::Result<RsFetch> {
+        match r {
+            Ok(f) => {
+                self.failures.clear();
+                Ok(f)
+            }
+            Err(f) => {
+                let msg = f.detail.clone();
+                self.failures.record(
+                    msg.clone(),
+                    TransportFailure::Reqwest {
+                        kind: f.kind,
+                        detail: f.detail,
+                    },
+                );
+                Err(RsError::Internal(msg))
+            }
+        }
+    }
+}
+
+/// Validate caller-supplied header pairs; a bad name or value is a
+/// `BadRequest`, never a panic.
+fn header_map(headers: &[(String, String)]) -> grindvakt::Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let mut map = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .map_err(|_| RsError::BadRequest(format!("invalid HTTP header name: {k:?}")))?;
+        let mut value = HeaderValue::from_str(v)
+            .map_err(|_| RsError::BadRequest(format!("invalid HTTP header value for {k:?}")))?;
+        // Keep credentials out of reqwest's Debug output and HPACK indexes.
+        if name == reqwest::header::AUTHORIZATION || name == reqwest::header::COOKIE {
+            value.set_sensitive(true);
+        }
+        map.append(name, value);
+    }
+    Ok(map)
+}
+
+#[async_trait]
+impl HttpClient for ReqwestCall {
+    async fn get(&self, url: &str) -> grindvakt::Result<RsFetch> {
+        self.finish(
+            self.client
+                .get_raw(url, reqwest::header::HeaderMap::new())
+                .await,
+        )
+    }
+
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<RsFetch> {
+        let map = header_map(headers)?;
+        self.finish(self.client.get_raw(url, map).await)
     }
 
     async fn post_form(
@@ -507,17 +748,7 @@ impl HttpClient for ReqwestHttpClient {
         form: &[(String, String)],
         headers: &[(String, String)],
     ) -> grindvakt::Result<RsFetch> {
-        let mut req = self.client().post(url).form(form);
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| RsError::Internal(format!("POST {url}: {e}")))?;
-        into_fetch(resp, self.max_response_bytes)
-            .await
-            .map_err(|e| request_error("POST", url, e))
+        self.finish(self.client.post_form_raw(url, form, headers).await)
     }
 }
 
@@ -581,15 +812,28 @@ impl ReqwestClient {
         })
     }
 
-    /// Issue a GET. Returns `(status, body, content_type)`.
+    /// Issue a GET, optionally with request headers. Returns
+    /// `(status, body, content_type)`. Redirects are never followed, so the
+    /// headers (for example `Authorization`) are only ever sent to `url`.
+    #[pyo3(signature = (url, headers = None))]
     fn get<'py>(
         &self,
         py: Python<'py>,
         url: String,
+        headers: Option<Vec<(String, String)>>,
     ) -> PyResult<(u16, Bound<'py, PyBytes>, Option<String>)> {
-        let client = self.inner.clone();
-        let r =
-            crate::runtime::block_on(py, async move { client.get(&url).await })?.map_err(err)?;
+        let failures = Failures::default();
+        let client = ReqwestCall {
+            client: self.inner.clone(),
+            failures: failures.clone(),
+        };
+        let r = crate::runtime::block_on(py, async move {
+            match headers {
+                Some(h) => client.get_with_headers(&url, &h).await,
+                None => client.get(&url).await,
+            }
+        })?
+        .map_err(|e| failures.err(py, e))?;
         Ok((r.status, PyBytes::new(py, &r.body), r.content_type))
     }
 
@@ -602,14 +846,18 @@ impl ReqwestClient {
         form: Vec<(String, String)>,
         headers: Option<Vec<(String, String)>>,
     ) -> PyResult<(u16, Bound<'py, PyBytes>, Option<String>)> {
-        let client = self.inner.clone();
+        let failures = Failures::default();
+        let client = ReqwestCall {
+            client: self.inner.clone(),
+            failures: failures.clone(),
+        };
         let headers = headers.unwrap_or_default();
         let r =
             crate::runtime::block_on(
                 py,
                 async move { client.post_form(&url, &form, &headers).await },
             )?
-            .map_err(err)?;
+            .map_err(|e| failures.err(py, e))?;
         Ok((r.status, PyBytes::new(py, &r.body), r.content_type))
     }
 
@@ -650,27 +898,108 @@ fn default_http_client() -> Arc<ReqwestHttpClient> {
 /// already inside `runtime::block_on`, so it re-acquires the GIL briefly.
 pub struct PyHttpClient {
     obj: Py<PyAny>,
+    failures: Failures,
+    headers_mode: HeadersMode,
 }
 
-fn py_http_err(e: PyErr) -> RsError {
-    RsError::Internal(format!("python http client: {e}"))
+/// How (whether) a Python client accepts request headers on GET, decided once
+/// when the adapter is built.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadersMode {
+    Unsupported,
+    /// `get_with_headers(url, headers)`.
+    GetWithHeaders,
+    /// `get(url, headers=headers)`.
+    GetKeyword,
+}
+
+/// `get` accepts `headers` by keyword (a positional-or-keyword or keyword-only
+/// parameter) or `**kwargs`. Introspection failure
+/// (for example a builtin without a signature) counts as unsupported.
+fn get_accepts_headers(py: Python<'_>, obj: &Bound<'_, PyAny>) -> bool {
+    let probe = || -> PyResult<bool> {
+        let get = obj.getattr("get")?;
+        let sig = py.import("inspect")?.call_method1("signature", (get,))?;
+        let params = sig.getattr("parameters")?;
+        let kinds = py.import("inspect")?.getattr("Parameter")?;
+        // The adapter calls `get(url, headers=...)`, so `headers` must be
+        // passable by keyword: a positional-only or `*headers` parameter
+        // would raise TypeError on every call.
+        if params.contains("headers")? {
+            let kind = params.get_item("headers")?.getattr("kind")?;
+            return Ok(kind.eq(&kinds.getattr("POSITIONAL_OR_KEYWORD")?)?
+                || kind.eq(&kinds.getattr("KEYWORD_ONLY")?)?
+                || kind.eq(&kinds.getattr("VAR_KEYWORD")?)?);
+        }
+        let var_kw = kinds.getattr("VAR_KEYWORD")?;
+        for p in params.call_method0("values")?.try_iter()? {
+            if p?.getattr("kind")?.eq(&var_kw)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    probe().unwrap_or(false)
+}
+
+fn headers_mode(py: Python<'_>, obj: &Bound<'_, PyAny>) -> HeadersMode {
+    if obj
+        .getattr("get_with_headers")
+        .map(|a| a.is_callable())
+        .unwrap_or(false)
+    {
+        HeadersMode::GetWithHeaders
+    } else if get_accepts_headers(py, obj) {
+        HeadersMode::GetKeyword
+    } else {
+        HeadersMode::Unsupported
+    }
+}
+
+impl PyHttpClient {
+    /// Log the adapter failure (ADR 0002: fail closed, report via the
+    /// unraisable hook), keep the original exception for `__cause__` chaining
+    /// and return the opaque grindvakt error.
+    fn fail(&self, py: Python<'_>, obj: &Bound<'_, PyAny>, what: &str, e: PyErr) -> RsError {
+        let msg = format!("python http client: {e}");
+        log_unraisable(py, e.clone_ref(py), obj, what);
+        self.failures
+            .record(msg.clone(), TransportFailure::Python(e));
+        RsError::Internal(msg)
+    }
+
+    fn ok(&self, f: RsFetch) -> RsFetch {
+        self.failures.clear();
+        f
+    }
 }
 
 fn extract_fetch(r: &Bound<'_, PyAny>) -> PyResult<RsFetch> {
     if let Ok(f) = r.extract::<HttpFetchResponse>() {
         return Ok(f.inner);
     }
-    let (status, body, content_type): (u16, Vec<u8>, Option<String>) =
-        r.extract().map_err(|e| {
-            internal_err(format!(
-                "HttpClient method must return (status: int, body: bytes, content_type: str | None) \
-                 or an HttpFetchResponse: {e}"
-            ))
-        })?;
+    let shape_err = |e: PyErr| {
+        internal_err(format!(
+            "HttpClient method must return (status: int, body: bytes, content_type: str | None \
+             [, headers: list[tuple[str, str]] | None]) or an HttpFetchResponse: {e}"
+        ))
+    };
+    // A 4-tuple carries response headers; a 3-tuple does not.
+    let is_four = r.cast::<pyo3::types::PyTuple>().is_ok_and(|t| t.len() == 4);
+    type Headers = Vec<(String, String)>;
+    type Four = (u16, Vec<u8>, Option<String>, Option<Headers>);
+    let (status, body, content_type, headers) = if is_four {
+        let (s, b, c, h): Four = r.extract().map_err(shape_err)?;
+        (s, b, c, h.unwrap_or_default())
+    } else {
+        let (s, b, c): (u16, Vec<u8>, Option<String>) = r.extract().map_err(shape_err)?;
+        (s, b, c, Headers::new())
+    };
     Ok(RsFetch {
         status,
         body,
         content_type,
+        headers: lower_names(headers),
     })
 }
 
@@ -681,10 +1010,43 @@ impl HttpClient for PyHttpClient {
             let obj = self.obj.bind(py);
             obj.call_method1("get", (url,))
                 .and_then(|r| extract_fetch(&r))
-                .map_err(|e| {
-                    log_unraisable(py, e.clone_ref(py), obj, "HttpClient.get");
-                    py_http_err(e)
-                })
+                .map(|f| self.ok(f))
+                .map_err(|e| self.fail(py, obj, "HttpClient.get", e))
+        })
+    }
+
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> grindvakt::Result<RsFetch> {
+        Python::attach(|py| {
+            let obj = self.obj.bind(py);
+            let (what, result) = match self.headers_mode {
+                HeadersMode::Unsupported => {
+                    return Err(RsError::Config(
+                        "this HttpClient does not support request headers on GET: its `get` \
+                         must accept a `headers` parameter (or **kwargs), or it must provide \
+                         `get_with_headers(url, headers)`"
+                            .into(),
+                    ))
+                }
+                HeadersMode::GetWithHeaders => (
+                    "HttpClient.get_with_headers",
+                    obj.call_method1("get_with_headers", (url, headers.to_vec())),
+                ),
+                HeadersMode::GetKeyword => {
+                    let kwargs = pyo3::types::PyDict::new(py);
+                    let call = kwargs
+                        .set_item("headers", headers.to_vec())
+                        .and_then(|_| obj.call_method("get", (url,), Some(&kwargs)));
+                    ("HttpClient.get", call)
+                }
+            };
+            result
+                .and_then(|r| extract_fetch(&r))
+                .map(|f| self.ok(f))
+                .map_err(|e| self.fail(py, obj, what, e))
         })
     }
 
@@ -698,10 +1060,8 @@ impl HttpClient for PyHttpClient {
             let obj = self.obj.bind(py);
             obj.call_method1("post_form", (url, form.to_vec(), headers.to_vec()))
                 .and_then(|r| extract_fetch(&r))
-                .map_err(|e| {
-                    log_unraisable(py, e.clone_ref(py), obj, "HttpClient.post_form");
-                    py_http_err(e)
-                })
+                .map(|f| self.ok(f))
+                .map_err(|e| self.fail(py, obj, "HttpClient.post_form", e))
         })
     }
 }
@@ -709,20 +1069,36 @@ impl HttpClient for PyHttpClient {
 /// Resolve the `http` argument of networked functions: `None` -> the shared
 /// built-in client, a `ReqwestClient` -> its inner client, anything else ->
 /// a Python protocol adapter (validated to have `get` and `post_form`).
-pub fn extract_http_client(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Arc<dyn HttpClient>> {
-    match obj {
-        None => Ok(default_http_client()),
-        Some(o) if o.is_none() => Ok(default_http_client()),
+///
+/// Returns the client together with this call's [`Failures`] slot; pass failed
+/// results through `Failures::err` so transport causes are chained.
+pub fn extract_http_client(
+    obj: Option<&Bound<'_, PyAny>>,
+) -> PyResult<(Arc<dyn HttpClient>, Failures)> {
+    let failures = Failures::default();
+    let reqwest_call = |client: Arc<ReqwestHttpClient>| -> Arc<dyn HttpClient> {
+        Arc::new(ReqwestCall {
+            client,
+            failures: failures.clone(),
+        })
+    };
+    let client = match obj {
+        None => reqwest_call(default_http_client()),
+        Some(o) if o.is_none() => reqwest_call(default_http_client()),
         Some(o) => {
             if let Ok(h) = o.cast::<ReqwestClient>() {
-                return Ok(h.get().inner.clone());
+                reqwest_call(h.get().inner.clone())
+            } else {
+                require_methods(o, &["get", "post_form"], "HttpClient")?;
+                Arc::new(PyHttpClient {
+                    obj: o.clone().unbind(),
+                    failures: failures.clone(),
+                    headers_mode: headers_mode(o.py(), o),
+                })
             }
-            require_methods(o, &["get", "post_form"], "HttpClient")?;
-            Ok(Arc::new(PyHttpClient {
-                obj: o.clone().unbind(),
-            }))
         }
-    }
+    };
+    Ok((client, failures))
 }
 
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
