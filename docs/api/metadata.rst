@@ -53,7 +53,12 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       absent when ``raw`` is available, the source lacked the key and the value
       is still ``[]``. Constructor-built metadata has no ``raw``, so an
       empty list is kept there. A list assigned through its setter is never treated as
-      absent, even when assigned ``[]``: that means "none", not the spec default. Re-parsing the output yields the same effective values.
+      absent, even when assigned ``[]``: that means "none", not the spec default.
+      Note that this serialization choice reads ``raw``, which for discovered
+      metadata is the OP-controlled document: an OP decides whether a
+      re-publishing proxy emits ``[]`` ("none") or omits the member (the spec
+      default) for these lists. Do not use ``raw`` or ``exclude_defaults``
+      output for any policy decision. Re-parsing the output yields the same effective values.
       ``from_dict(md.to_dict()).to_dict() == md.to_dict()``
       holds for any metadata, including ``end_session_endpoint`` and extras.
 
