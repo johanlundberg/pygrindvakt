@@ -39,11 +39,15 @@ def sign(key: SigningKey, claims: dict[str, Any], typ: str | None = ...) -> str:
     """Sign a claims dict into a compact JWS with ``key``, setting ``alg``,
     ``kid`` and (optionally) a custom ``typ`` header."""
 
-def verify_with_jwks(jwks: dict[str, Any], token: str, validation: Validation) -> dict[str, Any]:
+def verify_with_jwks(
+    jwks: dict[str, Any], token: str, validation: Validation
+) -> dict[str, Any]:
     """Verify a compact JWS against a JWKS dict (``{"keys": [...]}``) and
     return the validated claims as a dict."""
 
-def verify_with_jwk(jwk: dict[str, Any], token: str, validation: Validation) -> dict[str, Any]:
+def verify_with_jwk(
+    jwk: dict[str, Any], token: str, validation: Validation
+) -> dict[str, Any]:
     """Verify a compact JWS against a single JWK dict."""
 
 def peek_header(token: str) -> dict[str, Any]:

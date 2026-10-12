@@ -1,7 +1,6 @@
 """Signing-key loading: JWK, PEM (openssl-generated), PKCS#11 (SoftHSM2)."""
 
 import pytest
-
 from pygrindvakt import CryptoError, GrindvaktError, jwt, keys
 
 
@@ -12,7 +11,12 @@ def test_generate_and_load_ec_jwk():
     key = keys.signing_key_from_jwk(jwk, alg="ES256", kid="k1")
     assert key.alg == "ES256" and key.kid == "k1"
     pub = key.public_jwk()
-    assert pub["kty"] == "EC" and "d" not in pub and pub["kid"] == "k1" and pub["alg"] == "ES256"
+    assert (
+        pub["kty"] == "EC"
+        and "d" not in pub
+        and pub["kid"] == "k1"
+        and pub["alg"] == "ES256"
+    )
     jwks = key.to_public_jwks()
     assert [k["kid"] for k in jwks["keys"]] == ["k1"]
     assert "SigningKey" in repr(key)
@@ -48,7 +52,9 @@ def test_rsa_jwk_generation_and_signing():
     key = keys.signing_key_from_jwk(keys.generate_rsa_jwk(2048), kid="r")
     assert key.alg == "RS256"
     tok = jwt.sign(key, {"iss": "me", "sub": "you"})
-    claims = jwt.verify_with_jwks(key.to_public_jwks(), tok, jwt.Validation().with_issuer("me"))
+    claims = jwt.verify_with_jwks(
+        key.to_public_jwks(), tok, jwt.Validation().with_issuer("me")
+    )
     assert claims["sub"] == "you"
 
 
@@ -68,7 +74,9 @@ def test_pem_rsa_loader(rsa_pem):
 
 def test_pem_garbage_raises():
     with pytest.raises(GrindvaktError):
-        keys.signing_key_from_pem(b"-----BEGIN NOTHING-----\nAAAA\n-----END NOTHING-----\n")
+        keys.signing_key_from_pem(
+            b"-----BEGIN NOTHING-----\nAAAA\n-----END NOTHING-----\n"
+        )
 
 
 def test_jwk_thumbprint_is_stable():
@@ -86,11 +94,14 @@ def test_pkcs11_signing_key(softhsm):
     key = keys.signing_key_from_pkcs11(module, pin, label, "ES256", kid="hsm")
     assert key.alg == "ES256" and key.kid == "hsm"
     tok = jwt.sign(key, {"iss": "hsm"})
-    assert jwt.verify_with_jwks(key.to_public_jwks(), tok, jwt.Validation())["iss"] == "hsm"
+    assert (
+        jwt.verify_with_jwks(key.to_public_jwks(), tok, jwt.Validation())["iss"]
+        == "hsm"
+    )
 
 
 @pytest.mark.pkcs11
 def test_pkcs11_wrong_pin(softhsm):
-    module, pin, label = softhsm
+    module, _pin, label = softhsm
     with pytest.raises(CryptoError):
         keys.signing_key_from_pkcs11(module, "9999", label, "ES256")

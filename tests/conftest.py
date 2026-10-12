@@ -16,7 +16,6 @@ import textwrap
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-
 from pygrindvakt import OAuthError, client, keys, metadata, provider, tokens
 
 ISSUER = "https://op.example.com"
@@ -49,13 +48,17 @@ def code_from_redirect(resp) -> str:
 @pytest.fixture(scope="session")
 def op_key():
     """A P-256 signing key with kid ``op-1``."""
-    return keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid="op-1")
+    return keys.signing_key_from_jwk(
+        keys.generate_ec_jwk("P-256"), alg="ES256", kid="op-1"
+    )
 
 
 @pytest.fixture(scope="session")
 def rp_key():
     """A second P-256 key, used as an RP's private_key_jwt key."""
-    return keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid="rp-1")
+    return keys.signing_key_from_jwk(
+        keys.generate_ec_jwk("P-256"), alg="ES256", kid="rp-1"
+    )
 
 
 @pytest.fixture
@@ -136,7 +139,9 @@ class FakeHttpClient:
         hdrs = {k.lower(): v for k, v in headers}
         if url == TOKEN_URL:
             try:
-                tr = self.op.handle_token_request(list(form), TOKEN_URL, auth_header=hdrs.get("authorization"))
+                tr = self.op.handle_token_request(
+                    list(form), TOKEN_URL, auth_header=hdrs.get("authorization")
+                )
             except OAuthError as e:
                 r = e.to_response()
                 return r.status, r.body, "application/json"
@@ -164,7 +169,16 @@ def rsa_pem(tmp_path_factory):
     d = tmp_path_factory.mktemp("keys")
     key = d / "rsa.pem"
     subprocess.run(
-        ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(key)],
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            str(key),
+        ],
         check=True,
         capture_output=True,
     )
@@ -179,7 +193,16 @@ def ec_pem(tmp_path_factory):
     d = tmp_path_factory.mktemp("keys-ec")
     key = d / "ec.pem"
     subprocess.run(
-        ["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", str(key)],
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "EC",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-out",
+            str(key),
+        ],
         check=True,
         capture_output=True,
     )
@@ -213,13 +236,35 @@ def softhsm(tmp_path_factory):
 
     pin, label = "1234", "op-signing-key"
     subprocess.run(
-        ["softhsm2-util", "--init-token", "--slot", "0", "--label", "op", "--so-pin", "0000", "--pin", pin],
+        [
+            "softhsm2-util",
+            "--init-token",
+            "--slot",
+            "0",
+            "--label",
+            "op",
+            "--so-pin",
+            "0000",
+            "--pin",
+            pin,
+        ],
         check=True,
         capture_output=True,
     )
     subprocess.run(
-        ["pkcs11-tool", "--module", module, "--login", "--pin", pin, "--keypairgen",
-         "--key-type", "EC:prime256v1", "--label", label],
+        [
+            "pkcs11-tool",
+            "--module",
+            module,
+            "--login",
+            "--pin",
+            pin,
+            "--keypairgen",
+            "--key-type",
+            "EC:prime256v1",
+            "--label",
+            label,
+        ],
         check=True,
         capture_output=True,
     )

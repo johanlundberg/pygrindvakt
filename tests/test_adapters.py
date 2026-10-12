@@ -2,9 +2,27 @@
 they fail closed, and they cannot deadlock or re-enter the runtime."""
 
 import pytest
-
-from conftest import ISSUER, REDIRECT_URI, TOKEN_URL, FakeHttpClient, basic_auth, code_from_redirect
-from pygrindvakt import GrindvaktError, InternalError, OAuthError, client, metadata, pkce, provider, request, rp, tokens, util
+from conftest import (
+    ISSUER,
+    REDIRECT_URI,
+    TOKEN_URL,
+    FakeHttpClient,
+    basic_auth,
+    code_from_redirect,
+)
+from pygrindvakt import (
+    GrindvaktError,
+    InternalError,
+    OAuthError,
+    client,
+    metadata,
+    pkce,
+    provider,
+    request,
+    rp,
+    tokens,
+    util,
+)
 
 
 class DictClientStore:
@@ -40,16 +58,38 @@ def _op(op_key, clients, tus=None):
     md = metadata.ProviderMetadata(ISSUER)
     if tus is None:
         tus = provider.InMemoryTokenUseStore()
-    return provider.Provider(md, op_key, clients, tokens.TokenCodec("s"), token_use_store=tus)
+    return provider.Provider(
+        md, op_key, clients, tokens.TokenCodec("s"), token_use_store=tus
+    )
 
 
 def _flow(op, verifier="v" * 43):
-    req = request.AuthorizationRequest.from_params(list({"client_id": "demo", "response_type": "code", "redirect_uri": REDIRECT_URI, "scope": "openid",
-         "code_challenge": pkce.s256_challenge(verifier), "code_challenge_method": "S256"}.items()))
+    req = request.AuthorizationRequest.from_params(
+        list(
+            {
+                "client_id": "demo",
+                "response_type": "code",
+                "redirect_uri": REDIRECT_URI,
+                "scope": "openid",
+                "code_challenge": pkce.s256_challenge(verifier),
+                "code_challenge_method": "S256",
+            }.items()
+        )
+    )
     op.validate_authorization_request(req)
     code = code_from_redirect(op.authorization_redirect(req, "alice"))
-    return op.handle_token_request(list({"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI, "code_verifier": verifier}.items()),
-        TOKEN_URL, auth_header=basic_auth("demo", "s3cret"))
+    return op.handle_token_request(
+        list(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "code_verifier": verifier,
+            }.items()
+        ),
+        TOKEN_URL,
+        auth_header=basic_auth("demo", "s3cret"),
+    )
 
 
 def test_python_client_store_and_token_use_store(op_key, demo_client):
@@ -62,7 +102,11 @@ def test_python_client_store_and_token_use_store(op_key, demo_client):
     tr = _flow(op)
     assert tr.access_token and len(tus.seen) == 1
     with pytest.raises(OAuthError):
-        _flow(op) if False else op.handle_token_request(list({"grant_type": "refresh_token", "refresh_token": "junk"}.items()), TOKEN_URL, auth_header=basic_auth("demo", "s3cret"))
+        _flow(op) if False else op.handle_token_request(
+            list({"grant_type": "refresh_token", "refresh_token": "junk"}.items()),
+            TOKEN_URL,
+            auth_header=basic_auth("demo", "s3cret"),
+        )
 
 
 def test_client_store_returning_dict(op_key, demo_client):
@@ -87,7 +131,16 @@ def test_client_store_get_raising_is_unknown_client(op_key):
             pass
 
     op = _op(op_key, Bad())
-    req = request.AuthorizationRequest.from_params(list({"client_id": "demo", "response_type": "code", "redirect_uri": REDIRECT_URI, "scope": "openid"}.items()))
+    req = request.AuthorizationRequest.from_params(
+        list(
+            {
+                "client_id": "demo",
+                "response_type": "code",
+                "redirect_uri": REDIRECT_URI,
+                "scope": "openid",
+            }.items()
+        )
+    )
     with pytest.raises(OAuthError):
         op.validate_authorization_request(req)
 
@@ -150,11 +203,15 @@ def test_reentrant_http_client_drives_in_process_provider(op):
     info = rp.ProviderInfo.from_metadata(rp.discover(fake, ISSUER))
     me = rp.RpClient("demo", REDIRECT_URI, client_secret="s3cret")
     verifier = util.random_token(32)
-    url = rp.authorization_url(info, me, "st", "nn", code_challenge=pkce.s256_challenge(verifier))
+    url = rp.authorization_url(
+        info, me, "st", "nn", code_challenge=pkce.s256_challenge(verifier)
+    )
     params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
     req = request.AuthorizationRequest.from_params(list(params.items()))
     op.validate_authorization_request(req)
-    code = code_from_redirect(op.authorization_redirect(req, "alice", {"email": ["a@b"]}))
+    code = code_from_redirect(
+        op.authorization_redirect(req, "alice", {"email": ["a@b"]})
+    )
     ts = rp.exchange_code(fake, info, me, code, code_verifier=verifier)
     claims = rp.verify_id_token(
         rp.fetch_jwks(fake, info.jwks_uri, info.issuer),
@@ -165,15 +222,21 @@ def test_reentrant_http_client_drives_in_process_provider(op):
         ["ES256"],
     )
     assert claims["sub"] == "alice"
-    assert rp.fetch_userinfo(
-        fake, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer
-    )["email"] == "a@b"
+    assert (
+        rp.fetch_userinfo(
+            fake, info.userinfo_endpoint, ts.access_token, claims["sub"], info.issuer
+        )["email"]
+        == "a@b"
+    )
 
 
 def test_python_http_client_is_used(op):
     fake = FakeHttpClient(op)
     md = rp.discover(fake, ISSUER)
-    assert md.issuer == ISSUER and fake.calls[0] == ("GET", f"{ISSUER}/.well-known/openid-configuration")
+    assert md.issuer == ISSUER and fake.calls[0] == (
+        "GET",
+        f"{ISSUER}/.well-known/openid-configuration",
+    )
 
 
 def test_python_http_client_raising(op):
@@ -210,7 +273,9 @@ def test_fetch_response_object_accepted(op):
         def get(self, url):
             import json
 
-            return http.HttpFetchResponse(200, json.dumps(op.discovery_document()).encode(), "application/json")
+            return http.HttpFetchResponse(
+                200, json.dumps(op.discovery_document()).encode(), "application/json"
+            )
 
         def post_form(self, url, form, headers):
             raise AssertionError

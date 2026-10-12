@@ -46,7 +46,6 @@ class ProviderInfo:
     def jwks_uri(self) -> str | None: ...
     @property
     def end_session_endpoint(self) -> str | None: ...
-    def __repr__(self) -> str: ...
 
 class RpClient:
     """RP client configuration, including the token-endpoint auth method.
@@ -97,7 +96,6 @@ class RpClient:
     def redirect_uris(self) -> tuple[str, ...]: ...
     @property
     def allow_unregistered_redirect_uri(self) -> bool: ...
-    def __repr__(self) -> str: ...
 
 class TokenSet:
     """The result of a successful code exchange."""
@@ -110,7 +108,6 @@ class TokenSet:
     def token_type(self) -> str: ...
     @property
     def raw(self) -> dict[str, Any]: ...
-    def __repr__(self) -> str: ...
 
 def authorization_url(
     provider: ProviderInfo,
@@ -160,6 +157,7 @@ def end_session_url(
     ``BadRequestError``. This prevents an open redirect carrying
     ``id_token_hint`` when the value comes from a request parameter.
     """
+
 def fetch_jwks(http: _HttpArg, jwks_uri: str, issuer: str) -> dict[str, Any]: ...
 def exchange_code(
     http: _HttpArg,
@@ -283,7 +281,6 @@ class JwksCache:
         the set is refreshed once (rate-limited by ``min_refresh_interval``)
         and a still-unknown ``kid`` raises ``UnknownKeyError``.
         """
-    def __repr__(self) -> str: ...
 
 @overload
 def fetch_userinfo(

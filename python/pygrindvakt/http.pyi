@@ -27,6 +27,10 @@ calling thread while it holds the GIL, so one shared across threads must be
 thread-safe itself.
 """
 
+# Forward references to classes defined below are valid in a stub; PYI026 would
+# add TypeAlias annotations that tests/test_stubs.py counts as public names.
+# ruff: noqa: F821, PYI026
+
 from typing import Any, Protocol
 
 # Stub-only aliases (underscore-prefixed so they are not expected at runtime).

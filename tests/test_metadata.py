@@ -4,7 +4,6 @@ typed known-extension fields and ``end_session_endpoint``."""
 from __future__ import annotations
 
 import pytest
-
 from pygrindvakt import metadata
 
 ISSUER = "https://op.example.com"
@@ -39,16 +38,25 @@ def test_round_trip_constructed_metadata():
 
 
 def test_exclude_defaults_drops_spec_defaults_only():
-    md = metadata.ProviderMetadata.from_dict(minimal_doc() | {"unknown_empty": [], "frontchannel_logout_supported": False})
+    md = metadata.ProviderMetadata.from_dict(
+        minimal_doc() | {"unknown_empty": [], "frontchannel_logout_supported": False}
+    )
     full = md.to_dict()
-    assert full["scopes_supported"] == [] and full["claims_parameter_supported"] is False
+    assert (
+        full["scopes_supported"] == [] and full["claims_parameter_supported"] is False
+    )
     slim = md.to_dict(exclude_defaults=True)
-    assert "scopes_supported" not in slim and "frontchannel_logout_supported" not in slim
+    assert (
+        "scopes_supported" not in slim and "frontchannel_logout_supported" not in slim
+    )
     assert "claims_parameter_supported" not in slim and slim["unknown_empty"] == []
     md.scopes_supported = ["openid"]
     md.claims_parameter_supported = True
     slim = md.to_dict(exclude_defaults=True)
-    assert slim["scopes_supported"] == ["openid"] and slim["claims_parameter_supported"] is True
+    assert (
+        slim["scopes_supported"] == ["openid"]
+        and slim["claims_parameter_supported"] is True
+    )
 
 
 def test_exclude_defaults_request_uri_parameter_supported_defaults_true():
@@ -122,8 +130,14 @@ def _equivalence_docs():
     docs = [minimal_doc()]
     docs.append(minimal_doc() | {k: v for k, v in BOOL_DEFAULTS.items()})
     docs.append(minimal_doc() | {k: (not v) for k, v in BOOL_DEFAULTS.items()})
-    docs.append(minimal_doc() | {k: [] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)})
-    docs.append(minimal_doc() | {k: ["x"] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)})
+    docs.append(
+        minimal_doc()
+        | {k: [] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)}
+    )
+    docs.append(
+        minimal_doc()
+        | {k: ["x"] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)}
+    )
     docs.append(minimal_doc() | {k: list(v) for k, v in NONEMPTY_LIST_DEFAULTS.items()})
     for k, v in BOOL_DEFAULTS.items():
         docs.append(minimal_doc() | {k: v})
@@ -211,11 +225,17 @@ def test_userinfo_endpoint_optional():
 
 def test_known_extra_wrong_types_rejected():
     with pytest.raises(ValueError, match="acr_values_supported"):
-        metadata.ProviderMetadata.from_dict(minimal_doc() | {"acr_values_supported": "abc"})
+        metadata.ProviderMetadata.from_dict(
+            minimal_doc() | {"acr_values_supported": "abc"}
+        )
     with pytest.raises(ValueError, match="acr_values_supported"):
-        metadata.ProviderMetadata.from_dict(minimal_doc() | {"acr_values_supported": [1]})
+        metadata.ProviderMetadata.from_dict(
+            minimal_doc() | {"acr_values_supported": [1]}
+        )
     with pytest.raises(ValueError, match="backchannel_logout_supported"):
-        metadata.ProviderMetadata.from_dict(minimal_doc() | {"backchannel_logout_supported": "yes"})
+        metadata.ProviderMetadata.from_dict(
+            minimal_doc() | {"backchannel_logout_supported": "yes"}
+        )
     with pytest.raises(ValueError, match="revocation_endpoint"):
         metadata.ProviderMetadata.from_dict(minimal_doc() | {"revocation_endpoint": 5})
     md = metadata.ProviderMetadata(ISSUER)
@@ -258,7 +278,12 @@ def test_end_session_endpoint_property():
     assert md.extra["end_session_endpoint"] == f"{ISSUER}/logout"
     md.end_session_endpoint = None
     assert "end_session_endpoint" not in md.extra
-    for bad in ["http://op.example.com/l", "https://op.example.com/l#f", "https://u:p@op.example.com/l", "not a url"]:
+    for bad in [
+        "http://op.example.com/l",
+        "https://op.example.com/l#f",
+        "https://u:p@op.example.com/l",
+        "not a url",
+    ]:
         with pytest.raises(ValueError):
             md.end_session_endpoint = bad
     md.extra = {"end_session_endpoint": f"{ISSUER}/logout"}
@@ -305,7 +330,10 @@ def test_url_members_rejected_on_every_write_path(name, bad):
 @pytest.mark.parametrize("name", URL_MEMBERS)
 def test_url_members_accept_valid_https_url(name):
     good = f"{ISSUER}/x"
-    assert metadata.ProviderMetadata.from_dict(minimal_doc() | {name: good}).extra[name] == good
+    assert (
+        metadata.ProviderMetadata.from_dict(minimal_doc() | {name: good}).extra[name]
+        == good
+    )
     md = metadata.ProviderMetadata(ISSUER)
     md.extra = {name: good}
     md.set_extra_field(name, good)
@@ -315,7 +343,8 @@ def test_url_members_accept_valid_https_url(name):
 
 def test_non_url_extras_are_type_checked_only():
     md = metadata.ProviderMetadata.from_dict(
-        minimal_doc() | {"service_documentation": "nonsense", "op_policy_uri": "javascript:x"}
+        minimal_doc()
+        | {"service_documentation": "nonsense", "op_policy_uri": "javascript:x"}
     )
     assert md.extra["service_documentation"] == "nonsense"
     md.set_extra_field("op_tos_uri", "http://evil.example/t")
@@ -327,12 +356,16 @@ def test_non_url_extras_are_type_checked_only():
 
 
 def test_discover_does_not_validate_url_members():
-    from pygrindvakt import rp
     import json
+
+    from pygrindvakt import rp
 
     class Http:
         def get(self, url):
-            body = minimal_doc() | {"end_session_endpoint": "http://evil.example/l", "revocation_endpoint": "nonsense"}
+            body = minimal_doc() | {
+                "end_session_endpoint": "http://evil.example/l",
+                "revocation_endpoint": "nonsense",
+            }
             return 200, json.dumps(body).encode(), "application/json"
 
         def post_form(self, url, form, headers):
@@ -343,12 +376,17 @@ def test_discover_does_not_validate_url_members():
 
 
 def test_discovered_malformed_known_extra_getter_none_roundtrip_raises():
-    from pygrindvakt import rp
     import json
+
+    from pygrindvakt import rp
 
     class Http:
         def get(self, url):
-            return 200, json.dumps(minimal_doc() | {"acr_values_supported": "urn:x"}).encode(), "application/json"
+            return (
+                200,
+                json.dumps(minimal_doc() | {"acr_values_supported": "urn:x"}).encode(),
+                "application/json",
+            )
 
         def post_form(self, url, form, headers):
             raise AssertionError
@@ -456,7 +494,9 @@ def test_constructor_validates_base():
 def test_loopback_http_issuer_and_endpoints():
     md = metadata.ProviderMetadata("http://localhost:8000")
     md.userinfo_endpoint = "http://localhost:8000/ui"
-    assert metadata.ProviderMetadata.from_dict(md.to_dict()).jwks_uri.startswith("http://localhost")
+    assert metadata.ProviderMetadata.from_dict(md.to_dict()).jwks_uri.startswith(
+        "http://localhost"
+    )
 
 
 @pytest.mark.parametrize("key", ABSENT_AS_EMPTY)
@@ -473,7 +513,9 @@ def test_exclude_defaults_explicit_empty_assigned_after_parse_is_kept(key):
     assert all(k not in slim for k in others)
 
 
-@pytest.mark.parametrize("bad", ["http://op.example.com", "nonsense", "https://op.example.com#f", ""])
+@pytest.mark.parametrize(
+    "bad", ["http://op.example.com", "nonsense", "https://op.example.com#f", ""]
+)
 def test_issuer_validated_everywhere(bad):
     with pytest.raises(ValueError, match="issuer"):
         metadata.ProviderMetadata(bad)
@@ -488,7 +530,10 @@ def test_issuer_validated_everywhere(bad):
 
 
 def test_constructor_error_names_base_and_member():
-    with pytest.raises(ValueError, match=r"base .*http://x\.test/o.* yields an invalid endpoint.*_endpoint|jwks_uri"):
+    with pytest.raises(
+        ValueError,
+        match=r"base .*http://x\.test/o.* yields an invalid endpoint.*_endpoint|jwks_uri",
+    ):
         metadata.ProviderMetadata(ISSUER, "http://x.test/o")
 
 

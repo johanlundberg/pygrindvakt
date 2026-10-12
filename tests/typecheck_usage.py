@@ -97,7 +97,8 @@ def use_all() -> None:
         info, id_token_hint="t", client=me, state="s", extra={"k": "v"}
     )
     rpc_logout = rp.RpClient(
-        "demo", "https://rp.example.com/cb",
+        "demo",
+        "https://rp.example.com/cb",
         post_logout_redirect_uris=["https://rp.example.com/bye"],
     )
     registered: tuple[str, ...] = rpc_logout.post_logout_redirect_uris
@@ -106,7 +107,8 @@ def use_all() -> None:
     )
     del registered
     rpc_login = rp.RpClient(
-        "demo", "https://rp.example.com/cb",
+        "demo",
+        "https://rp.example.com/cb",
         redirect_uris=["https://rp.example.com/alt"],
         allow_unregistered_redirect_uri=False,
     )
@@ -115,12 +117,14 @@ def use_all() -> None:
     del login_uris, allow_any
     es: str | None = info.end_session_endpoint
     rp.ProviderInfo(
-        "https://op.example.com", "https://op.example.com/a",
+        "https://op.example.com",
+        "https://op.example.com/a",
         "https://op.example.com/t",
         end_session_endpoint="https://op.example.com/logout",
     )
     rp.ProviderInfo(
-        "https://op.example.com", "https://op.example.com/a",
+        "https://op.example.com",
+        "https://op.example.com/a",
         "https://op.example.com/t",
         end_session_endpoint="https://logout.other.example/logout",
         allow_cross_origin_end_session=True,

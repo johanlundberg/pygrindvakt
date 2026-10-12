@@ -1,13 +1,25 @@
 """Package-level checks: version, submodule registration, exception hierarchy."""
 
-import pytest
-
 import pygrindvakt
+import pytest
 from pygrindvakt import OAuthError
 
 SUBMODULES = [
-    "client", "discovery", "dpop", "federation", "http", "jwt", "keys", "mac",
-    "metadata", "pkce", "provider", "request", "rp", "tokens", "util",
+    "client",
+    "discovery",
+    "dpop",
+    "federation",
+    "http",
+    "jwt",
+    "keys",
+    "mac",
+    "metadata",
+    "pkce",
+    "provider",
+    "request",
+    "rp",
+    "tokens",
+    "util",
 ]
 
 
@@ -30,11 +42,29 @@ def test_submodules_importable():
 def test_exception_hierarchy():
     """All errors derive from GrindvaktError; DPoP errors form their own subtree."""
     E = pygrindvakt
-    for cls in (E.BadRequestError, E.AuthnError, E.StateError, E.ConfigError, E.CryptoError,
-                E.AttributeMappingError, E.JoseError, E.UnknownKeyError, E.JsonError, E.InternalError,
-                E.NoBoundEndpointError, E.UnknownModuleError, E.DpopError, OAuthError):
+    for cls in (
+        E.BadRequestError,
+        E.AuthnError,
+        E.StateError,
+        E.ConfigError,
+        E.CryptoError,
+        E.AttributeMappingError,
+        E.JoseError,
+        E.UnknownKeyError,
+        E.JsonError,
+        E.InternalError,
+        E.NoBoundEndpointError,
+        E.UnknownModuleError,
+        E.DpopError,
+        OAuthError,
+    ):
         assert issubclass(cls, E.GrindvaktError), cls
-    for cls in (E.DpopInvalidError, E.DpopReplayError, E.DpopNonceRequiredError, E.DpopServerError):
+    for cls in (
+        E.DpopInvalidError,
+        E.DpopReplayError,
+        E.DpopNonceRequiredError,
+        E.DpopServerError,
+    ):
         assert issubclass(cls, E.DpopError), cls
     assert issubclass(E.UnknownKeyError, E.JoseError)
     assert E.AuthnError.status_hint == 401
@@ -57,7 +87,10 @@ def test_oauth_error_is_constructible_and_renders():
     assert b'"error":"access_denied"' in r.body and b'"state":"xyz"' in r.body
     rd = e.to_redirect("https://rp.example.com/cb?x=1", "query")
     assert rd.status == 302
-    assert rd.header("location") == "https://rp.example.com/cb?x=1&error=access_denied&error_description=nope&state=xyz"
+    assert (
+        rd.header("location")
+        == "https://rp.example.com/cb?x=1&error=access_denied&error_description=nope&state=xyz"
+    )
     fragment = e.to_redirect("https://rp.example.com/cb", "fragment")
     assert fragment.header("location") == (
         "https://rp.example.com/cb#error=access_denied&error_description=nope&state=xyz"

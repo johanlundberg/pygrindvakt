@@ -104,14 +104,18 @@ class Provider:
         clients: InMemoryClientStore | ClientStoreProtocol,
         codec: TokenCodec,
         lifetimes: TokenLifetimes | None = ...,
-        token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol = ...,
+        token_use_store: InMemoryTokenUseStore
+        | RedisStore
+        | TokenUseStoreProtocol = ...,
         client_assertion_max_age: int | None = ...,
     ) -> None: ...
     @property
     def clients(self) -> InMemoryClientStore | ClientStoreProtocol:
         """The client store passed at construction."""
     @property
-    def token_use_store(self) -> InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol:
+    def token_use_store(
+        self,
+    ) -> InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol:
         """The token-use store in effect."""
     @property
     def metadata(self) -> ProviderMetadata: ...
@@ -168,7 +172,9 @@ class Provider:
         the request carried one. Raises ``OAuthError``; render it with
         ``.to_response()``.
         """
-    def userinfo(self, access_token: str, presented_jkt: str | None = ...) -> dict[str, Any]:
+    def userinfo(
+        self, access_token: str, presented_jkt: str | None = ...
+    ) -> dict[str, Any]:
         """Require an ``openid``-scoped access token, validate it (and any
         DPoP key binding), and return the subject and scope-filtered claims."""
     def authenticate_client(

@@ -16,7 +16,6 @@ import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-
 from pygrindvakt import (
     AuthnError,
     BadRequestError,
@@ -37,7 +36,9 @@ CLIENT_ID = "demo"
 
 
 def make_key(kid):
-    return keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256", kid=kid)
+    return keys.signing_key_from_jwk(
+        keys.generate_ec_jwk("P-256"), alg="ES256", kid=kid
+    )
 
 
 def jwks_doc(*signing_keys):
@@ -46,8 +47,15 @@ def jwks_doc(*signing_keys):
 
 def id_token(key, issuer=ISSUER, **extra):
     now = int(time.time())
-    claims = {"iss": issuer, "sub": "alice", "aud": CLIENT_ID, "iat": now, "exp": now + 300,
-              "nonce": "n", **extra}
+    claims = {
+        "iss": issuer,
+        "sub": "alice",
+        "aud": CLIENT_ID,
+        "iat": now,
+        "exp": now + 300,
+        "nonce": "n",
+        **extra,
+    }
     return jwt.sign(key, claims)
 
 
@@ -129,7 +137,7 @@ def test_constructor_validation():
         rp.JwksCache(http, JWKS_URI, ISSUER, min_ttl=100, max_ttl=10)
     with pytest.raises(ValueError, match="negative"):
         rp.JwksCache(http, JWKS_URI, ISSUER, default_ttl=-1)
-    with pytest.raises(Exception):
+    with pytest.raises(TypeError):
         rp.JwksCache(object(), JWKS_URI, ISSUER)
     assert http.calls == 0  # nothing is fetched at construction
 
@@ -185,7 +193,7 @@ def test_default_ttl_is_clamped():
 
 
 class _JwksHandler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         srv = self.server
         srv.hits += 1
         body = json.dumps(srv.doc).encode()
@@ -218,7 +226,9 @@ def jwks_server():
 
 def server_cache(srv, **kw):
     clock = Clock()
-    cache = rp.JwksCache(ReqwestClient(), f"{srv.issuer}/jwks", srv.issuer, _now=clock, **kw)
+    cache = rp.JwksCache(
+        ReqwestClient(), f"{srv.issuer}/jwks", srv.issuer, _now=clock, **kw
+    )
     return cache, clock
 
 
@@ -289,7 +299,9 @@ def test_no_store_with_zero_min_ttl_never_caches(jwks_server, header):
 def test_python_client_without_headers_warns_once_and_uses_default_ttl():
     http = ScriptedHttp({"keys": []})
     cache, clock = make_cache(http, default_ttl=100, min_ttl=1)
-    with pytest.warns(UserWarning, match=r"reports no response headers.*default_ttl \(100s\)"):
+    with pytest.warns(
+        UserWarning, match=r"reports no response headers.*default_ttl \(100s\)"
+    ):
         cache.jwks()
     clock.advance(99)
     cache.jwks()
@@ -358,8 +370,17 @@ def test_python_client_headers_clamped_and_no_store_floored():
 
 
 def test_fetch_response_headers_attribute():
-    r = rp_http.HttpFetchResponse(200, b"", None, [("Cache-Control", "x"), ("Set-Cookie", "a"), ("set-cookie", "b")])
-    assert r.headers == [("cache-control", "x"), ("set-cookie", "a"), ("set-cookie", "b")]
+    r = rp_http.HttpFetchResponse(
+        200,
+        b"",
+        None,
+        [("Cache-Control", "x"), ("Set-Cookie", "a"), ("set-cookie", "b")],
+    )
+    assert r.headers == [
+        ("cache-control", "x"),
+        ("set-cookie", "a"),
+        ("set-cookie", "b"),
+    ]
     assert rp_http.HttpFetchResponse(200, b"").headers == []
 
 
@@ -586,7 +607,9 @@ def test_kidless_token_follows_upstream_behaviour():
 
 def test_set_with_mixed_kid_and_kidless_keys_refreshes_for_unknown_kid():
     k1, rogue = make_key("k1"), make_key("rogue")
-    plain = keys.signing_key_from_jwk(keys.generate_ec_jwk("P-256"), alg="ES256").public_jwk()
+    plain = keys.signing_key_from_jwk(
+        keys.generate_ec_jwk("P-256"), alg="ES256"
+    ).public_jwk()
     plain.pop("kid", None)
     http = ScriptedHttp({"keys": [k1.public_jwk(), plain]})
     cache, clock = make_cache(http)
@@ -675,7 +698,9 @@ def test_rp_verify_id_token_accepts_cache():
     assert rp.verify_id_token(cache, id_token(k2), ISSUER, CLIENT_ID, "n", ["ES256"])
     with pytest.raises(UnknownKeyError):
         clock.advance(31)
-        rp.verify_id_token(cache, id_token(make_key("zzz")), ISSUER, CLIENT_ID, "n", ["ES256"])
+        rp.verify_id_token(
+            cache, id_token(make_key("zzz")), ISSUER, CLIENT_ID, "n", ["ES256"]
+        )
 
 
 def test_rp_verify_id_token_with_cache_rejects_issuer_mismatch():
@@ -686,7 +711,9 @@ def test_rp_verify_id_token_with_cache_rejects_issuer_mismatch():
     other = "https://other.example.com"
     # Token claims iss == other and is signed by the cache's key.
     with pytest.raises(BadRequestError, match="issuer"):
-        rp.verify_id_token(cache, id_token(k1, issuer=other), other, CLIENT_ID, "n", ["ES256"])
+        rp.verify_id_token(
+            cache, id_token(k1, issuer=other), other, CLIENT_ID, "n", ["ES256"]
+        )
     # Rejected before any fetch.
     assert http.calls == 0
 
@@ -695,7 +722,14 @@ def test_rp_verify_id_token_with_cache_checks_iss_claim():
     k1 = make_key("k1")
     cache, _ = make_cache(ScriptedHttp(jwks_doc(k1)))
     with pytest.raises(GrindvaktError):
-        rp.verify_id_token(cache, id_token(k1, issuer="https://other.example.com"), ISSUER, CLIENT_ID, "n", ["ES256"])
+        rp.verify_id_token(
+            cache,
+            id_token(k1, issuer="https://other.example.com"),
+            ISSUER,
+            CLIENT_ID,
+            "n",
+            ["ES256"],
+        )
 
 
 def test_cache_verify_options_are_forwarded():
@@ -734,14 +768,26 @@ def test_cache_strict_hashes_requires_claims_when_values_given():
     with pytest.raises(AuthnError, match="missing at_hash"):
         verify(cache, id_token(k1), access_token="at", strict_hashes=True)
     with pytest.raises(AuthnError, match="missing c_hash"):
-        verify(cache, id_token(k1, at_hash=hh("at")), access_token="at",
-               authorization_code="code", strict_hashes=True)
+        verify(
+            cache,
+            id_token(k1, at_hash=hh("at")),
+            access_token="at",
+            authorization_code="code",
+            strict_hashes=True,
+        )
     ok = id_token(k1, at_hash=hh("at"), c_hash=hh("code"))
-    assert verify(cache, ok, access_token="at", authorization_code="code", strict_hashes=True)
+    assert verify(
+        cache, ok, access_token="at", authorization_code="code", strict_hashes=True
+    )
     assert verify(cache, id_token(k1), strict_hashes=True)
     assert verify(cache, id_token(k1), access_token="at")  # default lenient
-    assert verify(cache, id_token(k1, at_hash=hh("at")), access_token="at",
-                  require_at_hash=True, strict_hashes=True)
+    assert verify(
+        cache,
+        id_token(k1, at_hash=hh("at")),
+        access_token="at",
+        require_at_hash=True,
+        strict_hashes=True,
+    )
 
 
 def test_cache_argument_errors_do_not_fetch():
@@ -785,8 +831,15 @@ def test_fetch_userinfo_signed_path_accepts_cache_and_refreshes_on_rotation():
 
     def call():
         return rp.fetch_userinfo(
-            http, f"{ISSUER}/userinfo", "tok", "alice", ISSUER, jwks=cache,
-            client_id=CLIENT_ID, allowed_algorithms=["ES256"], trust="dedicated_keys",
+            http,
+            f"{ISSUER}/userinfo",
+            "tok",
+            "alice",
+            ISSUER,
+            jwks=cache,
+            client_id=CLIENT_ID,
+            allowed_algorithms=["ES256"],
+            trust="dedicated_keys",
         )
 
     assert call()["name"] == "A"
@@ -805,7 +858,9 @@ def test_fetch_userinfo_json_does_not_touch_cache():
 
     http = JsonHttp({"keys": []})
     cache, _ = make_cache(http)
-    out = rp.fetch_userinfo(http, f"{ISSUER}/userinfo", "tok", "alice", ISSUER, jwks=cache)
+    out = rp.fetch_userinfo(
+        http, f"{ISSUER}/userinfo", "tok", "alice", ISSUER, jwks=cache
+    )
     assert out["sub"] == "alice"
     assert http.calls == 0
 
@@ -820,8 +875,15 @@ def test_fetch_userinfo_with_cache_rejects_issuer_mismatch():
     cache, _ = make_cache(http)
     with pytest.raises(BadRequestError, match="issuer"):
         rp.fetch_userinfo(
-            http, f"{other}/userinfo", "tok", "alice", other, jwks=cache,
-            client_id=CLIENT_ID, allowed_algorithms=["ES256"], trust="dedicated_keys",
+            http,
+            f"{other}/userinfo",
+            "tok",
+            "alice",
+            other,
+            jwks=cache,
+            client_id=CLIENT_ID,
+            allowed_algorithms=["ES256"],
+            trust="dedicated_keys",
         )
     assert http.calls == 0  # rejected before any request
 
@@ -917,7 +979,17 @@ def assert_flight_timeout(fn, bound=5.0):
 
 def test_fetch_timeout_validation_and_default():
     http = ScriptedHttp({"keys": []})
-    for bad in (0, 0.0, -1, -0.5, 1e-12, 4e-10, float("nan"), float("inf"), float("-inf")):
+    for bad in (
+        0,
+        0.0,
+        -1,
+        -0.5,
+        1e-12,
+        4e-10,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ):
         with pytest.raises(ValueError, match="fetch_timeout"):
             rp.JwksCache(http, JWKS_URI, ISSUER, fetch_timeout=bad)
     rp.JwksCache(http, JWKS_URI, ISSUER, fetch_timeout=0.001)
@@ -992,7 +1064,7 @@ def test_late_finish_wakes_remaining_waiters(stalling):
     http, threads = stalling
     http.stall = True
     cache, _ = make_cache(http, fetch_timeout=1.5)
-    a, out = start_holder(http, threads, cache.jwks)
+    a, _out = start_holder(http, threads, cache.jwks)
     results = []
 
     def waiter():

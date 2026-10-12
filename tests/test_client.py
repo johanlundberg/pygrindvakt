@@ -1,7 +1,6 @@
 """Client registration objects and the in-memory client store."""
 
 import pytest
-
 from pygrindvakt import client
 
 
@@ -14,7 +13,9 @@ def test_client_defaults():
     assert c.subject_type == "public"
     assert c.client_secret is None and c.jwks is None and c.scope is None
     assert c.allows_response_type("code") and not c.allows_response_type("token")
-    assert "Client(" in repr(c) and "secret" not in repr(c).lower().replace("client_secret", "")
+    assert "Client(" in repr(c) and "secret" not in repr(c).lower().replace(
+        "client_secret", ""
+    )
 
 
 def test_client_rejects_unknown_keyword():
@@ -29,9 +30,19 @@ def test_client_is_keyword_only_after_id():
 
 
 def test_client_dict_round_trip():
-    c = client.Client("id", client_secret="s", redirect_uris=["https://x/cb"], scope="a b", client_name="N")
+    c = client.Client(
+        "id",
+        client_secret="s",
+        redirect_uris=["https://x/cb"],
+        scope="a b",
+        client_name="N",
+    )
     d = c.to_dict()
-    assert d["client_id"] == "id" and d["redirect_uris"] == ["https://x/cb"] and d["scope"] == "a b"
+    assert (
+        d["client_id"] == "id"
+        and d["redirect_uris"] == ["https://x/cb"]
+        and d["scope"] == "a b"
+    )
     c2 = client.Client.from_dict(d)
     assert c2.client_name == "N" and c2.allows_redirect("https://x/cb")
 
@@ -50,7 +61,11 @@ def test_client_jwks():
     from pygrindvakt import keys
 
     k = keys.signing_key_from_jwk(keys.generate_ec_jwk(), kid="rp")
-    c = client.Client("x", token_endpoint_auth_method=client.AUTH_PRIVATE_KEY_JWT, jwks=k.to_public_jwks())
+    c = client.Client(
+        "x",
+        token_endpoint_auth_method=client.AUTH_PRIVATE_KEY_JWT,
+        jwks=k.to_public_jwks(),
+    )
     assert c.jwks["keys"][0]["kid"] == "rp"
 
 

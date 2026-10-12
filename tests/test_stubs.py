@@ -10,14 +10,26 @@ import ast
 import importlib
 import pathlib
 
-import pytest
-
 import pygrindvakt
+import pytest
 
 STUB_DIR = pathlib.Path(pygrindvakt.__file__).parent
 SUBMODULES = [
-    "client", "discovery", "dpop", "federation", "http", "jwt", "keys", "mac",
-    "metadata", "pkce", "provider", "request", "rp", "tokens", "util",
+    "client",
+    "discovery",
+    "dpop",
+    "federation",
+    "http",
+    "jwt",
+    "keys",
+    "mac",
+    "metadata",
+    "pkce",
+    "provider",
+    "request",
+    "rp",
+    "tokens",
+    "util",
 ]
 # Names that exist only in stubs (typing helpers) and are not runtime objects.
 STUB_ONLY_SUFFIX = "Protocol"
@@ -33,9 +45,13 @@ def _stub_names(tree):
             if isinstance(node, ast.ClassDef):
                 members = set()
                 for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and not item.name.startswith("_"):
+                    if isinstance(item, ast.FunctionDef) and not item.name.startswith(
+                        "_"
+                    ):
                         members.add(item.name)
-                    elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    elif isinstance(item, ast.AnnAssign) and isinstance(
+                        item.target, ast.Name
+                    ):
                         members.add(item.target.id)
                     elif isinstance(item, ast.Assign):
                         for t in item.targets:
@@ -66,8 +82,12 @@ def test_stub_matches_runtime(name):
     stub_public = {n for n in stub_names if not n.endswith(STUB_ONLY_SUFFIX)}
     missing_in_stub = runtime - stub_public
     missing_at_runtime = stub_public - runtime
-    assert not missing_in_stub, f"{name}: runtime names absent from stub: {sorted(missing_in_stub)}"
-    assert not missing_at_runtime, f"{name}: stub names absent at runtime: {sorted(missing_at_runtime)}"
+    assert not missing_in_stub, (
+        f"{name}: runtime names absent from stub: {sorted(missing_in_stub)}"
+    )
+    assert not missing_at_runtime, (
+        f"{name}: stub names absent at runtime: {sorted(missing_at_runtime)}"
+    )
     for cls_name, members in stub_classes.items():
         if cls_name.endswith(STUB_ONLY_SUFFIX):
             continue

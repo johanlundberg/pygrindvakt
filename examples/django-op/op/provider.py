@@ -7,9 +7,8 @@ across ``fork()``, and an in-memory token-use store must not be shared by
 copy across workers anyway (use ``provider.RedisStore`` there).
 """
 
-from django.conf import settings
-
 from common.op_config import build_provider
+from django.conf import settings
 
 OP = build_provider(settings.OP_ISSUER)
 TOKEN_URL = f"{settings.OP_ISSUER}/token"
