@@ -56,6 +56,12 @@ Base class
       default (see :ref:`error-codes`); an instance may override it with a
       more precise value. :attr:`OAuthError.code` has the same meaning.
 
+   .. py:attribute:: status_hint
+      :type: int
+
+      The HTTP status conventionally paired with this error class. ``500``
+      on the base class; each subclass overrides it as listed above.
+
    .. py:attribute:: upstream_status
       :type: int | None
 
@@ -189,12 +195,6 @@ The cause is captured per call, so concurrent and nested calls never see each
 other's failures, and it is attached only to the error that the failed fetch
 itself produced (a tolerated earlier failure is not blamed for an unrelated
 error).
-
-   .. py:attribute:: status_hint
-      :type: int
-
-      The HTTP status conventionally paired with this error class. ``500``
-      on the base class; each subclass overrides it as listed above.
 
 grindvakt errors
 ----------------

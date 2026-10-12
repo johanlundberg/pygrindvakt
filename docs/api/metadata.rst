@@ -60,7 +60,12 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       default) for these lists. Do not use ``raw`` or ``exclude_defaults``
       output for any policy decision. Re-parsing the output yields the same effective values.
       ``from_dict(md.to_dict()).to_dict() == md.to_dict()``
-      holds for any metadata, including ``end_session_endpoint`` and extras.
+      holds for metadata built through the validated paths (the constructor,
+      ``from_dict`` and the setters), including ``end_session_endpoint`` and
+      extras. It does **not** hold for metadata returned by
+      :func:`pygrindvakt.rp.discover` when the discovered document carries a
+      malformed known extension member: ``to_dict()`` preserves it and
+      ``from_dict()`` rejects it (see below).
 
    .. py:attribute:: raw
       :type: dict[str, Any] | None

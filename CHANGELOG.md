@@ -241,7 +241,9 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `extra = ...` and `set_extra_field` (previously accepted silently).
 - `ProviderMetadata.extra` may now contain `end_session_endpoint`, fixing
   `from_dict(md.to_dict())` raising `ValueError` for discovered documents that
-  carry it. `from_dict(md.to_dict()).to_dict() == md.to_dict()` now holds.
+  carry it. `from_dict(md.to_dict()).to_dict() == md.to_dict()` now holds for metadata built
+  through the validated paths (not for discovered documents with malformed known
+  extension members, which `to_dict()` preserves and `from_dict()` rejects).
 - **Breaking:** `rp.fetch_userinfo` now takes `userinfo_endpoint: str | None`
   and raises `ConfigError` for `None`; a signed (`application/jwt`) UserInfo
   response that previously failed generically now raises `AuthnError` with a
