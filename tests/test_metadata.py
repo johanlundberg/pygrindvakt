@@ -374,3 +374,17 @@ def test_set_issuer_revalidates_url_members():
     md.issuer = "https://op.example"
     assert md.issuer == "https://op.example"
     md.issuer = "https://op.example"
+
+
+@pytest.mark.parametrize("key", ABSENT_AS_EMPTY)
+def test_exclude_defaults_explicit_empty_assigned_after_parse_is_kept(key):
+    """An explicit [] set by the caller is "none", not the absent-in-source artefact."""
+    md = metadata.ProviderMetadata.from_dict(minimal_doc())
+    assert key not in md.to_dict(exclude_defaults=True)  # untouched: stays absent
+    setattr(md, key, [])
+    assert md.to_dict(exclude_defaults=True)[key] == []
+    assert key not in (md.raw or {})  # raw stays an unmodified snapshot
+    # Other untouched lists are still suppressed.
+    others = [k for k in ABSENT_AS_EMPTY if k != key]
+    slim = md.to_dict(exclude_defaults=True)
+    assert all(k not in slim for k in others)

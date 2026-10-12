@@ -245,11 +245,19 @@ pub struct ProviderMetadata {
     pub inner: gm::ProviderMetadata,
     /// The source document, kept as a snapshot (see `raw`).
     pub raw: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Non-empty-default list members assigned through a setter after
+    /// construction. `exclude_defaults` must not treat an explicit `[]` that the
+    /// caller assigned as the absent-in-source parse artefact.
+    touched: std::collections::BTreeSet<&'static str>,
 }
 
 impl ProviderMetadata {
     pub fn wrap(inner: gm::ProviderMetadata) -> Self {
-        Self { inner, raw: None }
+        Self {
+            inner,
+            raw: None,
+            touched: Default::default(),
+        }
     }
 
     pub fn wrap_with_raw(
@@ -259,6 +267,7 @@ impl ProviderMetadata {
         Self {
             inner,
             raw: Some(raw),
+            touched: Default::default(),
         }
     }
 
@@ -298,6 +307,7 @@ impl ProviderMetadata {
         Self {
             inner: gm::ProviderMetadata::new(issuer, &base),
             raw: None,
+            touched: Default::default(),
         }
     }
 
@@ -337,6 +347,7 @@ impl ProviderMetadata {
             // contained is that artefact (not "none"), so keep it absent.
             let absent_in_source = NONEMPTY_DEFAULT_LISTS.contains(&key.as_str())
                 && value.as_array().is_some_and(Vec::is_empty)
+                && !self.touched.contains(key.as_str())
                 && self.raw.as_ref().is_some_and(|r| !r.contains_key(key));
             !absent_in_source
         });
@@ -674,6 +685,7 @@ impl ProviderMetadata {
     #[setter]
     fn set_response_types_supported(&mut self, v: Vec<String>) {
         self.inner.response_types_supported = v;
+        self.touched.insert("response_types_supported");
     }
     #[getter]
     fn response_modes_supported(&self) -> Vec<String> {
@@ -682,6 +694,7 @@ impl ProviderMetadata {
     #[setter]
     fn set_response_modes_supported(&mut self, v: Vec<String>) {
         self.inner.response_modes_supported = v;
+        self.touched.insert("response_modes_supported");
     }
     #[getter]
     fn grant_types_supported(&self) -> Vec<String> {
@@ -690,6 +703,7 @@ impl ProviderMetadata {
     #[setter]
     fn set_grant_types_supported(&mut self, v: Vec<String>) {
         self.inner.grant_types_supported = v;
+        self.touched.insert("grant_types_supported");
     }
     #[getter]
     fn subject_types_supported(&self) -> Vec<String> {
@@ -698,6 +712,7 @@ impl ProviderMetadata {
     #[setter]
     fn set_subject_types_supported(&mut self, v: Vec<String>) {
         self.inner.subject_types_supported = v;
+        self.touched.insert("subject_types_supported");
     }
     #[getter]
     fn id_token_signing_alg_values_supported(&self) -> Vec<String> {
@@ -706,6 +721,7 @@ impl ProviderMetadata {
     #[setter]
     fn set_id_token_signing_alg_values_supported(&mut self, v: Vec<String>) {
         self.inner.id_token_signing_alg_values_supported = v;
+        self.touched.insert("id_token_signing_alg_values_supported");
     }
     #[getter]
     fn token_endpoint_auth_methods_supported(&self) -> Vec<String> {
@@ -714,6 +730,7 @@ impl ProviderMetadata {
     #[setter]
     fn set_token_endpoint_auth_methods_supported(&mut self, v: Vec<String>) {
         self.inner.token_endpoint_auth_methods_supported = v;
+        self.touched.insert("token_endpoint_auth_methods_supported");
     }
     #[getter]
     fn claims_supported(&self) -> Vec<String> {

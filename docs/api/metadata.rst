@@ -52,7 +52,8 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       ``Option<Vec<_>>`` upstream), but ``exclude_defaults=True`` keeps them
       absent when ``raw`` is available, the source lacked the key and the value
       is still ``[]``. Constructor-built metadata has no ``raw``, so an
-      empty list is kept there. Re-parsing the output yields the same effective values.
+      empty list is kept there. A list assigned through its setter is never treated as
+      absent, even when assigned ``[]``: that means "none", not the spec default. Re-parsing the output yields the same effective values.
       ``from_dict(md.to_dict()).to_dict() == md.to_dict()``
       holds for any metadata, including ``end_session_endpoint`` and extras.
 
