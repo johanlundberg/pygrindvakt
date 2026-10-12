@@ -1148,8 +1148,140 @@ def test_from_metadata_drops_unsafe_end_session_endpoint():
         info = rp.ProviderInfo.from_metadata(md)
         assert info.end_session_endpoint is None
         assert info.token_endpoint == f"{ISSUER}/token"
-        with pytest.raises(ConfigError, match="no usable end_session_endpoint"):
+        with pytest.raises(ConfigError, match="different origin than the issuer"):
             rp.end_session_url(info)
+
+
+def _pi(endpoint, issuer=ISSUER, **kw):
+    return rp.ProviderInfo(issuer, f"{issuer}/authorization", f"{issuer}/token",
+                           end_session_endpoint=endpoint, **kw)
+
+
+def _md_with(endpoint, issuer=ISSUER):
+    return metadata.ProviderMetadata.from_dict(
+        metadata.ProviderMetadata(issuer).to_dict() | {"end_session_endpoint": endpoint})
+
+
+SAME_ORIGIN = [
+    "https://op.example.com/l",
+    "https://op.example.com:443/l",
+    "https://OP.Example.COM/l",
+    "HTTPS://op.example.com/l?x=1",
+]
+CROSS_ORIGIN = [
+    "https://evil.example/logout",
+    "https://sub.op.example.com/l",
+    "https://op.example.com:8443/l",
+    "https://op.example.com./l",
+    "https://op.example.com@evil.example/l",
+    "https://op.example.com.evil.example/l",
+    "https://evil.example/https://op.example.com/l",
+]
+
+
+@pytest.mark.parametrize("ep", SAME_ORIGIN)
+def test_end_session_same_origin_accepted(ep):
+    assert _pi(ep).end_session_endpoint == ep
+    assert rp.ProviderInfo.from_metadata(_md_with(ep)).end_session_endpoint == ep
+
+
+@pytest.mark.parametrize("ep", CROSS_ORIGIN)
+def test_end_session_cross_origin_rejected_and_dropped(ep):
+    with pytest.raises(GrindvaktError):
+        _pi(ep)
+    info = rp.ProviderInfo.from_metadata(_raw_md(ep))
+    assert info.end_session_endpoint is None
+    with pytest.raises(ConfigError, match="different origin than the issuer"):
+        rp.end_session_url(info, id_token_hint="tok")
+
+
+def test_from_metadata_warns_when_dropping_end_session():
+    import warnings
+
+    with pytest.warns(UserWarning, match="different origin than the issuer.*allow_cross_origin_end_session=True"):
+        info = rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/logout"))
+    assert info.end_session_endpoint is None
+    with pytest.warns(UserWarning, match="unsafe"):
+        rp.ProviderInfo.from_metadata(_raw_md("https://op.example.com/l#frag"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        # a warnings filter of "error" must not make login depend on logout
+        dropped = rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/logout"))
+        assert dropped.end_session_endpoint is None
+        rp.ProviderInfo.from_metadata(_raw_md("https://op.example.com/l"))
+        rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/l"), allow_cross_origin_end_session=True)
+        rp.ProviderInfo.from_metadata(rp.discover(_NoEndSession(), ISSUER))
+
+
+class _NoEndSession:
+    def get(self, url):
+        return 200, json.dumps(metadata.ProviderMetadata(ISSUER).to_dict()).encode(), "application/json"
+
+    def post_form(self, url, form, headers):
+        raise AssertionError
+
+
+def test_end_session_constructor_error_says_cross_origin():
+    with pytest.raises(BadRequestError, match="different origin"):
+        _pi("https://evil.example/logout")
+
+
+def test_end_session_explicit_default_port_issuer():
+    iss = "https://op.example.com:443"
+    assert _pi("https://op.example.com/l", issuer=iss).end_session_endpoint == "https://op.example.com/l"
+
+
+def test_end_session_loopback_http_issuer_origin_binding():
+    iss = "http://localhost:8000"
+    assert _pi("http://localhost:8000/l", issuer=iss).end_session_endpoint
+    for bad in ["http://localhost:9000/l", "http://127.0.0.1:8000/l", "http://localhost/l"]:
+        with pytest.raises(GrindvaktError):
+            _pi(bad, issuer=iss)
+    # scheme differs: https on the loopback host/port is still another origin
+    with pytest.raises(GrindvaktError):
+        _pi("https://localhost:8000/l", issuer=iss)
+    v6 = "http://[::1]:8000"
+    assert _pi("http://[::1]:8000/l", issuer=v6).end_session_endpoint
+    with pytest.raises(GrindvaktError):
+        _pi("http://[::1]:8001/l", issuer=v6)
+
+
+def test_end_session_review_poc_now_config_error():
+    md = metadata.ProviderMetadata.from_dict(
+        metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": "https://evil.example/logout"})
+    info = rp.ProviderInfo.from_metadata(md)
+    with pytest.raises(ConfigError):
+        rp.end_session_url(info, id_token_hint="secret-id-token")
+
+
+def test_end_session_cross_origin_opt_in():
+    ep = "https://logout.other.example/l"
+    info = _pi(ep, allow_cross_origin_end_session=True)
+    assert info.end_session_endpoint == ep
+    info2 = rp.ProviderInfo.from_metadata(_md_with(ep), allow_cross_origin_end_session=True)
+    assert info2.end_session_endpoint == ep
+    url = rp.end_session_url(info2, id_token_hint="tok")
+    assert url.startswith("https://logout.other.example/l?") and "id_token_hint=tok" in url
+
+
+def test_end_session_opt_in_still_validates_unsafe():
+    for bad in ["http://evil.example/l", "https://evil.example/l#f", "https://u:p@evil.example/l"]:
+        with pytest.raises(GrindvaktError):
+            _pi(bad, allow_cross_origin_end_session=True)
+        info = rp.ProviderInfo.from_metadata(_raw_md(bad), allow_cross_origin_end_session=True)
+        assert info.end_session_endpoint is None
+
+
+def _raw_md(bad):
+    class Http:
+        def get(self, url):
+            return 200, json.dumps(metadata.ProviderMetadata(ISSUER).to_dict()
+                                   | {"end_session_endpoint": bad}).encode(), "application/json"
+
+        def post_form(self, url, form, headers):
+            raise AssertionError
+
+    return rp.discover(Http(), ISSUER)
 
 
 def _logout_client(*uris):

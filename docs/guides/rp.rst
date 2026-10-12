@@ -424,8 +424,26 @@ exactly equals a registered entry; anything else (including a value from
 ``BadRequestError``. This prevents logout from becoming an open redirect that
 also carries ``id_token_hint``. A provider
 without an ``end_session_endpoint`` makes ``end_session_url`` raise
-``ConfigError``; end only the local session in that case. The endpoint is
-validated like the other endpoints (https, no credentials or fragment).
+``ConfigError``; end only the local session in that case.
+
+``id_token_hint`` carries the full ID token and goes to the first hop, the
+host of the ``end_session_endpoint``. Therefore ``ProviderInfo`` requires that
+endpoint to have the same origin as the issuer (scheme, host, effective port),
+besides the https / no-credentials / no-fragment checks. ``ProviderInfo(...)``
+raises ``BadRequestError`` for a cross-origin endpoint, and
+``ProviderInfo.from_metadata`` drops it, so ``info.end_session_endpoint`` is
+``None`` and ``end_session_url`` raises ``ConfigError`` (the advertised endpoint
+was missing, unsafe, or on a different origin than the issuer). If the OP
+legitimately logs out on another origin, opt in explicitly with
+``allow_cross_origin_end_session=True`` on ``ProviderInfo(...)`` or
+``ProviderInfo.from_metadata(...)``.
+
+``ProviderMetadata`` itself only checks scheme, credentials, fragment and
+control characters; it does not compare hosts with the issuer. An RP that gets
+metadata from anything other than its own TLS discovery of the issuer (a
+config service, a database row) must pin the host itself. The other metadata
+endpoints (revocation, introspection, PAR, ``check_session_iframe``) are not
+origin-checked.
 
 Security notes
 --------------

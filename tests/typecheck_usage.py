@@ -106,7 +106,21 @@ def use_all() -> None:
     )
     del registered
     es: str | None = info.end_session_endpoint
-    rp.ProviderInfo("i", "a", "t", end_session_endpoint="https://x/logout")
+    rp.ProviderInfo(
+        "https://op.example.com", "https://op.example.com/a",
+        "https://op.example.com/t",
+        end_session_endpoint="https://op.example.com/logout",
+    )
+    rp.ProviderInfo(
+        "https://op.example.com", "https://op.example.com/a",
+        "https://op.example.com/t",
+        end_session_endpoint="https://logout.other.example/logout",
+        allow_cross_origin_end_session=True,
+    )
+    xo: rp.ProviderInfo = rp.ProviderInfo.from_metadata(
+        md, allow_cross_origin_end_session=True
+    )
+    del xo
     acr: list[str] | None = md.acr_values_supported
     flag: bool | None = md.backchannel_logout_supported
     rev: str | None = md.revocation_endpoint

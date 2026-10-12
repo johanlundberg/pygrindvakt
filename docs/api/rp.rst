@@ -22,7 +22,7 @@ Networked calls block the calling thread with the GIL released.
 Provider and client
 -------------------
 
-.. py:class:: ProviderInfo(issuer: str, authorization_endpoint: str, token_endpoint: str, userinfo_endpoint: str | None = None, jwks_uri: str | None = None, *, end_session_endpoint: str | None = None)
+.. py:class:: ProviderInfo(issuer: str, authorization_endpoint: str, token_endpoint: str, userinfo_endpoint: str | None = None, jwks_uri: str | None = None, *, end_session_endpoint: str | None = None, allow_cross_origin_end_session: bool = False)
 
    The minimal upstream-provider information the RP needs. Immutable. Build
    one by hand for a statically configured provider, or with
@@ -33,14 +33,27 @@ Provider and client
    development origin, and then only for loopback endpoint hosts. URL
    credentials and fragments are rejected before any credentials can be sent.
 
-   .. py:staticmethod:: from_metadata(metadata: ProviderMetadata) -> ProviderInfo
+   ``end_session_endpoint`` additionally must have the **same origin as the
+   issuer** (scheme, host compared case-insensitively after IDNA
+   normalisation, and effective port; an explicit default port equals the
+   implicit one), because :func:`end_session_url` sends ``id_token_hint`` (the
+   full ID token) to that endpoint's host. A cross-origin endpoint raises
+   :class:`pygrindvakt.BadRequestError` unless
+   ``allow_cross_origin_end_session=True`` is passed, for OPs that legitimately
+   log out on another origin; the scheme, userinfo and fragment checks still
+   apply then. No other endpoint is origin-checked.
+
+   .. py:staticmethod:: from_metadata(metadata: ProviderMetadata, *, allow_cross_origin_end_session: bool = False) -> ProviderInfo
 
       Build from a :class:`pygrindvakt.metadata.ProviderMetadata` (as
       returned by :func:`discover`); the userinfo endpoint is ``None``
       if the provider does not advertise one. An advertised
-      ``end_session_endpoint`` is carried over if it passes issuer validation;
-      an unsafe one is dropped (``None``) so login never depends on logout
-      (the direct constructor stays strict and raises).
+      ``end_session_endpoint`` is carried over if it is safe (https, no userinfo
+      or fragment) and has the same origin as the issuer, or
+      ``allow_cross_origin_end_session=True`` is passed. Otherwise it is dropped
+      (``None``) so login never depends on logout; :func:`end_session_url`
+      then raises :class:`pygrindvakt.ConfigError`. (The direct constructor is
+      strict and raises.)
 
    .. py:property:: issuer
       :type: str
@@ -56,7 +69,8 @@ Provider and client
       :type: str | None
 
       OIDC RP-Initiated Logout endpoint, or ``None``. Validated like the
-      other endpoints at construction. Used by :func:`end_session_url`.
+      other endpoints at construction and bound to the issuer's origin
+      (see above). Used by :func:`end_session_url`.
 
 .. py:class:: RpClient(client_id: str, redirect_uri: str, *, scope: str = "openid profile email", client_secret: str | None = None, auth_method: str | None = None, signing_key: SigningKey | None = None, post_logout_redirect_uris: list[str] | None = None)
 
@@ -211,8 +225,10 @@ Discovery and keys
    redirect carrying ``id_token_hint``. It must also be registered at the OP. ``extra`` may not
    contain ``id_token_hint``, ``client_id``, ``post_logout_redirect_uri``,
    ``state``, ``logout_hint`` or ``ui_locales``, and neither may the endpoint's
-   own query. Raises :class:`pygrindvakt.ConfigError` when the provider has no
-   ``end_session_endpoint`` and :class:`pygrindvakt.BadRequestError` for unsafe
+   own query. ``id_token_hint`` is sent to the first hop, the host of
+   ``provider.end_session_endpoint``. Raises :class:`pygrindvakt.ConfigError`
+   when the provider's endpoint was missing, unsafe, or on a different origin
+   than the issuer (so it is ``None``), and :class:`pygrindvakt.BadRequestError` for unsafe
    or invalid input. ``state`` is echoed back to ``post_logout_redirect_uri``
    by the OP; generate it like the login ``state`` and verify it.
 

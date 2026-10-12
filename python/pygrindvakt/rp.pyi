@@ -7,7 +7,17 @@ from .keys import SigningKey
 from .metadata import ProviderMetadata
 
 class ProviderInfo:
-    """Minimal upstream-provider information the RP needs."""
+    """Minimal upstream-provider information the RP needs.
+
+    ``end_session_endpoint`` receives ``id_token_hint`` (the full ID token) in
+    the query string, so it must have the same origin as ``issuer`` (scheme,
+    host, effective port) unless ``allow_cross_origin_end_session=True``. The
+    constructor raises ``BadRequestError`` for a cross-origin endpoint without
+    the opt-in; ``from_metadata`` drops it to ``None`` instead (so
+    ``end_session_url`` raises ``ConfigError``). The opt-in still requires the
+    scheme/userinfo/fragment checks to pass. Other metadata endpoints are not
+    origin-checked.
+    """
 
     def __init__(
         self,
@@ -18,9 +28,12 @@ class ProviderInfo:
         jwks_uri: str | None = ...,
         *,
         end_session_endpoint: str | None = ...,
+        allow_cross_origin_end_session: bool = ...,
     ) -> None: ...
     @staticmethod
-    def from_metadata(metadata: ProviderMetadata) -> ProviderInfo: ...
+    def from_metadata(
+        metadata: ProviderMetadata, *, allow_cross_origin_end_session: bool = ...
+    ) -> ProviderInfo: ...
     @property
     def issuer(self) -> str: ...
     @property

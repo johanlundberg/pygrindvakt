@@ -154,17 +154,25 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
    setters). URL-typed members, that is every ``*_endpoint`` member
    (``end_session_endpoint``, ``revocation_endpoint``,
    ``introspection_endpoint``, ``pushed_authorization_request_endpoint``) and
-   ``check_session_iframe``, are additionally **URL-validated** against the
-   metadata's own issuer on every one of those paths: an absolute URL, https
-   (or loopback http), no fragment, no userinfo. A bad value raises
-   ``ValueError`` from all of them. ``service_documentation``,
+   ``check_session_iframe``, are additionally **URL-validated** on every one of those paths: an absolute
+   https URL (loopback http only for a loopback issuer), no userinfo, no
+   fragment, no control characters. A bad value raises ``ValueError`` from all
+   of them. The host is **not** compared with the issuer: an OP may publish
+   any host, so ``ProviderMetadata`` stays origin-permissive. An RP that
+   consumes metadata from anything other than its own TLS discovery of the
+   issuer must pin the host itself. The RP side binds only
+   ``end_session_endpoint``, in :class:`~pygrindvakt.rp.ProviderInfo` (same
+   origin as the issuer unless ``allow_cross_origin_end_session=True``), because
+   ``id_token_hint`` is sent there. ``revocation_endpoint``,
+   ``introspection_endpoint``, ``pushed_authorization_request_endpoint`` and
+   ``check_session_iframe`` are not origin-checked anywhere. ``service_documentation``,
    ``op_policy_uri`` and ``op_tos_uri`` are informational links and are
    type-checked only. :class:`~pygrindvakt.provider.Provider` emits a
    ``UserWarning`` at construction when the metadata advertises logout,
    revocation, introspection, PAR or session members the engine does not
    implement; publishing is still allowed. Building a
-   :class:`~pygrindvakt.rp.ProviderInfo` (the constructor raises;
-   ``from_metadata`` drops an unsafe ``end_session_endpoint``) and calling
+   :class:`~pygrindvakt.rp.ProviderInfo` (the constructor raises on an unsafe or cross-origin
+   ``end_session_endpoint``; ``from_metadata`` drops it) and calling
    :func:`~pygrindvakt.rp.end_session_url` validate it again.
 
    Documents returned by :func:`~pygrindvakt.rp.discover` are not type-checked
@@ -183,7 +191,9 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       :type: str | None
 
       OIDC RP-Initiated Logout endpoint. The setter validates it as an https
-      URL for the issuer (loopback http only for a loopback issuer). A
+      URL (loopback http only for a loopback issuer) without comparing its host
+      to the issuer; the origin rule lives on
+      :class:`~pygrindvakt.rp.ProviderInfo`. A
       :class:`~pygrindvakt.provider.Provider` advertises it in its discovery
       document when set; the provider does not implement a logout endpoint
       itself.

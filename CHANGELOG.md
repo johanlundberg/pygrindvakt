@@ -71,8 +71,15 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   previously refused on the OP side because the library implements no logout.
   They are now accepted (RP-Initiated Logout needs `end_session_endpoint`).
   URL-typed members (every `*_endpoint` and `check_session_iframe`) are
-  validated against the metadata's issuer (https or loopback http, no
-  fragment, no userinfo) on every write path: `from_dict`, the `extra` setter,
+  validated on every write path (absolute https URL, or loopback http for a
+  loopback issuer; no userinfo, no fragment, no control characters). The host
+  is NOT compared with the issuer for `ProviderMetadata` members: an OP may
+  publish any host, and an RP consuming metadata from anything other than its
+  own TLS discovery must pin the host itself. The RP-side
+  `ProviderInfo.end_session_endpoint` IS origin-bound (see below).
+  `revocation_endpoint`, `introspection_endpoint`,
+  `pushed_authorization_request_endpoint` and `check_session_iframe` are not
+  origin-checked anywhere. Validation applies on: `from_dict`, the `extra` setter,
   `set_extra_field` and the typed setters. Inputs that were accepted (for
   example `"javascript:x"` or non-loopback `http://` via `from_dict` /
   `extra` / `set_extra_field`) now raise `ValueError`. The dedicated
@@ -118,13 +125,27 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 - RP-Initiated Logout (OIDC 1.0): `rp.end_session_url(provider, *, id_token_hint,
   client, post_logout_redirect_uri, state, logout_hint, ui_locales, extra)`;
   `ProviderInfo(..., *, end_session_endpoint=None)` and a read-only
-  `ProviderInfo.end_session_endpoint` (copied by `from_metadata`, validated
-  like other endpoints); `ProviderMetadata.end_session_endpoint` (validated
+  `ProviderInfo.end_session_endpoint` (copied by `from_metadata`; scheme,
+  userinfo and fragment validated like other endpoints, and bound to the
+  issuer's origin, see below); `ProviderMetadata.end_session_endpoint` (validated
   setter). A `Provider` advertises it when the caller sets it (with a
   `UserWarning`); no logout endpoint is implemented on the OP side.
-- `ProviderInfo.from_metadata` drops an advertised `end_session_endpoint` that
-  fails issuer validation (it becomes `None`) instead of raising, so login never
-  depends on logout; the `ProviderInfo` constructor stays strict.
+- `ProviderInfo.end_session_endpoint` must have the same origin as the issuer
+  (scheme, case-insensitive/IDNA-normalised host, effective port; `:443` equals
+  the default) because `end_session_url` sends `id_token_hint` (the full ID
+  token) to that host. The constructor raises `BadRequestError` for a
+  cross-origin endpoint; `ProviderInfo.from_metadata` drops it to `None` (so
+  login never depends on logout) and `end_session_url` then raises
+  `ConfigError` ("missing, unsafe, or on a different origin than the issuer").
+  OPs that legitimately log out on another origin opt in with keyword-only
+  `allow_cross_origin_end_session=True` on `ProviderInfo(...)` and
+  `ProviderInfo.from_metadata(...)`; the scheme/userinfo/fragment checks still
+  apply. `ProviderMetadata.end_session_endpoint` stays origin-permissive.
+  Migration: `ProviderInfo.from_metadata` now ignores an
+  `end_session_endpoint` on a different origin than the issuer (or an unsafe
+  one) and emits a `UserWarning` saying so; the strict constructor raises. OPs
+  that legitimately log out on another host (for example the AWS Cognito
+  hosted UI) need `allow_cross_origin_end_session=True`.
 - `ProviderMetadata.raw` (source document snapshot; for `rp.discover` it is the
   fetched body) and `to_dict(*, exclude_defaults=False)`.
 - Typed accessors (`None` when absent) for known extension members stored in

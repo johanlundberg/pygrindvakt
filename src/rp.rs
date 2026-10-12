@@ -68,15 +68,64 @@ pub struct ProviderInfo {
     pub end_session_endpoint: Option<String>,
 }
 
-/// Validate an `end_session_endpoint` against the provider's issuer.
-fn validate_end_session_endpoint(endpoint: &str, issuer: &str) -> PyResult<()> {
-    grp::validate_service_endpoint_for_issuer("end_session_endpoint", endpoint, issuer).map_err(err)
+/// Same-origin test: scheme, host (the `url` crate lower-cases and IDNA-
+/// normalises; a trailing dot is NOT stripped, so `op.example.` differs from
+/// `op.example`) and effective port (default ports equal explicit ones).
+fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(a), Ok(b)) = (url::Url::parse(a), url::Url::parse(b)) else {
+        return false;
+    };
+    a.scheme() == b.scheme()
+        && a.host().is_some()
+        && a.host() == b.host()
+        && a.port_or_known_default().is_some()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Why an `end_session_endpoint` was refused.
+enum EndSessionReject {
+    /// Fails the shared scheme/userinfo/fragment/control-char rules.
+    Unsafe(RsError),
+    /// Safe, but not the issuer's origin and no opt-in.
+    CrossOrigin,
+}
+
+/// Single validation point: the shared safety rules (upstream), then (unless
+/// `allow_cross_origin`) same origin as the issuer, because `id_token_hint`
+/// is sent to the endpoint's host.
+fn check_end_session_endpoint(
+    endpoint: &str,
+    issuer: &str,
+    allow_cross_origin: bool,
+) -> Result<(), EndSessionReject> {
+    grp::validate_service_endpoint_for_issuer("end_session_endpoint", endpoint, issuer)
+        .map_err(EndSessionReject::Unsafe)?;
+    if !allow_cross_origin && !same_origin(endpoint, issuer) {
+        return Err(EndSessionReject::CrossOrigin);
+    }
+    Ok(())
+}
+
+/// `check_end_session_endpoint` as a raising Python-facing check.
+fn validate_end_session_endpoint(
+    endpoint: &str,
+    issuer: &str,
+    allow_cross_origin: bool,
+) -> PyResult<()> {
+    check_end_session_endpoint(endpoint, issuer, allow_cross_origin).map_err(|r| match r {
+        EndSessionReject::Unsafe(e) => err(e),
+        EndSessionReject::CrossOrigin => err(RsError::BadRequest(format!(
+            "end_session_endpoint {endpoint:?} is on a different origin than the issuer \
+             {issuer:?}; id_token_hint would be sent to that host. Pass \
+             allow_cross_origin_end_session=True only if the OP legitimately logs out there"
+        ))),
+    })
 }
 
 #[pymethods]
 impl ProviderInfo {
     #[new]
-    #[pyo3(signature = (issuer, authorization_endpoint, token_endpoint, userinfo_endpoint = None, jwks_uri = None, *, end_session_endpoint = None))]
+    #[pyo3(signature = (issuer, authorization_endpoint, token_endpoint, userinfo_endpoint = None, jwks_uri = None, *, end_session_endpoint = None, allow_cross_origin_end_session = false))]
     fn new(
         issuer: String,
         authorization_endpoint: String,
@@ -84,6 +133,7 @@ impl ProviderInfo {
         userinfo_endpoint: Option<String>,
         jwks_uri: Option<String>,
         end_session_endpoint: Option<String>,
+        allow_cross_origin_end_session: bool,
     ) -> PyResult<Self> {
         let inner = grp::ProviderInfo {
             issuer,
@@ -94,7 +144,7 @@ impl ProviderInfo {
         };
         inner.validate().map_err(err)?;
         if let Some(e) = &end_session_endpoint {
-            validate_end_session_endpoint(e, &inner.issuer)?;
+            validate_end_session_endpoint(e, &inner.issuer, allow_cross_origin_end_session)?;
         }
         Ok(Self {
             inner,
@@ -104,10 +154,17 @@ impl ProviderInfo {
 
     /// Build from a discovered `ProviderMetadata` document (the userinfo
     /// endpoint is `None` if the provider does not advertise one). An
-    /// advertised `end_session_endpoint` is carried over; one that fails
-    /// issuer validation is dropped (`None`) so login never depends on logout.
+    /// advertised `end_session_endpoint` is carried over; one that is unsafe
+    /// or on a different origin than the issuer (unless
+    /// `allow_cross_origin_end_session`) is dropped (`None`) so login never
+    /// depends on logout.
     #[staticmethod]
-    fn from_metadata(metadata: &ProviderMetadata) -> PyResult<Self> {
+    #[pyo3(signature = (metadata, *, allow_cross_origin_end_session = false))]
+    fn from_metadata(
+        py: Python<'_>,
+        metadata: &ProviderMetadata,
+        allow_cross_origin_end_session: bool,
+    ) -> PyResult<Self> {
         let inner = grp::ProviderInfo::from(metadata.inner.clone());
         inner.validate().map_err(err)?;
         let end_session_endpoint = metadata
@@ -118,8 +175,38 @@ impl ProviderInfo {
             .map(str::to_owned);
         // Login must not depend on logout: an advertised endpoint that fails
         // issuer validation is dropped rather than raised.
-        let end_session_endpoint = end_session_endpoint
-            .filter(|e| validate_end_session_endpoint(e, &inner.issuer).is_ok());
+        let end_session_endpoint = match end_session_endpoint {
+            Some(e) => {
+                match check_end_session_endpoint(&e, &inner.issuer, allow_cross_origin_end_session)
+                {
+                    Ok(()) => Some(e),
+                    Err(reject) => {
+                        let reason = match reject {
+                            EndSessionReject::CrossOrigin => format!(
+                                "end_session_endpoint {e:?} is on a different origin than the \
+                                 issuer and was ignored; pass \
+                                 allow_cross_origin_end_session=True to trust it"
+                            ),
+                            EndSessionReject::Unsafe(cause) => {
+                                format!("end_session_endpoint {e:?} is unsafe ({cause}) and was ignored")
+                            }
+                        };
+                        let msg =
+                            std::ffi::CString::new(reason.replace('\0', "?")).expect("NUL removed");
+                        // Best effort: a warnings filter of "error" must not
+                        // make login depend on logout.
+                        let _ = PyErr::warn(
+                            py,
+                            &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                            &msg,
+                            1,
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(Self {
             inner,
             end_session_endpoint,
@@ -676,12 +763,14 @@ fn end_session_url(
 ) -> PyResult<String> {
     let endpoint = provider.end_session_endpoint.as_deref().ok_or_else(|| {
         err(RsError::Config(
-            "provider has no usable end_session_endpoint (none advertised, or the advertised one \
-             was rejected as unsafe)"
+            "provider has no usable end_session_endpoint (the advertised endpoint was missing, \
+             unsafe, or on a different origin than the issuer)"
                 .into(),
         ))
     })?;
-    validate_end_session_endpoint(endpoint, &provider.inner.issuer)?;
+    // Origin binding was decided when the ProviderInfo was built (it may have
+    // opted in); re-check only the shared safety rules here.
+    validate_end_session_endpoint(endpoint, &provider.inner.issuer, true)?;
     let mut url = url::Url::parse(endpoint).map_err(|e| {
         err(RsError::BadRequest(format!(
             "invalid end_session_endpoint: {e}"
