@@ -785,3 +785,34 @@ def test_fetch_userinfo_with_cache_rejects_issuer_mismatch():
             client_id=CLIENT_ID, allowed_algorithms=["ES256"], trust="dedicated_keys",
         )
     assert http.calls == 0  # rejected before any request
+
+
+def test_unknown_kid_after_single_flight_never_uses_expired_snapshot():
+    """A waiter must not verify with a set another thread stored already expired."""
+    k1, k2 = make_key("k1"), make_key("k2")
+    http = ScriptedHttp(jwks_doc(k1))
+    http.headers = [("cache-control", "max-age=3600")]
+    cache, _ = make_cache(http, min_ttl=0, min_refresh_interval=0)
+    cache.jwks()  # E1: {k1}, valid
+    assert http.calls == 1
+    # From now on the OP rotates and answers no-store: with min_ttl=0 the new
+    # set expires the moment it is stored.
+    http.doc = jwks_doc(k1, k2)
+    http.headers = [("cache-control", "no-store")]
+    http.delay = 0.4
+    token = id_token(k2)
+    results = []
+
+    def work():
+        results.append(verify(cache, token))
+
+    a = threading.Thread(target=work)
+    b = threading.Thread(target=work)
+    a.start()
+    time.sleep(0.1)
+    b.start()
+    a.join()
+    b.join()
+    assert len(results) == 2
+    # A fetched once; B waited, found the stored set expired and fetched again.
+    assert http.calls == 3

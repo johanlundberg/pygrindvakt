@@ -1349,10 +1349,15 @@ impl JwksCache {
             return Ok(entry.jwks.clone());
         }
         let _flight = self.begin_flight(py);
-        let entry = match self.snapshot() {
+        // Re-select through `valid_entry`: the wait may have outlived the old
+        // entry, or another thread may have stored a zero-TTL set. Never
+        // verify with an expired snapshot; fetch again instead.
+        let now = self.now();
+        let entry = match self.valid_entry(now) {
             // Another thread refreshed while we waited.
             Some(current) if !Arc::ptr_eq(&current, &entry) => current,
-            _ if self.rate_limited(self.now()) => entry,
+            // Rate-limited: keep the (still valid) entry we already have.
+            Some(current) if self.rate_limited(now) => current,
             _ => self.fetch(py)?,
         };
         if kid_unknown(&entry.jwks, &kid) {
