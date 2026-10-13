@@ -772,7 +772,7 @@ def test_collection_entity_value_semantics():
     assert a == b
     assert a != c
     assert a != "https://op.example"
-    assert a != object()
+    assert (a == object()) is False  # exercises __eq__ itself, not the __ne__ path
     assert a.entity_id == "https://op.example"
     assert a.display_name == "OP"
     assert a.logo_uri is None
