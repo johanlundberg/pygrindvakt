@@ -877,7 +877,7 @@ def test_failing_constructor_does_not_warn(op_key):
     md.end_session_endpoint = f"{ISSUER}/logout"
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        with pytest.raises(Exception) as ei:
+        with pytest.raises(TypeError):
             provider.Provider(
                 md,
                 op_key,
@@ -885,7 +885,6 @@ def test_failing_constructor_does_not_warn(op_key):
                 tokens.TokenCodec("s"),
                 token_use_store=provider.InMemoryTokenUseStore(),
             )
-        assert not isinstance(ei.value, UserWarning)
         with pytest.raises(ValueError, match="token_use_store"):
             from pygrindvakt import client
 
