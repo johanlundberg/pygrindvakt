@@ -114,8 +114,10 @@ framework integrations cannot accidentally omit deployment-critical choices.
        UserInfo or JWKS traffic at plaintext ``http``, a ``javascript:`` URL or
        a fragment-bearing URL.
      - None; fix the document. :func:`~pygrindvakt.rp.discover` deliberately
-       does **not** apply this check, so it never fails over a foreign
-       document: re-validate before you act on what ``raw`` contains.
+       does **not** apply the binding's own checks (extension members, the
+       empty-string endpoint rule), so the binding adds no failures over a
+       foreign document; upstream discovery still rejects malformed modelled
+       endpoints. Re-validate before you act on what ``raw`` contains.
 
 If grindvakt later adopts these guards upstream, the binding's checks become
 redundant but harmless.

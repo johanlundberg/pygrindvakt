@@ -177,13 +177,15 @@ REDIS_URL=redis://127.0.0.1/ .venv/bin/python -m pytest tests/ -m redis
 `just` wraps the same gates: `just check` runs ruff lint, ruff format check,
 `mypy --strict` over `tests/typecheck_usage.py`, pytest and `just docs-version`
 (which fails if the grindvakt version documented here and in `docs/index.rst`
-has drifted from `Cargo.lock`); `just --list` shows the rest. `just release
+has drifted from `Cargo.lock`, or the `docs/conf.py` fallback `release` from
+`Cargo.toml`; it does not read `CHANGELOG.md`); `just --list` shows the rest. `just release
 <version>` creates and pushes the signed tag that triggers the release workflow
 (it refuses a tag that disagrees with `Cargo.toml` / `pyproject.toml`).
 
 When the `grindvakt` dependency is bumped, update the version in this README, in
 `docs/index.rst` (prose and the compatibility table) and in `CHANGELOG.md` in
-the same commit; `just docs-version` is the check.
+the same commit; `just docs-version` checks the README and `docs/index.rst`, not
+the changelog.
 
 ## Documentation
 
