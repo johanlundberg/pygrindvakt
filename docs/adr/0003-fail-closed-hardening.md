@@ -1,6 +1,8 @@
 # ADR 0003: Fail-closed hardening added at the binding boundary
 
-- **Status:** Amended by the 0.8 OIDC conformance hardening
+- **Status:** Amended by the grindvakt 0.8 conformance hardening (pygrindvakt
+  0.1.0); extended by [`ADR 0004`](0004-redirect-registration-and-hash-binding.md)
+  for the pygrindvakt 0.2.0 (grindvakt 0.9.0) guards
 - **Date:** 2026-09-02
 - **Deciders:** pygrindvakt maintainers
 

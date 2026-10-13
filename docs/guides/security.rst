@@ -79,6 +79,49 @@ framework integrations cannot accidentally omit deployment-critical choices.
        ``server_error`` / :class:`pygrindvakt.InternalError`.
      - Not applicable (Rust traits).
      - None.
+   * - The per-call ``redirect_uri=`` override of
+       :func:`~pygrindvakt.rp.authorization_url`,
+       :func:`~pygrindvakt.rp.signed_request_object`,
+       :func:`~pygrindvakt.rp.begin` and :func:`~pygrindvakt.rp.exchange_code`
+       is accepted only if it equals the client's ``redirect_uri`` or an entry
+       of :class:`RpClient(redirect_uris=[...]) <pygrindvakt.rp.RpClient>`
+       (:class:`~pygrindvakt.BadRequestError` otherwise). Registered entries
+       are checked at construction and may not be plain ``http`` to a
+       non-loopback host; the client's own ``redirect_uri`` is not
+       transport-checked.
+     - The override is often derived from a request parameter. Accepting any
+       valid URL lets an attacker send the authorization request with their own
+       ``redirect_uri`` and receive the code.
+     - ``RpClient(allow_unregistered_redirect_uri=True)`` skips the
+       registration check (an override that differs from ``redirect_uri``
+       must still be a valid URL and not plaintext http to a non-loopback
+       host). It is set at construction, shows up in ``repr()``, and emits **no
+       warning**: use it only for RFC 7591 dynamic registrations.
+   * - :func:`~pygrindvakt.rp.end_session_url` accepts a
+       ``post_logout_redirect_uri`` only when ``client=`` is passed and the
+       value is registered on
+       :class:`RpClient(post_logout_redirect_uris=[...]) <pygrindvakt.rp.RpClient>`,
+       and :class:`~pygrindvakt.rp.ProviderInfo` binds ``end_session_endpoint``
+       to the issuer's origin.
+     - The logout URL carries ``id_token_hint`` (the whole ID token) to the
+       OP only. An unregistered ``post_logout_redirect_uri`` turns a crafted
+       logout link into an open redirect to an attacker-chosen host, unless
+       the OP rejects it.
+     - None for the registration check. ``allow_cross_origin_end_session=True``
+       on ``ProviderInfo`` / ``from_metadata`` for OPs that legitimately log
+       out on another origin.
+   * - :class:`~pygrindvakt.metadata.ProviderMetadata` URL-validates the
+       modelled endpoints, the extension ``*_endpoint`` members and the
+       ``issuer`` on every write path (constructor, ``from_dict``, setters,
+       ``set_extra_field``).
+     - A document served under a trusted URL could otherwise point token,
+       UserInfo or JWKS traffic at plaintext ``http``, a ``javascript:`` URL or
+       a fragment-bearing URL.
+     - None; fix the document. :func:`~pygrindvakt.rp.discover` deliberately
+       does **not** apply the binding's own checks (extension members, the
+       empty-string endpoint rule), so the binding adds no failures over a
+       foreign document; upstream discovery still rejects malformed modelled
+       endpoints. Re-validate before you act on what ``raw`` contains.
 
 If grindvakt later adopts these guards upstream, the binding's checks become
 redundant but harmless.
@@ -268,6 +311,13 @@ Each is named so it stands out in a code review.
    id_token without ever having sent a nonce. In the standard code flow it
    allows id_token replay. See :doc:`rp`.
 
+``RpClient(allow_unregistered_redirect_uri=True)``
+   Turns off the registration check on per-call ``redirect_uri`` overrides, so
+   any syntactically valid URL that is not plaintext ``http`` to a non-loopback
+   host is accepted. Unlike the ``unsafe_*`` arguments it warns nothing at call
+   time; the flag is visible in ``repr()`` and in the constructor call. Legitimate only for RFC 7591 dynamic
+   registrations, and never with a value that came from request data.
+
 :func:`pygrindvakt.jwt.peek_claims_unverified` and :func:`pygrindvakt.federation.decode_unverified`
    Return claims without checking any signature. For inspection only (which
    key set to fetch, which authority to ask). Never make a decision on their
@@ -318,8 +368,18 @@ Checklist for a production RP
 #. Pass a non-empty allowlist of ID-token signing algorithms derived from
    trusted provider configuration, and opt in explicitly to any additional
    audience you trust.
+#. Register every login redirect URI on the :class:`~pygrindvakt.rp.RpClient`
+   (``redirect_uris=[...]``) instead of passing ``allow_unregistered_redirect_uri``,
+   and register the ``post_logout_redirect_uris`` you use with
+   :func:`~pygrindvakt.rp.end_session_url`.
+#. In an implicit / hybrid flow, pass the ``access_token`` /
+   ``authorization_code`` together with ``require_at_hash`` /
+   ``require_c_hash`` or ``strict_hashes=True``, so an id_token carrying a hash
+   claim that cannot be checked is refused instead of accepted.
 #. Prefer ``private_key_jwt`` over shared secrets; the OP then holds only
    your public key.
 #. Keep the built-in HTTP client, or make sure your own never follows
    redirects, enforces timeouts and caps bodies.
 #. Treat ``AuthnError`` messages as log material.
+#. Do not set ``unsafe_skip_nonce_check`` or
+   ``allow_unregistered_redirect_uri``; register the redirect URIs instead.

@@ -32,8 +32,34 @@ format-check:
 format:
     .venv/bin/ruff format {{ python_dirs }}
 
-# Everything: ruff lint + format check, mypy, tests.
-check: lint format-check typecheck test
+# Everything: ruff lint + format check, mypy, tests, docs version check.
+check: lint format-check typecheck test docs-version
+
+# Fail if the grindvakt version documented in README.md / docs/index.rst has
+# drifted from the one Cargo.lock pins, or the docs/conf.py fallback release from
+# Cargo.toml (the release-time doc traps).
+docs-version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    locked="$(awk '/^name = "grindvakt"$/{getline; gsub(/[^0-9.]/, ""); print; exit}' Cargo.lock)"
+    if [[ -z "${locked}" ]]; then
+        echo "error: no grindvakt entry in Cargo.lock" >&2
+        exit 1
+    fi
+    minor="${locked%.*}"
+    status=0
+    check() {  # check <file> <fixed string> <what>
+        if ! grep -qF -- "$2" "$1"; then
+            echo "error: $1 does not mention $3 ('$2')" >&2
+            status=1
+        fi
+    }
+    check README.md "**${locked}**" "the locked grindvakt version"
+    check docs/index.rst "${minor}.x, a runtime-agnostic Rust" "grindvakt ${minor}.x"
+    check docs/index.rst "     - ${locked}" "the compatibility table row for grindvakt ${locked}"
+    pkg="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+    check docs/conf.py "release = \"${pkg}\"" "the Cargo.toml version (fallback release)"
+    exit "${status}"
 
 # The v<version> tag triggers .github/workflows/release.yml.
 # Create and push a signed release tag, e.g. `just release 0.2.0`.

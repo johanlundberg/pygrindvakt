@@ -1,6 +1,6 @@
 # pygrindvakt
 
-Python bindings for [grindvakt](https://github.com/kushaldas/grindvakt) **0.7.2**, a
+Python bindings for [grindvakt](https://github.com/kushaldas/grindvakt) **0.9.0**, a
 runtime-agnostic Rust library for **OAuth 2.0**, **OpenID Connect** and
 **OpenID Federation 1.1**: an OpenID Provider engine, a Relying Party toolkit,
 federation trust-chain resolution, DPoP (RFC 9449), and the JOSE/key primitives
@@ -163,19 +163,35 @@ key = keys.signing_key_from_pkcs11(
 
 Installs must go through `sfw` (Socket Firewall).
 
+A Rust toolchain matching `Cargo.toml`'s `rust-version` (1.88 or newer) is required.
+
 ```bash
-uv venv
-sfw uv pip install --python .venv/bin/python "maturin==1.14.1" pytest cryptography flask django fastapi httpx
+sfw uv sync --frozen --only-group dev   # the locked test / lint / typecheck tools, as in CI
+sfw uv pip install --python .venv/bin/python "maturin==1.14.1"
 VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release --uv
 .venv/bin/python -m pytest tests/            # PKCS#11 / Redis tests auto-skip
 cargo clippy --release -- -D warnings && cargo fmt --check
 REDIS_URL=redis://127.0.0.1/ .venv/bin/python -m pytest tests/ -m redis
 ```
 
+`just` wraps the same gates: `just check` runs ruff lint, ruff format check,
+`mypy --strict` over `tests/typecheck_usage.py`, pytest and `just docs-version`
+(which fails if the grindvakt version documented here and in `docs/index.rst`
+has drifted from `Cargo.lock`, or the `docs/conf.py` fallback `release` from
+`Cargo.toml`; it does not read `CHANGELOG.md`); `just --list` shows the rest. `just release
+<version>` creates and pushes the signed tag that triggers the release workflow
+(it refuses a tag that disagrees with `Cargo.toml` / `pyproject.toml`).
+
+When the `grindvakt` dependency is bumped, update the version in this README, in
+`docs/index.rst` (prose and the compatibility table) and in `CHANGELOG.md` in
+the same commit; `just docs-version` checks the README and `docs/index.rst`, not
+the changelog.
+
 ## Documentation
 
 Guides and the full API reference: <https://pygrindvakt.readthedocs.io/en/latest/>.
-Design decisions live in `docs/adr/`.
+Design decisions live in `docs/adr/`; release-by-release changes, including
+every breaking change, in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Type stubs
 
