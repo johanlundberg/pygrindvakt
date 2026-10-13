@@ -9,6 +9,7 @@ changes.
 import ast
 import importlib
 import pathlib
+import re
 
 import pygrindvakt
 import pytest
@@ -103,16 +104,24 @@ def test_stub_matches_runtime(name):
             f"{name}.{cls_name}: stub {sorted(members ^ rt_members)} differs "
             f"(stub-only: {sorted(members - rt_members)}, runtime-only: {sorted(rt_members - members)})"
         )
+    _assert_dunder_parity(name, tree, mod)
+
+
+def _assert_dunder_parity(name, tree, mod):
     stub_dunders = _stub_dunders(tree)
-    for cls_name in stub_classes:
+    for cls_name, declared in stub_dunders.items():
         if cls_name.endswith(STUB_ONLY_SUFFIX):
             continue
-        cls = getattr(mod, cls_name)
-        runtime_dunders = {d for d in REDACTED_DUNDERS if d in vars(cls)}
-        assert stub_dunders[cls_name] == runtime_dunders, (
-            f"{name}.{cls_name}: runtime defines {sorted(runtime_dunders)} but "
-            f"stub declares {sorted(stub_dunders[cls_name])}"
+        runtime_dunders = {d for d in REDACTED_DUNDERS if d in vars(getattr(mod, cls_name))}
+        assert declared == runtime_dunders, (
+            f"{name}.{cls_name}: runtime defines {sorted(runtime_dunders)} but stub declares {sorted(declared)}"
         )
+
+
+def test_errors_stub_dunders_match_runtime():
+    """``errors`` is not in SUBMODULES (it is Python-defined), so check its dunders here."""
+    tree = ast.parse((STUB_DIR / "errors.pyi").read_text())
+    _assert_dunder_parity("errors", tree, importlib.import_module("pygrindvakt.errors"))
 
 
 def test_top_level_stub_lists_all_submodules_and_exceptions():
@@ -129,11 +138,12 @@ def test_top_level_stub_lists_all_submodules_and_exceptions():
         assert n in names, f"__init__.pyi lacks {n}"
 
 
-@pytest.mark.parametrize("name", SUBMODULES)
-def test_stubs_do_not_blanket_suppress_undefined_names(name):
-    """A file-level ``# ruff: noqa: F821`` would hide typos in every annotation."""
-    for line in (STUB_DIR / f"{name}.pyi").read_text().splitlines():
+@pytest.mark.parametrize("stub", sorted(STUB_DIR.glob("*.pyi")), ids=lambda p: p.name)
+def test_stubs_do_not_blanket_suppress_lint(stub):
+    """A file-level noqa would hide typos (F821) in every annotation of the stub."""
+    for line in stub.read_text().splitlines():
         stripped = line.strip().lower()
-        if stripped.startswith("# ruff: noqa"):
-            codes = stripped.removeprefix("# ruff: noqa").lstrip(": ")
-            assert codes and "f821" not in codes, f"{name}.pyi: file-level noqa covers F821: {line}"
+        for prefix in ("# ruff: noqa", "# flake8: noqa"):
+            if stripped.startswith(prefix):
+                codes = {c for c in re.split(r"[\s,:]+", stripped.removeprefix(prefix)) if c}
+                assert codes and not codes & {"f821", "all"}, f"{stub.name}: file-level noqa covers F821: {line}"
