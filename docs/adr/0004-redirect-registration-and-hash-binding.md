@@ -17,10 +17,13 @@ framework integration would walk straight into:
    accepted, and the natural way to fill it in is from a request parameter —
    which lets the caller point the authorization request (and the code that
    comes back) at a host they control.
-2. `rp.end_session_url` sends `id_token_hint`, the whole ID token. A
-   `post_logout_redirect_uri` that came from anywhere other than a registration
-   makes the logout endpoint an open redirect that ships that token to the
-   chosen host.
+2. `rp.end_session_url` builds a logout URL for the OP's
+   `end_session_endpoint`, with `id_token_hint` (the whole ID token) and
+   `post_logout_redirect_uri` as query parameters. The token goes only to the
+   OP, but a `post_logout_redirect_uri` that came from anywhere other than a
+   registration lets an attacker-crafted logout link send the user, after
+   logout, to a host they control (an open redirect, with `state` echoed
+   back), unless the OP itself rejects unregistered values.
 3. `ProviderMetadata` URL-validated only its extension `*_endpoint` members;
    the five modelled endpoints and the `issuer` could be set to a non-https,
    fragment-bearing or `javascript:` URL through the constructor or
@@ -37,8 +40,10 @@ grindvakt release and change Rust behaviour for every consumer.
 1. **Login redirect URIs are registered, not passed.**
    `RpClient(..., redirect_uris=[...])` holds the allowed set; a per-call
    override must exactly equal (plain string comparison) the client's
-   `redirect_uri` or one entry, and may not be plaintext `http` to a
-   non-loopback host. `RpClient(..., allow_unregistered_redirect_uri=True)` is
+   `redirect_uri` or one entry. Registered entries, and unregistered
+   overrides when the escape hatch is on, may not be plaintext `http` to a
+   non-loopback host; the client's own `redirect_uri` is not
+   transport-checked. `RpClient(..., allow_unregistered_redirect_uri=True)` is
    the escape hatch for RFC 7591 dynamic registrations.
 2. **Post-logout redirect URIs are registered too.**
    `RpClient(..., post_logout_redirect_uris=[...])`; `end_session_url` accepts

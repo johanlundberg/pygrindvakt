@@ -251,7 +251,7 @@ Discovery and keys
    anything else, including an ``id_token_hint``-only call, raises
    :class:`pygrindvakt.BadRequestError`. Registration is structural so that a
    value taken from a request parameter cannot turn logout into an open
-   redirect carrying ``id_token_hint``. It must also be registered at the OP. ``extra`` may not
+   redirect. It must also be registered at the OP. ``extra`` may not
    contain ``id_token_hint``, ``client_id``, ``post_logout_redirect_uri``,
    ``state``, ``logout_hint`` or ``ui_locales``, and neither may the endpoint's
    own query. ``id_token_hint`` is sent to the first hop, the host of

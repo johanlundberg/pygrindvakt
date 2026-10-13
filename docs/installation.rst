@@ -102,14 +102,16 @@ Install them all with:
 
 .. code-block:: console
 
-   uv pip install --python .venv/bin/python --group dev
+   uv sync --frozen --only-group dev
    .venv/bin/python -m pytest tests/
 
-The ``dev`` dependency group carries ``pytest``, ``cryptography``, ``flask``,
-``django``, ``fastapi``, ``httpx``, ``mypy`` and the pinned ``ruff``; ``just
---list`` shows the available recipes. ``just check`` is the local aggregate
-(lint, format check, mypy, tests, ``docs-version``); CI runs the same linters,
-type check and tests as separate jobs but has no ``docs-version`` job.
+``uv sync --frozen`` installs the versions pinned in ``uv.lock``, as CI does,
+so a local ``just check`` matches it. The ``dev`` dependency group carries
+``pytest``, ``cryptography``, ``flask``, ``django``, ``fastapi``, ``httpx``,
+``mypy`` and the pinned ``ruff``. ``just --list`` shows the available recipes.
+``just check`` is the local aggregate (lint, format check, mypy, tests,
+``docs-version``); CI runs the same linters, type check and tests as separate
+jobs but has no ``docs-version`` job.
 
 Tests that need a SoftHSM2 token or a Redis server skip themselves when the
 tooling is missing.

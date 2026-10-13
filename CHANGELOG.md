@@ -39,7 +39,7 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 - `rp.end_session_url` accepts `post_logout_redirect_uri` only when `client`
   is given and the value exactly equals an entry of the new
   `RpClient(..., post_logout_redirect_uris=[...])` registration; otherwise
-  `BadRequestError`. This closes an open redirect (carrying `id_token_hint`)
+  `BadRequestError`. This closes an open redirect
   when the URI came from a request parameter. The `id_token_hint`-only path
   for `post_logout_redirect_uri` is removed (never released).
 - The per-call `redirect_uri=` override on `rp.authorization_url`,
@@ -150,27 +150,6 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `HttpClientProtocol` methods are typed as returning a
   `(status, body, content_type)` tuple or an `HttpFetchResponse`.
 
-### Fixed
-
-- `ProviderMetadata.to_dict(exclude_defaults=True)` no longer drops every
-  `false`, `[]` and `None`; it omits only members equal to their spec default.
-  This corrects the earlier blanket behaviour, which re-published a source
-  `request_uri_parameter_supported: false` with the member absent (default
-  `true`), flipping policy. Members that now stay in the output:
-  `request_uri_parameter_supported: false`, and `[]` for
-  `response_modes_supported`, `grant_types_supported`,
-  `token_endpoint_auth_methods_supported`, `claim_types_supported` (non-empty
-  spec defaults, so `[]` means "none") and the required
-  `response_types_supported`, `subject_types_supported`,
-  `id_token_signing_alg_values_supported`. `request_uri_parameter_supported:
-  true` is now dropped. Limit: the full `to_dict()` still emits `[]` for
-  absent `response_modes_supported`, `grant_types_supported` (and the required lists) and
-  `token_endpoint_auth_methods_supported` (the upstream model cannot represent
-  absence; a proper fix needs `Option<Vec<_>>` upstream). With
-  `exclude_defaults=True` they stay absent when `raw` shows the source lacked
-  them and the value is still `[]`; constructor-built metadata (no `raw`)
-  keeps the `[]`.
-
 ### Added
 
 - Python `HttpClient` adapters can report response headers: the tuple form
@@ -229,7 +208,24 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   that legitimately log out on another host (for example the AWS Cognito
   hosted UI) need `allow_cross_origin_end_session=True`.
 - `ProviderMetadata.raw` (source document snapshot; for `rp.discover` it is the
-  fetched body) and `to_dict(*, exclude_defaults=False)`.
+  fetched body) and `to_dict(*, exclude_defaults=False)`. With
+  `exclude_defaults=True`, `to_dict` omits only members equal to their spec
+  default, not every `false`, `[]` and `None`, so a source
+  `request_uri_parameter_supported: false` (default `true`) stays in the output
+  instead of being dropped, which would flip policy. Kept in the output:
+  `request_uri_parameter_supported: false`, and `[]` for
+  `response_modes_supported`, `grant_types_supported`,
+  `token_endpoint_auth_methods_supported`, `claim_types_supported` (non-empty
+  spec defaults, so `[]` means "none") and the required
+  `response_types_supported`, `subject_types_supported`,
+  `id_token_signing_alg_values_supported`. Dropped: `request_uri_parameter_supported:
+  true`. Limit: the full `to_dict()` still emits `[]` for absent
+  `response_modes_supported`, `grant_types_supported` (and the required lists)
+  and `token_endpoint_auth_methods_supported` (the upstream model cannot
+  represent absence; a proper fix needs `Option<Vec<_>>` upstream). With
+  `exclude_defaults=True` they stay absent when `raw` shows the source lacked
+  them and the value is still `[]`; constructor-built metadata (no `raw`)
+  keeps the `[]`.
 - Typed accessors (`None` when absent) for known extension members stored in
   `extra`: `acr_values_supported`, `claim_types_supported`,
   `revocation_endpoint`, `introspection_endpoint`,

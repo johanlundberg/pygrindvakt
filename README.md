@@ -166,8 +166,8 @@ Installs must go through `sfw` (Socket Firewall).
 A Rust toolchain matching `Cargo.toml`'s `rust-version` (1.88 or newer) is required.
 
 ```bash
-uv venv
-sfw uv pip install --python .venv/bin/python "maturin==1.14.1" pytest cryptography flask django fastapi httpx mypy ruff
+sfw uv sync --frozen --only-group dev   # the locked test / lint / typecheck tools, as in CI
+sfw uv pip install --python .venv/bin/python "maturin==1.14.1"
 VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release --uv
 .venv/bin/python -m pytest tests/            # PKCS#11 / Redis tests auto-skip
 cargo clippy --release -- -D warnings && cargo fmt --check

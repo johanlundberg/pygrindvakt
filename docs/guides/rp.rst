@@ -462,9 +462,8 @@ client, via ``RpClient(..., post_logout_redirect_uris=[...])``.
 ``end_session_url`` accepts it only when ``client`` is passed and the value
 exactly equals a registered entry; anything else (including a value from
 ``request.args``, or an ``id_token_hint``-only call) raises
-``BadRequestError``. This prevents logout from becoming an open redirect that
-also carries ``id_token_hint``. A provider
-without an ``end_session_endpoint`` makes ``end_session_url`` raise
+``BadRequestError``. This prevents logout from becoming an open redirect to a
+host the attacker chose. A provider without an ``end_session_endpoint`` makes ``end_session_url`` raise
 ``ConfigError``; end only the local session in that case.
 
 ``id_token_hint`` carries the full ID token and goes to the first hop, the

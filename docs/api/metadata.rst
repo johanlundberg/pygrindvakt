@@ -48,11 +48,10 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       kept.
 
       .. versionchanged:: 0.2.0
-         ``exclude_defaults=True`` no longer drops every ``false``, ``[]`` and
-         ``None``: only members equal to their spec default are omitted. The
-         earlier blanket behaviour re-published a source
-         ``request_uri_parameter_supported: false`` with the member absent
-         (default ``true``), flipping policy.
+         Added the ``exclude_defaults`` parameter. It omits only members equal
+         to their spec default, so a source
+         ``request_uri_parameter_supported: false`` (default ``true``) stays
+         in the output instead of being dropped, which would flip policy.
 
       The full ``to_dict()`` still emits ``[]`` for absent members of these
       lists, including the three required ones (the upstream model cannot represent absence; a proper fix needs

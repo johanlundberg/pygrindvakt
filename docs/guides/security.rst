@@ -85,14 +85,17 @@ framework integrations cannot accidentally omit deployment-critical choices.
        :func:`~pygrindvakt.rp.begin` and :func:`~pygrindvakt.rp.exchange_code`
        is accepted only if it equals the client's ``redirect_uri`` or an entry
        of :class:`RpClient(redirect_uris=[...]) <pygrindvakt.rp.RpClient>`
-       (:class:`~pygrindvakt.BadRequestError` otherwise), and never plain
-       ``http`` to a non-loopback host.
+       (:class:`~pygrindvakt.BadRequestError` otherwise). Registered entries
+       are checked at construction and may not be plain ``http`` to a
+       non-loopback host; the client's own ``redirect_uri`` is not
+       transport-checked.
      - The override is often derived from a request parameter. Accepting any
        valid URL lets an attacker send the authorization request with their own
        ``redirect_uri`` and receive the code.
      - ``RpClient(allow_unregistered_redirect_uri=True)`` skips the
-       registration check (the URL must still be valid and not plaintext
-       http). It is set at construction, shows up in ``repr()``, and emits **no
+       registration check (an override that differs from ``redirect_uri``
+       must still be a valid URL and not plaintext http to a non-loopback
+       host). It is set at construction, shows up in ``repr()``, and emits **no
        warning**: use it only for RFC 7591 dynamic registrations.
    * - :func:`~pygrindvakt.rp.end_session_url` accepts a
        ``post_logout_redirect_uri`` only when ``client=`` is passed and the
@@ -100,9 +103,10 @@ framework integrations cannot accidentally omit deployment-critical choices.
        :class:`RpClient(post_logout_redirect_uris=[...]) <pygrindvakt.rp.RpClient>`,
        and :class:`~pygrindvakt.rp.ProviderInfo` binds ``end_session_endpoint``
        to the issuer's origin.
-     - The logout URL carries ``id_token_hint`` (the whole ID token). An
-       unregistered redirect makes it an open redirect that ships the token to
-       an attacker-chosen host.
+     - The logout URL carries ``id_token_hint`` (the whole ID token) to the
+       OP only. An unregistered ``post_logout_redirect_uri`` turns a crafted
+       logout link into an open redirect to an attacker-chosen host, unless
+       the OP rejects it.
      - None for the registration check. ``allow_cross_origin_end_session=True``
        on ``ProviderInfo`` / ``from_metadata`` for OPs that legitimately log
        out on another origin.
@@ -309,9 +313,9 @@ Each is named so it stands out in a code review.
 
 ``RpClient(allow_unregistered_redirect_uri=True)``
    Turns off the registration check on per-call ``redirect_uri`` overrides, so
-   any syntactically valid, non-plaintext-``http`` URL is accepted. Unlike the
-   ``unsafe_*`` arguments it warns nothing at call time; the flag is visible in
-   ``repr()`` and in the constructor call. Legitimate only for RFC 7591 dynamic
+   any syntactically valid URL that is not plaintext ``http`` to a non-loopback
+   host is accepted. Unlike the ``unsafe_*`` arguments it warns nothing at call
+   time; the flag is visible in ``repr()`` and in the constructor call. Legitimate only for RFC 7591 dynamic
    registrations, and never with a value that came from request data.
 
 :func:`pygrindvakt.jwt.peek_claims_unverified` and :func:`pygrindvakt.federation.decode_unverified`
