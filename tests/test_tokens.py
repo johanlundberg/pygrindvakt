@@ -3,7 +3,6 @@
 import time
 
 import pytest
-
 from pygrindvakt import GrindvaktError, tokens
 
 
@@ -69,7 +68,12 @@ def test_key_rotation_with_previous_secrets():
 def test_refresh_payload_round_trip_and_dpop_binding():
     codec = tokens.TokenCodec("s")
     rt = tokens.RefreshTokenPayload(
-        client_id="demo", sub="a", scope="openid", auth_time=1, exp=int(time.time()) + 5, cnf_jkt="thumb"
+        client_id="demo",
+        sub="a",
+        scope="openid",
+        auth_time=1,
+        exp=int(time.time()) + 5,
+        cnf_jkt="thumb",
     )
     opened = codec.open_refresh_token(codec.seal_refresh_token(rt))
     assert opened.cnf_jkt == "thumb" and opened.acr is None
@@ -80,3 +84,8 @@ def test_payload_from_dict():
     assert p.claims == {} and p.exp == 5
     with pytest.raises(ValueError):
         tokens.AccessTokenPayload.from_dict({"sub": "s"})
+
+
+def test_codec_repr_never_renders_the_secret():
+    r = repr(tokens.TokenCodec("hunter2-super-secret"))
+    assert "hunter2" not in r and "<secret>" in r

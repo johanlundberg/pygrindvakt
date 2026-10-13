@@ -4,7 +4,6 @@ typed known-extension fields and ``end_session_endpoint``."""
 from __future__ import annotations
 
 import pytest
-
 from pygrindvakt import metadata
 
 ISSUER = "https://op.example.com"
@@ -39,7 +38,9 @@ def test_round_trip_constructed_metadata():
 
 
 def test_exclude_defaults_drops_spec_defaults_only():
-    md = metadata.ProviderMetadata.from_dict(minimal_doc() | {"unknown_empty": [], "frontchannel_logout_supported": False})
+    md = metadata.ProviderMetadata.from_dict(
+        minimal_doc() | {"unknown_empty": [], "frontchannel_logout_supported": False}
+    )
     full = md.to_dict()
     assert full["scopes_supported"] == [] and full["claims_parameter_supported"] is False
     slim = md.to_dict(exclude_defaults=True)
@@ -120,7 +121,7 @@ def effective(doc):
 
 def _equivalence_docs():
     docs = [minimal_doc()]
-    docs.append(minimal_doc() | {k: v for k, v in BOOL_DEFAULTS.items()})
+    docs.append(minimal_doc() | dict(BOOL_DEFAULTS))
     docs.append(minimal_doc() | {k: (not v) for k, v in BOOL_DEFAULTS.items()})
     docs.append(minimal_doc() | {k: [] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)})
     docs.append(minimal_doc() | {k: ["x"] for k in NONEMPTY_LIST_DEFAULTS | dict.fromkeys(EMPTY_LIST_DEFAULT)})
@@ -258,7 +259,12 @@ def test_end_session_endpoint_property():
     assert md.extra["end_session_endpoint"] == f"{ISSUER}/logout"
     md.end_session_endpoint = None
     assert "end_session_endpoint" not in md.extra
-    for bad in ["http://op.example.com/l", "https://op.example.com/l#f", "https://u:p@op.example.com/l", "not a url"]:
+    for bad in [
+        "http://op.example.com/l",
+        "https://op.example.com/l#f",
+        "https://u:p@op.example.com/l",
+        "not a url",
+    ]:
         with pytest.raises(ValueError):
             md.end_session_endpoint = bad
     md.extra = {"end_session_endpoint": f"{ISSUER}/logout"}
@@ -327,12 +333,16 @@ def test_non_url_extras_are_type_checked_only():
 
 
 def test_discover_does_not_validate_url_members():
-    from pygrindvakt import rp
     import json
+
+    from pygrindvakt import rp
 
     class Http:
         def get(self, url):
-            body = minimal_doc() | {"end_session_endpoint": "http://evil.example/l", "revocation_endpoint": "nonsense"}
+            body = minimal_doc() | {
+                "end_session_endpoint": "http://evil.example/l",
+                "revocation_endpoint": "nonsense",
+            }
             return 200, json.dumps(body).encode(), "application/json"
 
         def post_form(self, url, form, headers):
@@ -343,12 +353,17 @@ def test_discover_does_not_validate_url_members():
 
 
 def test_discovered_malformed_known_extra_getter_none_roundtrip_raises():
-    from pygrindvakt import rp
     import json
+
+    from pygrindvakt import rp
 
     class Http:
         def get(self, url):
-            return 200, json.dumps(minimal_doc() | {"acr_values_supported": "urn:x"}).encode(), "application/json"
+            return (
+                200,
+                json.dumps(minimal_doc() | {"acr_values_supported": "urn:x"}).encode(),
+                "application/json",
+            )
 
         def post_form(self, url, form, headers):
             raise AssertionError
@@ -436,7 +451,7 @@ def test_from_dict_rejects_bad_modelled_url(key, bad):
 def test_set_issuer_revalidates_modelled_fields_atomically():
     md = metadata.ProviderMetadata("http://localhost:8000")
     md.jwks_uri = "http://localhost:8000/jwks"
-    with pytest.raises(ValueError, match="_endpoint|jwks_uri"):
+    with pytest.raises(ValueError, match=r"_endpoint|jwks_uri"):
         md.issuer = "https://op.example"
     assert md.issuer == "http://localhost:8000"
     md.authorization_endpoint = "https://op.example/a"
@@ -447,7 +462,7 @@ def test_set_issuer_revalidates_modelled_fields_atomically():
 
 
 def test_constructor_validates_base():
-    with pytest.raises(ValueError, match="_endpoint|jwks_uri"):
+    with pytest.raises(ValueError, match=r"_endpoint|jwks_uri"):
         metadata.ProviderMetadata(ISSUER, "http://x.test/o")
     md = metadata.ProviderMetadata(ISSUER, "https://cdn.other.example/o")
     assert md.token_endpoint.startswith("https://cdn.other.example/")
@@ -488,7 +503,10 @@ def test_issuer_validated_everywhere(bad):
 
 
 def test_constructor_error_names_base_and_member():
-    with pytest.raises(ValueError, match=r"base .*http://x\.test/o.* yields an invalid endpoint.*_endpoint|jwks_uri"):
+    with pytest.raises(
+        ValueError,
+        match=r"base .*http://x\.test/o.* yields an invalid endpoint.*_endpoint|jwks_uri",
+    ):
         metadata.ProviderMetadata(ISSUER, "http://x.test/o")
 
 

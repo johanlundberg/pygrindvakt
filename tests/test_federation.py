@@ -21,9 +21,8 @@ import json
 import time
 from urllib.parse import parse_qs, quote, urlsplit
 
-import pytest
-
 import pygrindvakt
+import pytest
 from pygrindvakt import federation, jwt, keys
 
 LEAF = "https://rp.example.org"
@@ -141,9 +140,7 @@ class Federation:
             None,
             3600,
         )
-        self.subordinate = subordinate_statement(
-            self.ta_key, TA, LEAF, self.leaf_key.to_public_jwks()
-        )
+        self.subordinate = subordinate_statement(self.ta_key, TA, LEAF, self.leaf_key.to_public_jwks())
 
     def trust_anchors(self) -> dict:
         return {TA: self.ta_key.to_public_jwks()}
@@ -159,7 +156,11 @@ class Federation:
         return FakeHttpClient(
             {
                 TA + WELL_KNOWN: (200, self.ta_ec, "application/entity-statement+jwt"),
-                LEAF + WELL_KNOWN: (200, self.leaf_ec, "application/entity-statement+jwt"),
+                LEAF + WELL_KNOWN: (
+                    200,
+                    self.leaf_ec,
+                    "application/entity-statement+jwt",
+                ),
                 RESOLVE_EP: (200, resolved, "application/resolve-response+jwt"),
             }
         )
@@ -225,10 +226,8 @@ def test_build_entity_configuration_defaults_and_trust_marks(fed):
 
 def test_build_entity_configuration_rejects_bad_jwks(fed):
     """``public_jwks`` must be a ``{"keys": [...]}`` dict."""
-    with pytest.raises(Exception):
-        federation.build_entity_configuration(
-            fed.leaf_key, LEAF, {"nope": 1}, [], {}, None, 3600
-        )
+    with pytest.raises(Exception):  # noqa: B017 - core raises a bare Exception here
+        federation.build_entity_configuration(fed.leaf_key, LEAF, {"nope": 1}, [], {}, None, 3600)
 
 
 def test_decode_unverified_reads_claims_without_a_key(fed):
@@ -243,9 +242,11 @@ def test_decode_unverified_reads_claims_without_a_key(fed):
     head, _, sig = fed.leaf_ec.split(".")
     import base64
 
-    forged = base64.urlsafe_b64encode(
-        json.dumps({"iss": "https://evil.example", "sub": "https://evil.example"}).encode()
-    ).rstrip(b"=").decode()
+    forged = (
+        base64.urlsafe_b64encode(json.dumps({"iss": "https://evil.example", "sub": "https://evil.example"}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
     assert federation.decode_unverified(f"{head}.{forged}.{sig}").iss() == "https://evil.example"
     with pytest.raises(pygrindvakt.GrindvaktError):
         federation.verify_self_signed(f"{head}.{forged}.{sig}")
@@ -269,25 +270,16 @@ def test_verify_against_explicit_jwks(fed):
 
 def test_verify_typed_requires_matching_typ(fed):
     """``verify_typed`` enforces the ``typ`` header; the wrong typ fails."""
-    ok = federation.verify_typed(
-        fed.leaf_ec, fed.leaf_key.to_public_jwks(), federation.ENTITY_STATEMENT_TYP
-    )
+    ok = federation.verify_typed(fed.leaf_ec, fed.leaf_key.to_public_jwks(), federation.ENTITY_STATEMENT_TYP)
     assert ok.sub() == LEAF
     with pytest.raises(pygrindvakt.GrindvaktError):
-        federation.verify_typed(
-            fed.leaf_ec, fed.leaf_key.to_public_jwks(), federation.RESOLVE_RESPONSE_TYP
-        )
+        federation.verify_typed(fed.leaf_ec, fed.leaf_key.to_public_jwks(), federation.RESOLVE_RESPONSE_TYP)
     # ``verify`` is ``verify_typed`` with the entity-statement typ, so a resolve
     # response is refused by it.
     resolved = resolve_response(fed.ta_key, TA, LEAF, {}, fed.chain())
     with pytest.raises(pygrindvakt.GrindvaktError):
         federation.verify(resolved, fed.ta_key.to_public_jwks())
-    assert (
-        federation.verify_typed(
-            resolved, fed.ta_key.to_public_jwks(), federation.RESOLVE_RESPONSE_TYP
-        ).iss()
-        == TA
-    )
+    assert federation.verify_typed(resolved, fed.ta_key.to_public_jwks(), federation.RESOLVE_RESPONSE_TYP).iss() == TA
 
 
 def test_verify_self_signed_rejects_non_self_issued(fed):
@@ -508,7 +500,13 @@ def test_resolve_rejects_sub_mismatch(fed):
 def test_resolve_requires_resolve_endpoint_in_ta_configuration(fed):
     """A TA whose entity configuration lacks ``federation_resolve_endpoint`` cannot be used."""
     ta_ec = federation.build_entity_configuration(
-        fed.ta_key, TA, fed.ta_key.to_public_jwks(), [], {"federation_entity": {}}, None, 3600
+        fed.ta_key,
+        TA,
+        fed.ta_key.to_public_jwks(),
+        [],
+        {"federation_entity": {}},
+        None,
+        3600,
     )
     http = FakeHttpClient({TA + WELL_KNOWN: (200, ta_ec, "application/entity-statement+jwt")})
     with pytest.raises(pygrindvakt.InternalError, match="no federation_resolve_endpoint"):
@@ -527,14 +525,20 @@ def test_resolve_tries_each_trust_anchor(fed):
     """A failing anchor is skipped; an anchor that succeeds wins (iteration order is unspecified)."""
     other_ta = "https://other-ta.example.org"
     http = fed.network()
-    anchors = {other_ta: make_key("x").to_public_jwks(), TA: fed.ta_key.to_public_jwks()}
+    anchors = {
+        other_ta: make_key("x").to_public_jwks(),
+        TA: fed.ta_key.to_public_jwks(),
+    }
     entity = federation.resolve_via_trust_anchors(http, LEAF, anchors)
     assert entity.issuer == TA
     assert all(c.startswith((TA, other_ta)) for c in http.calls)
     assert http.calls[-1].startswith(RESOLVE_EP + "?")
 
     # When every anchor fails, the error of the last one tried is raised.
-    anchors = {other_ta: make_key("x").to_public_jwks(), "https://third.example": make_key("y").to_public_jwks()}
+    anchors = {
+        other_ta: make_key("x").to_public_jwks(),
+        "https://third.example": make_key("y").to_public_jwks(),
+    }
     with pytest.raises(pygrindvakt.InternalError, match="returned 404"):
         federation.resolve_via_trust_anchors(http, LEAF, anchors)
 
@@ -548,7 +552,7 @@ def test_resolve_response_non_200(fed):
 
 def test_trust_anchors_must_be_a_jwks_map(fed):
     """``trust_anchors`` values must be ``{"keys": [...]}`` dicts."""
-    with pytest.raises(Exception):
+    with pytest.raises(TypeError):
         federation.resolve_via_trust_anchors(fed.network(), LEAF, {TA: "not-a-jwks"})
 
 
@@ -561,9 +565,7 @@ def test_entity_metadata_jwks_inline(fed):
     """Inline ``jwks`` wins and no request is made."""
     http = FakeHttpClient({})
     jwks = fed.leaf_key.to_public_jwks()
-    out = federation.entity_metadata_jwks(
-        http, {"jwks": jwks}, LEAF, fed.leaf_key.to_public_jwks()
-    )
+    out = federation.entity_metadata_jwks(http, {"jwks": jwks}, LEAF, fed.leaf_key.to_public_jwks())
     assert out == jwks
     assert http.calls == []
 
@@ -572,17 +574,13 @@ def test_entity_metadata_jwks_via_jwks_uri(fed):
     """``jwks_uri`` is fetched as plain JSON."""
     jwks = fed.leaf_key.to_public_jwks()
     http = FakeHttpClient({LEAF + "/jwks": (200, json.dumps(jwks), "application/json")})
-    out = federation.entity_metadata_jwks(
-        http, {"jwks_uri": LEAF + "/jwks"}, LEAF, fed.leaf_key.to_public_jwks()
-    )
+    out = federation.entity_metadata_jwks(http, {"jwks_uri": LEAF + "/jwks"}, LEAF, fed.leaf_key.to_public_jwks())
     assert out == jwks
     assert http.calls == [LEAF + "/jwks"]
 
     http = FakeHttpClient({})
     with pytest.raises(pygrindvakt.InternalError, match="jwks fetch failed"):
-        federation.entity_metadata_jwks(
-            http, {"jwks_uri": LEAF + "/jwks"}, LEAF, fed.leaf_key.to_public_jwks()
-        )
+        federation.entity_metadata_jwks(http, {"jwks_uri": LEAF + "/jwks"}, LEAF, fed.leaf_key.to_public_jwks())
 
 
 def test_entity_metadata_jwks_via_signed_jwks_uri(fed):
@@ -591,7 +589,10 @@ def test_entity_metadata_jwks_via_signed_jwks_uri(fed):
     doc = signed_jwks_document(fed.leaf_key, LEAF, op_key.to_public_jwks()["keys"])
     http = FakeHttpClient({LEAF + "/signed-jwks": (200, doc, "application/jwk-set+jwt")})
     out = federation.entity_metadata_jwks(
-        http, {"signed_jwks_uri": LEAF + "/signed-jwks"}, LEAF, fed.leaf_key.to_public_jwks()
+        http,
+        {"signed_jwks_uri": LEAF + "/signed-jwks"},
+        LEAF,
+        fed.leaf_key.to_public_jwks(),
     )
     assert out == op_key.to_public_jwks()
     assert http.calls == [LEAF + "/signed-jwks"]
@@ -618,9 +619,7 @@ def test_entity_metadata_jwks_prefers_signed_over_plain_uri(fed):
 def test_entity_metadata_jwks_without_any_source(fed):
     """Metadata with no key source is an AuthnError."""
     with pytest.raises(pygrindvakt.AuthnError, match="neither jwks"):
-        federation.entity_metadata_jwks(
-            FakeHttpClient({}), {"issuer": LEAF}, LEAF, fed.leaf_key.to_public_jwks()
-        )
+        federation.entity_metadata_jwks(FakeHttpClient({}), {"issuer": LEAF}, LEAF, fed.leaf_key.to_public_jwks())
 
 
 def test_entity_metadata_jwks_malformed_inline_does_not_fall_back(fed):
@@ -658,9 +657,7 @@ def test_fetch_signed_jwks_checks(fed):
         federation.fetch_signed_jwks(FakeHttpClient({}), uri, LEAF, fed_jwks)
 
     with pytest.raises(pygrindvakt.AuthnError, match="unexpected content type"):
-        federation.fetch_signed_jwks(
-            FakeHttpClient({uri: (200, good, "application/json")}), uri, LEAF, fed_jwks
-        )
+        federation.fetch_signed_jwks(FakeHttpClient({uri: (200, good, "application/json")}), uri, LEAF, fed_jwks)
 
     with pytest.raises(pygrindvakt.AuthnError, match="sub mismatch"):
         federation.fetch_signed_jwks(
@@ -674,7 +671,10 @@ def test_fetch_signed_jwks_checks(fed):
     forged = signed_jwks_document(make_key("mallory"), LEAF, op_key.to_public_jwks()["keys"])
     with pytest.raises(pygrindvakt.GrindvaktError):
         federation.fetch_signed_jwks(
-            FakeHttpClient({uri: (200, forged, "application/jwk-set+jwt")}), uri, LEAF, fed_jwks
+            FakeHttpClient({uri: (200, forged, "application/jwk-set+jwt")}),
+            uri,
+            LEAF,
+            fed_jwks,
         )
 
     # Wrong typ (an entity statement instead of a jwk-set document).
@@ -694,7 +694,10 @@ def test_fetch_signed_jwks_checks(fed):
     )
     with pytest.raises(pygrindvakt.AuthnError, match="no keys"):
         federation.fetch_signed_jwks(
-            FakeHttpClient({uri: (200, no_keys, "application/jwk-set+jwt")}), uri, LEAF, fed_jwks
+            FakeHttpClient({uri: (200, no_keys, "application/jwk-set+jwt")}),
+            uri,
+            LEAF,
+            fed_jwks,
         )
 
 
@@ -769,7 +772,7 @@ def test_collection_entity_value_semantics():
     assert a == b
     assert a != c
     assert a != "https://op.example"
-    assert not (a == object())
+    assert (a == object()) is False  # exercises __eq__ itself, not the __ne__ path
     assert a.entity_id == "https://op.example"
     assert a.display_name == "OP"
     assert a.logo_uri is None
@@ -791,9 +794,7 @@ def test_parse_collection_flattens_ui_with_fallbacks():
         "https://op-c.example",
     ]
     rps = federation.parse_collection(COLLECTION_BODY, "openid_relying_party")
-    assert rps == [
-        federation.CollectionEntity(entity_id="https://rp.example", display_name="An RP")
-    ]
+    assert rps == [federation.CollectionEntity(entity_id="https://rp.example", display_name="An RP")]
 
 
 def test_parse_collection_handles_missing_entities():
@@ -876,7 +877,8 @@ def test_apply_policy_operators_mirror_upstream():
 def test_apply_policy_value_overrides_and_default_does_not():
     """``value`` forces the parameter; ``default`` only fills an absent one."""
     out = federation.apply_policy(
-        {"a": 1, "b": 2}, {"a": {"value": 10}, "b": {"default": 20}, "c": {"default": 30}}
+        {"a": 1, "b": 2},
+        {"a": {"value": 10}, "b": {"default": 20}, "c": {"default": 30}},
     )
     assert out == {"a": 10, "b": 2, "c": 30}
 
@@ -885,7 +887,10 @@ def test_apply_policy_add_appends_unique_values():
     """``add`` appends values not already present, creating the array if needed."""
     out = federation.apply_policy(
         {"scopes": ["openid"]},
-        {"scopes": {"add": ["openid", "email"]}, "grant_types": {"add": "authorization_code"}},
+        {
+            "scopes": {"add": ["openid", "email"]},
+            "grant_types": {"add": "authorization_code"},
+        },
     )
     assert out == {"scopes": ["openid", "email"], "grant_types": ["authorization_code"]}
 
@@ -907,9 +912,7 @@ def test_apply_policy_subset_of():
 
 def test_apply_policy_superset_of():
     """``superset_of`` requires every listed value to be present (absent -> violation)."""
-    ok = federation.apply_policy(
-        {"scopes": ["openid", "email"]}, {"scopes": {"superset_of": ["openid"]}}
-    )
+    ok = federation.apply_policy({"scopes": ["openid", "email"]}, {"scopes": {"superset_of": ["openid"]}})
     assert ok["scopes"] == ["openid", "email"]
     with pytest.raises(pygrindvakt.AuthnError, match="superset_of"):
         federation.apply_policy({"scopes": ["email"]}, {"scopes": {"superset_of": ["openid"]}})
@@ -934,7 +937,7 @@ def test_apply_policy_rejects_non_object_operator():
 
 def test_apply_policy_requires_dicts():
     """Both arguments must be JSON objects."""
-    with pytest.raises(Exception):
+    with pytest.raises(TypeError):
         federation.apply_policy(["not", "a", "dict"], {})
-    with pytest.raises(Exception):
+    with pytest.raises(TypeError):
         federation.apply_policy({}, ["not", "a", "dict"])

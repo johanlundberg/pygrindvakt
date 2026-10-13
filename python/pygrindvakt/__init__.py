@@ -8,26 +8,26 @@ submodules so the public API is the same whether you ``import pygrindvakt`` or
 ``from pygrindvakt import provider``.
 """
 
-from ._native import (  # noqa: F401
-    __version__,
-    GrindvaktError,
-    BadRequestError,
+from ._native import (
+    AttributeMappingError,
     AuthnError,
-    StateError,
+    BadRequestError,
     ConfigError,
     CryptoError,
-    AttributeMappingError,
-    JoseError,
-    UnknownKeyError,
-    JsonError,
-    InternalError,
-    NoBoundEndpointError,
-    UnknownModuleError,
     DpopError,
     DpopInvalidError,
-    DpopReplayError,
     DpopNonceRequiredError,
+    DpopReplayError,
     DpopServerError,
+    GrindvaktError,
+    InternalError,
+    JoseError,
+    JsonError,
+    NoBoundEndpointError,
+    StateError,
+    UnknownKeyError,
+    UnknownModuleError,
+    __version__,
     client,
     discovery,
     dpop,
@@ -45,31 +45,34 @@ from ._native import (  # noqa: F401
     util,
 )
 
+# isort: off
 # OAuthError is defined in Python (it needs methods; see errors.py). It must be
 # imported after _native so the native side can resolve it lazily.
-from .errors import OAuthError  # noqa: E402,F401
+from .errors import OAuthError
+
+# isort: on
 
 __all__ = [
-    "__version__",
-    "GrindvaktError",
-    "BadRequestError",
+    "AttributeMappingError",
     "AuthnError",
-    "StateError",
+    "BadRequestError",
     "ConfigError",
     "CryptoError",
-    "AttributeMappingError",
-    "JoseError",
-    "UnknownKeyError",
-    "JsonError",
-    "InternalError",
-    "NoBoundEndpointError",
-    "UnknownModuleError",
-    "OAuthError",
     "DpopError",
     "DpopInvalidError",
-    "DpopReplayError",
     "DpopNonceRequiredError",
+    "DpopReplayError",
     "DpopServerError",
+    "GrindvaktError",
+    "InternalError",
+    "JoseError",
+    "JsonError",
+    "NoBoundEndpointError",
+    "OAuthError",
+    "StateError",
+    "UnknownKeyError",
+    "UnknownModuleError",
+    "__version__",
     "client",
     "discovery",
     "dpop",

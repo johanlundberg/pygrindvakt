@@ -21,11 +21,14 @@ import flask
 from flask import Flask, session
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/, for ``common``
-from common.op_config import authenticate, build_provider, render_login_form  # noqa: E402
-
-from pygrindvakt import OAuthError  # noqa: E402
-from pygrindvakt.http import HttpRequestData, Response  # noqa: E402
-from pygrindvakt.request import AuthorizationRequest  # noqa: E402
+from common.op_config import (
+    authenticate,
+    build_provider,
+    render_login_form,
+)
+from pygrindvakt import OAuthError
+from pygrindvakt.http import HttpRequestData, Response
+from pygrindvakt.request import AuthorizationRequest
 
 ISSUER = os.environ.get("OP_ISSUER", "http://127.0.0.1:5000")
 

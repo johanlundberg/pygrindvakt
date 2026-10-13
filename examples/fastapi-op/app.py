@@ -23,11 +23,14 @@ from fastapi import FastAPI, Request
 from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/, for ``common``
-from common.op_config import authenticate, build_provider, render_login_form  # noqa: E402
-
-from pygrindvakt import OAuthError, util  # noqa: E402
-from pygrindvakt.http import HttpRequestData, Response  # noqa: E402
-from pygrindvakt.request import AuthorizationRequest  # noqa: E402
+from common.op_config import (
+    authenticate,
+    build_provider,
+    render_login_form,
+)
+from pygrindvakt import OAuthError, util
+from pygrindvakt.http import HttpRequestData, Response
+from pygrindvakt.request import AuthorizationRequest
 
 ISSUER = os.environ.get("OP_ISSUER", "http://127.0.0.1:5000")
 TOKEN_URL = f"{ISSUER}/token"  # from configuration, never from the Host header
@@ -151,7 +154,12 @@ async def login(request: Request):
 async def token(request: Request):
     data = await request_data(request)
     try:
-        tr = await run_in_threadpool(OP.handle_token_request, data.form_pairs, TOKEN_URL, auth_header=data.authorization())
+        tr = await run_in_threadpool(
+            OP.handle_token_request,
+            data.form_pairs,
+            TOKEN_URL,
+            auth_header=data.authorization(),
+        )
     except OAuthError as e:
         return to_fastapi(e.to_response())
     return to_fastapi(tr.to_response())

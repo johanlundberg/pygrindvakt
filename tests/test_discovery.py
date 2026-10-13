@@ -7,12 +7,12 @@ Ported from the unit tests in ``grindvakt/src/discovery.rs``.
 import time
 from urllib.parse import parse_qsl, urlsplit
 
-import pytest
-
 import pygrindvakt
+import pytest
 from pygrindvakt import discovery, jwt, keys
-from pygrindvakt.errors import OAuthError  # noqa: F401  (ensures package import side effects)
-
+from pygrindvakt.errors import (
+    OAuthError,  # noqa: F401  (ensures package import side effects)
+)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -83,7 +83,11 @@ def query_of(url: str) -> dict:
 
 @pytest.mark.parametrize(
     "entity_id",
-    ["https://rp.example.com", "https://rp.example.com/oidc", "https://rp.example.com/"],
+    [
+        "https://rp.example.com",
+        "https://rp.example.com/oidc",
+        "https://rp.example.com/",
+    ],
 )
 def test_validate_entity_id_accepts_https_urls(entity_id):
     """Plain https URLs with a host, with or without a path, are valid entity ids."""
@@ -165,17 +169,13 @@ def test_discovery_request_url_keyword_arguments():
 
 def test_discovery_request_url_joins_existing_query():
     """An endpoint that already has a query string gets ``&`` rather than ``?``."""
-    url = discovery.discovery_request_url(
-        "https://discovery.example.com/?ui=compact", "https://rp.example.com"
-    )
+    url = discovery.discovery_request_url("https://discovery.example.com/?ui=compact", "https://rp.example.com")
     assert url == "https://discovery.example.com/?ui=compact&entity_id=https%3A%2F%2Frp.example.com"
 
 
 def test_discovery_request_url_places_query_before_fragment():
     """A fragment on the endpoint stays after the appended query."""
-    url = discovery.discovery_request_url(
-        "https://discovery.example.com/discovery#chooser", "https://rp.example.com"
-    )
+    url = discovery.discovery_request_url("https://discovery.example.com/discovery#chooser", "https://rp.example.com")
     assert url == "https://discovery.example.com/discovery?entity_id=https%3A%2F%2Frp.example.com#chooser"
 
 
@@ -201,7 +201,10 @@ def test_discovery_request_url_rejects_bad_ids():
 def test_parse_third_party_initiated_login_required_and_optional_params():
     """iss is required; login_hint and target_link_uri are optional and passed through."""
     login = discovery.parse_third_party_initiated_login(
-        {"iss": "https://op.example.com", "target_link_uri": "https://app.example.com/x"}
+        {
+            "iss": "https://op.example.com",
+            "target_link_uri": "https://app.example.com/x",
+        }
     )
     assert isinstance(login, discovery.ThirdPartyInitiatedLogin)
     assert login.iss == "https://op.example.com"
@@ -260,7 +263,9 @@ def test_third_party_initiated_login_constructor_eq_hash_repr():
     a = discovery.ThirdPartyInitiatedLogin("https://op.example.com")
     b = discovery.parse_third_party_initiated_login({"iss": "https://op.example.com"})
     c = discovery.ThirdPartyInitiatedLogin(
-        "https://op.example.com", login_hint="alice", target_link_uri="https://app.example.com/"
+        "https://op.example.com",
+        login_hint="alice",
+        target_link_uri="https://app.example.com/",
     )
     assert a == b
     assert hash(a) == hash(b)
@@ -334,7 +339,9 @@ def test_third_party_login_url_keeps_target_verbatim():
     """target_link_uri is appended percent-encoded and round-trips through parsing."""
     target = "https://app.example.com/deep?x=1&y=2"
     url = discovery.third_party_login_url(
-        "https://rp.example.com/initiate", "https://op.example.com", target_link_uri=target
+        "https://rp.example.com/initiate",
+        "https://op.example.com",
+        target_link_uri=target,
     )
     assert url == (
         "https://rp.example.com/initiate"
@@ -380,12 +387,12 @@ def test_third_party_login_url_minimal():
 def test_self_published_initiate_login_uri_roundtrip():
     """A self-signed entity configuration served at .well-known yields the initiate_login_uri."""
     body = rp_entity_configuration(
-        "https://rp.example.com", {"initiate_login_uri": "https://rp.example.com/initiate"}
+        "https://rp.example.com",
+        {"initiate_login_uri": "https://rp.example.com/initiate"},
     )
     http = FakeHttpClient(body)
     assert (
-        discovery.self_published_initiate_login_uri(http, "https://rp.example.com")
-        == "https://rp.example.com/initiate"
+        discovery.self_published_initiate_login_uri(http, "https://rp.example.com") == "https://rp.example.com/initiate"
     )
     assert http.urls == ["https://rp.example.com/.well-known/openid-federation"]
 
@@ -393,7 +400,8 @@ def test_self_published_initiate_login_uri_roundtrip():
 def test_self_published_rp_exposes_metadata_and_exp():
     """The richer form exposes the full metadata dict and the statement's exp."""
     body = rp_entity_configuration(
-        "https://rp.example.com", {"initiate_login_uri": "https://rp.example.com/initiate"}
+        "https://rp.example.com",
+        {"initiate_login_uri": "https://rp.example.com/initiate"},
     )
     rp = discovery.self_published_rp(FakeHttpClient(body), "https://rp.example.com")
     assert isinstance(rp, discovery.SelfPublishedRp)
@@ -411,7 +419,8 @@ def test_self_published_rp_exposes_metadata_and_exp():
 def test_self_published_rp_trailing_slash_entity_id():
     """A trailing slash on the entity id does not double the slash in the well-known URL."""
     body = rp_entity_configuration(
-        "https://rp.example.com/", {"initiate_login_uri": "https://rp.example.com/initiate"}
+        "https://rp.example.com/",
+        {"initiate_login_uri": "https://rp.example.com/initiate"},
     )
     http = FakeHttpClient(body)
     discovery.self_published_rp(http, "https://rp.example.com/")
@@ -421,7 +430,8 @@ def test_self_published_rp_trailing_slash_entity_id():
 def test_self_published_rp_must_be_issued_by_requested_entity():
     """A statement issued by a different entity than the one asked for is rejected."""
     body = rp_entity_configuration(
-        "https://rp.example.com", {"initiate_login_uri": "https://rp.example.com/initiate"}
+        "https://rp.example.com",
+        {"initiate_login_uri": "https://rp.example.com/initiate"},
     )
     with pytest.raises(pygrindvakt.AuthnError):
         discovery.self_published_initiate_login_uri(FakeHttpClient(body), "https://other.example.com")
@@ -450,7 +460,8 @@ def test_self_published_rp_validates_entity_id_before_fetching():
 def test_self_published_rp_rejects_bad_signature():
     """A statement whose signature does not verify against its own jwks is rejected."""
     body = rp_entity_configuration(
-        "https://rp.example.com", {"initiate_login_uri": "https://rp.example.com/initiate"}
+        "https://rp.example.com",
+        {"initiate_login_uri": "https://rp.example.com/initiate"},
     )
     head, payload, sig = body.split(".")
     tampered = ".".join([head, payload, sig[:-4] + ("AAAA" if not sig.endswith("AAAA") else "BBBB")])
@@ -492,7 +503,11 @@ def test_promote_hint_no_match_keeps_order():
     ops = _ops()
     found, out = discovery.promote_hint(ops, "https://nope.example")
     assert found is False
-    assert [e.entity_id for e in out] == ["https://a.example", "https://b.example", "https://c.example"]
+    assert [e.entity_id for e in out] == [
+        "https://a.example",
+        "https://b.example",
+        "https://c.example",
+    ]
 
 
 def test_promote_hint_moves_match_to_front():
@@ -500,10 +515,18 @@ def test_promote_hint_moves_match_to_front():
     ops = _ops()
     found, out = discovery.promote_hint(ops, "https://c.example/")
     assert found is True
-    assert [e.entity_id for e in out] == ["https://c.example", "https://a.example", "https://b.example"]
+    assert [e.entity_id for e in out] == [
+        "https://c.example",
+        "https://a.example",
+        "https://b.example",
+    ]
     assert len(out) == 3
     # The input list is not mutated.
-    assert [e.entity_id for e in ops] == ["https://a.example", "https://b.example", "https://c.example"]
+    assert [e.entity_id for e in ops] == [
+        "https://a.example",
+        "https://b.example",
+        "https://c.example",
+    ]
 
 
 def test_promote_hint_already_first_still_matches():
@@ -511,7 +534,11 @@ def test_promote_hint_already_first_still_matches():
     ops = _ops()
     found, out = discovery.promote_hint(ops, "https://a.example")
     assert found is True
-    assert [e.entity_id for e in out] == ["https://a.example", "https://b.example", "https://c.example"]
+    assert [e.entity_id for e in out] == [
+        "https://a.example",
+        "https://b.example",
+        "https://c.example",
+    ]
 
 
 def test_promote_hint_empty_list():
@@ -557,9 +584,7 @@ def resolved_rp_entity(rp_metadata: dict):
     rp_key = rp_signing_key()
     now = int(time.time())
     metadata = {"openid_relying_party": rp_metadata}
-    rp_ec = federation.build_entity_configuration(
-        rp_key, RP_ID, rp_key.to_public_jwks(), [TA_ID], metadata, None, 3600
-    )
+    rp_ec = federation.build_entity_configuration(rp_key, RP_ID, rp_key.to_public_jwks(), [TA_ID], metadata, None, 3600)
     ta_ec = federation.build_entity_configuration(
         ta_key,
         TA_ID,
@@ -571,7 +596,13 @@ def resolved_rp_entity(rp_metadata: dict):
     )
     subordinate = jwt.sign(
         ta_key,
-        {"iss": TA_ID, "sub": RP_ID, "iat": now, "exp": now + 3600, "jwks": rp_key.to_public_jwks()},
+        {
+            "iss": TA_ID,
+            "sub": RP_ID,
+            "iat": now,
+            "exp": now + 3600,
+            "jwks": rp_key.to_public_jwks(),
+        },
         "entity-statement+jwt",
     )
     resolve_response = jwt.sign(

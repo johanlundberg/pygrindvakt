@@ -1,7 +1,6 @@
 """Client registration objects and the in-memory client store."""
 
 import pytest
-
 from pygrindvakt import client
 
 
@@ -29,7 +28,13 @@ def test_client_is_keyword_only_after_id():
 
 
 def test_client_dict_round_trip():
-    c = client.Client("id", client_secret="s", redirect_uris=["https://x/cb"], scope="a b", client_name="N")
+    c = client.Client(
+        "id",
+        client_secret="s",
+        redirect_uris=["https://x/cb"],
+        scope="a b",
+        client_name="N",
+    )
     d = c.to_dict()
     assert d["client_id"] == "id" and d["redirect_uris"] == ["https://x/cb"] and d["scope"] == "a b"
     c2 = client.Client.from_dict(d)
@@ -50,7 +55,11 @@ def test_client_jwks():
     from pygrindvakt import keys
 
     k = keys.signing_key_from_jwk(keys.generate_ec_jwk(), kid="rp")
-    c = client.Client("x", token_endpoint_auth_method=client.AUTH_PRIVATE_KEY_JWT, jwks=k.to_public_jwks())
+    c = client.Client(
+        "x",
+        token_endpoint_auth_method=client.AUTH_PRIVATE_KEY_JWT,
+        jwks=k.to_public_jwks(),
+    )
     assert c.jwks["keys"][0]["kid"] == "rp"
 
 

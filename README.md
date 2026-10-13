@@ -24,29 +24,37 @@ ISSUER = "https://op.example.com"
 op = provider.Provider(
     metadata.ProviderMetadata(ISSUER),
     keys.signing_key_from_pem(open("op-key.pem", "rb").read(), kid="op-1"),
-    client.InMemoryClientStore([
-        client.Client("demo", client_secret="s3cret", redirect_uris=["https://rp.example.com/cb"]),
-    ]),
+    client.InMemoryClientStore(
+        [
+            client.Client(
+                "demo",
+                client_secret="s3cret",
+                redirect_uris=["https://rp.example.com/cb"],
+            ),
+        ]
+    ),
     tokens.TokenCodec("a-long-random-secret"),
-    token_use_store=provider.InMemoryTokenUseStore(),   # or RedisStore(...) across workers
+    token_use_store=provider.InMemoryTokenUseStore(),  # or RedisStore(...) across workers
 )
 
 app = Flask(__name__)
 
+
 def to_flask(r):
     return FlaskResponse(r.body, status=r.status, headers=r.headers)
+
 
 @app.post("/token")
 def token():
     try:
         tr = op.handle_token_request(
             list(request.form.items(multi=True)),
-            f"{ISSUER}/token",                          # from config, never from Host
+            f"{ISSUER}/token",  # from config, never from Host
             auth_header=request.headers.get("Authorization"),
         )
         return to_flask(tr.to_response())
     except OAuthError as e:
-        return to_flask(e.to_response())               # correct status, JSON body, no-store
+        return to_flask(e.to_response())  # correct status, JSON body, no-store
 ```
 
 Discovery, JWKS, authorization and userinfo follow the same shape:
@@ -59,13 +67,19 @@ Discovery, JWKS, authorization and userinfo follow the same shape:
 ```python
 from pygrindvakt import http, rp, pkce, util
 
-http_client = http.ReqwestClient()           # never follows redirects, bounded body
+http_client = http.ReqwestClient()  # never follows redirects, bounded body
 md = rp.discover(http_client, "https://op.example.com")
 info = rp.ProviderInfo.from_metadata(md)
 me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s3cret")
 
-state, nonce, verifier = util.random_token(24), util.random_token(24), util.random_token(32)
-url = rp.authorization_url(info, me, state, nonce, code_challenge=pkce.s256_challenge(verifier))
+state, nonce, verifier = (
+    util.random_token(24),
+    util.random_token(24),
+    util.random_token(32),
+)
+url = rp.authorization_url(
+    info, me, state, nonce, code_challenge=pkce.s256_challenge(verifier)
+)
 # ... redirect the browser to `url`; on the callback:
 tokens_ = rp.exchange_code(http_client, info, me, code, code_verifier=verifier)
 jwks = rp.fetch_jwks(http_client, info.jwks_uri, info.issuer)
@@ -74,7 +88,11 @@ claims = rp.verify_id_token(
 )
 if info.userinfo_endpoint is not None:  # OPs may omit UserInfo
     userinfo = rp.fetch_userinfo(
-        http_client, info.userinfo_endpoint, tokens_.access_token, claims["sub"], info.issuer
+        http_client,
+        info.userinfo_endpoint,
+        tokens_.access_token,
+        claims["sub"],
+        info.issuer,
     )
 ```
 
@@ -132,7 +150,10 @@ Python-implemented stores **fail closed**: an exception is logged through
 
 ```python
 from pygrindvakt import keys
-key = keys.signing_key_from_pkcs11("/usr/lib/softhsm/libsofthsm2.so", "1234", "op-signing-key", "ES256", kid="hsm-1")
+
+key = keys.signing_key_from_pkcs11(
+    "/usr/lib/softhsm/libsofthsm2.so", "1234", "op-signing-key", "ES256", kid="hsm-1"
+)
 ```
 
 > Prefer building the wheel on (or against) the target host when deploying with

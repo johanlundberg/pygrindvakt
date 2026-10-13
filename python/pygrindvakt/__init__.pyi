@@ -8,19 +8,47 @@ provider, request, rp, tokens, util).
 
 from . import (
     client as client,
+)
+from . import (
     discovery as discovery,
+)
+from . import (
     dpop as dpop,
+)
+from . import (
     federation as federation,
+)
+from . import (
     http as http,
+)
+from . import (
     jwt as jwt,
+)
+from . import (
     keys as keys,
+)
+from . import (
     mac as mac,
+)
+from . import (
     metadata as metadata,
+)
+from . import (
     pkce as pkce,
+)
+from . import (
     provider as provider,
+)
+from . import (
     request as request,
+)
+from . import (
     rp as rp,
+)
+from . import (
     tokens as tokens,
+)
+from . import (
     util as util,
 )
 from .errors import OAuthError as OAuthError
@@ -97,26 +125,26 @@ class DpopServerError(DpopError):
     """The replay store failed; the proof could not be evaluated (500)."""
 
 __all__ = [
-    "__version__",
-    "GrindvaktError",
-    "BadRequestError",
+    "AttributeMappingError",
     "AuthnError",
-    "StateError",
+    "BadRequestError",
     "ConfigError",
     "CryptoError",
-    "AttributeMappingError",
-    "JoseError",
-    "UnknownKeyError",
-    "JsonError",
-    "InternalError",
-    "NoBoundEndpointError",
-    "UnknownModuleError",
-    "OAuthError",
     "DpopError",
     "DpopInvalidError",
-    "DpopReplayError",
     "DpopNonceRequiredError",
+    "DpopReplayError",
     "DpopServerError",
+    "GrindvaktError",
+    "InternalError",
+    "JoseError",
+    "JsonError",
+    "NoBoundEndpointError",
+    "OAuthError",
+    "StateError",
+    "UnknownKeyError",
+    "UnknownModuleError",
+    "__version__",
     "client",
     "discovery",
     "dpop",

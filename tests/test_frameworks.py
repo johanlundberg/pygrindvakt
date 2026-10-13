@@ -19,7 +19,6 @@ from typing import NamedTuple
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 import pytest
-
 from conftest import basic_auth
 from pygrindvakt import keys, pkce, rp, util
 
@@ -117,8 +116,12 @@ class DjangoDriver:
         return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
     def post(self, path, form, headers=None):
-        r = self.client.post(path, urlencode(form), content_type="application/x-www-form-urlencoded",
-                             headers=headers)
+        r = self.client.post(
+            path,
+            urlencode(form),
+            content_type="application/x-www-form-urlencoded",
+            headers=headers,
+        )
         return Reply(r.status_code, {k.lower(): v for k, v in r.headers.items()}, r.content)
 
 
@@ -134,7 +137,10 @@ class FastapiDriver:
 
     def post(self, path, form, headers=None):
         if isinstance(form, list):
-            headers = {**(headers or {}), "content-type": "application/x-www-form-urlencoded"}
+            headers = {
+                **(headers or {}),
+                "content-type": "application/x-www-form-urlencoded",
+            }
             r = self.client.post(path, content=urlencode(form), headers=headers, follow_redirects=False)
         else:
             r = self.client.post(path, data=form, headers=headers, follow_redirects=False)
@@ -199,8 +205,12 @@ def code_from_login(reply) -> str:
 
 def exchange(op, code, verifier):
     """POST /token with client_secret_basic and the PKCE verifier."""
-    form = {"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI,
-            "code_verifier": verifier}
+    form = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "code_verifier": verifier,
+    }
     return op.post("/token", form, headers={"Authorization": basic_auth("demo", "demo-secret")})
 
 
@@ -225,8 +235,13 @@ def test_full_code_flow(op_app):
     """Login form -> credentials -> code -> tokens (PKCE, client_secret_basic)
     -> verified id_token -> userinfo, all through the framework's test client."""
     verifier = util.random_token(48)
-    r = start_authorization(op_app, {"code_challenge": pkce.s256_challenge(verifier),
-                                     "code_challenge_method": "S256"})
+    r = start_authorization(
+        op_app,
+        {
+            "code_challenge": pkce.s256_challenge(verifier),
+            "code_challenge_method": "S256",
+        },
+    )
     assert r.status == 200 and b"<form" in r.body and b"demo" in r.body
 
     code = code_from_login(op_app.post("/authorization", {"username": "alice", "password": "alice"}))
@@ -264,12 +279,16 @@ def test_unknown_client_is_not_redirected(op_app):
     r = start_authorization(op_app, {"client_id": "ghost"})
     assert 400 <= r.status < 500 and "location" not in r.headers
     assert r.headers["content-type"].startswith("application/json")
-    assert r.json()["error"] in ("invalid_client", "invalid_request", "unauthorized_client")
+    assert r.json()["error"] in (
+        "invalid_client",
+        "invalid_request",
+        "unauthorized_client",
+    )
 
 
 def test_duplicate_authorization_parameter_is_rejected_by_every_adapter(op_app):
     """Flask, Django, and FastAPI preserve duplicate query values for rejection."""
-    params = list(AUTHZ_PARAMS.items()) + [("client_id", "attacker")]
+    params = [*AUTHZ_PARAMS.items(), ("client_id", "attacker")]
     r = op_app.get("/authorization", params)
     assert r.status == 400
     assert r.json()["error"] == "invalid_request"
@@ -293,8 +312,13 @@ def test_login_without_pending_request_is_rejected(op_app):
 def test_code_replay_is_rejected(op_app):
     """Presenting the same authorization code twice yields 400 invalid_grant."""
     verifier = util.random_token(48)
-    start_authorization(op_app, {"code_challenge": pkce.s256_challenge(verifier),
-                                 "code_challenge_method": "S256"})
+    start_authorization(
+        op_app,
+        {
+            "code_challenge": pkce.s256_challenge(verifier),
+            "code_challenge_method": "S256",
+        },
+    )
     code = code_from_login(op_app.post("/authorization", {"username": "alice", "password": "alice"}))
     assert exchange(op_app, code, verifier).status == 200
     r = exchange(op_app, code, verifier)
@@ -303,16 +327,26 @@ def test_code_replay_is_rejected(op_app):
 
 def test_token_endpoint_rejects_bad_client_secret(op_app):
     """A wrong client secret is a 401 invalid_client with a WWW-Authenticate challenge."""
-    r = op_app.post("/token", {"grant_type": "authorization_code", "code": "x", "redirect_uri": REDIRECT_URI},
-                    headers={"Authorization": basic_auth("demo", "wrong")})
+    r = op_app.post(
+        "/token",
+        {"grant_type": "authorization_code", "code": "x", "redirect_uri": REDIRECT_URI},
+        headers={"Authorization": basic_auth("demo", "wrong")},
+    )
     assert r.status == 401 and r.json()["error"] == "invalid_client"
     assert "www-authenticate" in r.headers
 
 
 def test_client_credentials_grant(op_app):
     """The ``svc`` client obtains an access token with client_secret_post."""
-    r = op_app.post("/token", {"grant_type": "client_credentials", "client_id": "svc",
-                               "client_secret": "svc-secret", "scope": "read"})
+    r = op_app.post(
+        "/token",
+        {
+            "grant_type": "client_credentials",
+            "client_id": "svc",
+            "client_secret": "svc-secret",
+            "scope": "read",
+        },
+    )
     assert r.status == 200
     body = r.json()
     assert body["scope"] == "read" and "id_token" not in body
@@ -341,7 +375,7 @@ class OpBridge:
 
     def _path(self, url: str) -> str:
         assert url.startswith(OP_ISSUER + "/"), url
-        return url[len(OP_ISSUER):]
+        return url[len(OP_ISSUER) :]
 
     @staticmethod
     def _fetch(reply: Reply):

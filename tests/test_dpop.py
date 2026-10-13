@@ -9,8 +9,7 @@ import hashlib
 import time
 
 import pytest
-
-from conftest import ISSUER, TOKEN_URL, USERINFO_URL, basic_auth
+from conftest import TOKEN_URL, USERINFO_URL
 from pygrindvakt import (
     DpopInvalidError,
     DpopNonceRequiredError,
@@ -18,14 +17,18 @@ from pygrindvakt import (
     DpopServerError,
     OAuthError,
     dpop,
-    jwt,
     keys,
     util,
 )
 
 
 def make_proof(key, htm, htu, nonce=None, ath=None, iat=None, typ="dpop+jwt"):
-    claims = {"jti": util.random_token(16), "htm": htm, "htu": htu, "iat": iat or int(time.time())}
+    claims = {
+        "jti": util.random_token(16),
+        "htm": htm,
+        "htu": htu,
+        "iat": iat or int(time.time()),
+    }
     if nonce:
         claims["nonce"] = nonce
     if ath:
@@ -59,7 +62,7 @@ def _sign_with_jwk_header(key, claims, typ):
 @pytest.fixture(scope="module")
 def dpop_key():
     """(private key object, public JWK dict) for an ES256 DPoP key."""
-    cryptography = pytest.importorskip("cryptography")
+    pytest.importorskip("cryptography")
     from cryptography.hazmat.primitives.asymmetric import ec
 
     priv = ec.generate_private_key(ec.SECP256R1())
@@ -99,10 +102,21 @@ def test_htm_htu_mismatch(dpop_key):
     with pytest.raises(DpopInvalidError):
         dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL + "/")
     with pytest.raises(DpopInvalidError):
-        dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL, typ="JWT"), "POST", TOKEN_URL)
+        dpop.validate_proof(
+            store,
+            cfg,
+            make_proof(dpop_key, "POST", TOKEN_URL, typ="JWT"),
+            "POST",
+            TOKEN_URL,
+        )
     with pytest.raises(DpopInvalidError):
-        dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL, iat=int(time.time()) - 10_000),
-                            "POST", TOKEN_URL)
+        dpop.validate_proof(
+            store,
+            cfg,
+            make_proof(dpop_key, "POST", TOKEN_URL, iat=int(time.time()) - 10_000),
+            "POST",
+            TOKEN_URL,
+        )
 
 
 def test_nonce_challenge_then_accept(dpop_key):
@@ -112,10 +126,22 @@ def test_nonce_challenge_then_accept(dpop_key):
     with pytest.raises(DpopNonceRequiredError):
         dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
     nonce = dpop.issue_nonce(cfg)
-    dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL, nonce=nonce), "POST", TOKEN_URL)
+    dpop.validate_proof(
+        store,
+        cfg,
+        make_proof(dpop_key, "POST", TOKEN_URL, nonce=nonce),
+        "POST",
+        TOKEN_URL,
+    )
     # A forged / stale nonce is re-challenged (RFC 9449 section 8), not merely rejected.
     with pytest.raises(DpopNonceRequiredError):
-        dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL, nonce="forged"), "POST", TOKEN_URL)
+        dpop.validate_proof(
+            store,
+            cfg,
+            make_proof(dpop_key, "POST", TOKEN_URL, nonce="forged"),
+            "POST",
+            TOKEN_URL,
+        )
 
 
 def test_no_replay_store_fails_closed():
@@ -159,19 +185,41 @@ def test_dpop_bound_token_end_to_end(op, dpop_key):
     store = dpop.InMemoryReplayStore()
     cfg = dpop.DpopConfig()
     proof = dpop.validate_proof(store, cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
-    tr = op.handle_token_request(list({"grant_type": "client_credentials", "client_id": "svc", "client_secret": "svc-secret", "scope": "read"}.items()),
-        TOKEN_URL, dpop=proof)
+    tr = op.handle_token_request(
+        list(
+            {
+                "grant_type": "client_credentials",
+                "client_id": "svc",
+                "client_secret": "svc-secret",
+                "scope": "read",
+            }.items()
+        ),
+        TOKEN_URL,
+        dpop=proof,
+    )
     assert tr.token_type == "DPoP"
     with pytest.raises(OAuthError):
         op.userinfo(tr.access_token)  # bound token presented without proof
     ath = base64.urlsafe_b64encode(hashlib.sha256(tr.access_token.encode()).digest()).rstrip(b"=").decode()
-    rp = dpop.validate_resource_proof(store, cfg, make_proof(dpop_key, "GET", USERINFO_URL, ath=ath), "GET",
-                                      USERINFO_URL, tr.access_token)
+    rp = dpop.validate_resource_proof(
+        store,
+        cfg,
+        make_proof(dpop_key, "GET", USERINFO_URL, ath=ath),
+        "GET",
+        USERINFO_URL,
+        tr.access_token,
+    )
     with pytest.raises(OAuthError, match="openid scope"):
         op.userinfo(tr.access_token, presented_jkt=rp.jkt)
     with pytest.raises(DpopInvalidError):  # wrong ath
-        dpop.validate_resource_proof(store, cfg, make_proof(dpop_key, "GET", USERINFO_URL, ath="x"), "GET",
-                                     USERINFO_URL, tr.access_token)
+        dpop.validate_resource_proof(
+            store,
+            cfg,
+            make_proof(dpop_key, "GET", USERINFO_URL, ath="x"),
+            "GET",
+            USERINFO_URL,
+            tr.access_token,
+        )
     with pytest.raises(OAuthError):  # wrong key thumbprint
         op.userinfo(tr.access_token, presented_jkt="someone-else")
 

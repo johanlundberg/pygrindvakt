@@ -9,18 +9,34 @@ changes.
 import ast
 import importlib
 import pathlib
-
-import pytest
+import re
 
 import pygrindvakt
+import pytest
 
 STUB_DIR = pathlib.Path(pygrindvakt.__file__).parent
 SUBMODULES = [
-    "client", "discovery", "dpop", "federation", "http", "jwt", "keys", "mac",
-    "metadata", "pkce", "provider", "request", "rp", "tokens", "util",
+    "client",
+    "discovery",
+    "dpop",
+    "federation",
+    "http",
+    "jwt",
+    "keys",
+    "mac",
+    "metadata",
+    "pkce",
+    "provider",
+    "request",
+    "rp",
+    "tokens",
+    "util",
 ]
 # Names that exist only in stubs (typing helpers) and are not runtime objects.
 STUB_ONLY_SUFFIX = "Protocol"
+# Dunders that the member comparison skips but that control what ends up in logs.
+# Several runtime reprs redact secrets on purpose, so the stub must declare them.
+REDACTED_DUNDERS = {"__repr__", "__str__"}
 
 
 def _stub_names(tree):
@@ -42,13 +58,24 @@ def _stub_names(tree):
                             if isinstance(t, ast.Name):
                                 members.add(t.id)
                 classes[node.name] = members
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        elif (
+            isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and not node.target.id.startswith("_")
+        ):
             names.add(node.target.id)
         elif isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name) and not t.id.startswith("_"):
                     names.add(t.id)
     return names, classes
+
+
+def _stub_dunders(tree):
+    """Map class name -> redaction-relevant dunders declared in the stub."""
+    return {
+        node.name: {i.name for i in node.body if isinstance(i, ast.FunctionDef) and i.name in REDACTED_DUNDERS}
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+    }
 
 
 def _runtime_names(mod):
@@ -77,6 +104,24 @@ def test_stub_matches_runtime(name):
             f"{name}.{cls_name}: stub {sorted(members ^ rt_members)} differs "
             f"(stub-only: {sorted(members - rt_members)}, runtime-only: {sorted(rt_members - members)})"
         )
+    _assert_dunder_parity(name, tree, mod)
+
+
+def _assert_dunder_parity(name, tree, mod):
+    stub_dunders = _stub_dunders(tree)
+    for cls_name, declared in stub_dunders.items():
+        if cls_name.endswith(STUB_ONLY_SUFFIX):
+            continue
+        runtime_dunders = {d for d in REDACTED_DUNDERS if d in vars(getattr(mod, cls_name))}
+        assert declared == runtime_dunders, (
+            f"{name}.{cls_name}: runtime defines {sorted(runtime_dunders)} but stub declares {sorted(declared)}"
+        )
+
+
+def test_errors_stub_dunders_match_runtime():
+    """``errors`` is not in SUBMODULES (it is Python-defined), so check its dunders here."""
+    tree = ast.parse((STUB_DIR / "errors.pyi").read_text())
+    _assert_dunder_parity("errors", tree, importlib.import_module("pygrindvakt.errors"))
 
 
 def test_top_level_stub_lists_all_submodules_and_exceptions():
@@ -91,3 +136,14 @@ def test_top_level_stub_lists_all_submodules_and_exceptions():
             names.add(node.target.id)
     for n in pygrindvakt.__all__:
         assert n in names, f"__init__.pyi lacks {n}"
+
+
+@pytest.mark.parametrize("stub", sorted(STUB_DIR.glob("*.pyi")), ids=lambda p: p.name)
+def test_stubs_do_not_blanket_suppress_lint(stub):
+    """A file-level noqa would hide typos (F821) in every annotation of the stub."""
+    for line in stub.read_text().splitlines():
+        stripped = line.strip().lower()
+        for prefix in ("# ruff: noqa", "# flake8: noqa"):
+            if stripped.startswith(prefix):
+                codes = {c for c in re.split(r"[\s,:]+", stripped.removeprefix(prefix)) if c}
+                assert codes and not codes & {"f821", "all"}, f"{stub.name}: file-level noqa covers F821: {line}"

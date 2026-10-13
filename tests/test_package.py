@@ -1,13 +1,28 @@
 """Package-level checks: version, submodule registration, exception hierarchy."""
 
-import pytest
+import ast
+import pathlib
 
 import pygrindvakt
+import pytest
 from pygrindvakt import OAuthError
 
 SUBMODULES = [
-    "client", "discovery", "dpop", "federation", "http", "jwt", "keys", "mac",
-    "metadata", "pkce", "provider", "request", "rp", "tokens", "util",
+    "client",
+    "discovery",
+    "dpop",
+    "federation",
+    "http",
+    "jwt",
+    "keys",
+    "mac",
+    "metadata",
+    "pkce",
+    "provider",
+    "request",
+    "rp",
+    "tokens",
+    "util",
 ]
 
 
@@ -30,11 +45,29 @@ def test_submodules_importable():
 def test_exception_hierarchy():
     """All errors derive from GrindvaktError; DPoP errors form their own subtree."""
     E = pygrindvakt
-    for cls in (E.BadRequestError, E.AuthnError, E.StateError, E.ConfigError, E.CryptoError,
-                E.AttributeMappingError, E.JoseError, E.UnknownKeyError, E.JsonError, E.InternalError,
-                E.NoBoundEndpointError, E.UnknownModuleError, E.DpopError, OAuthError):
+    for cls in (
+        E.BadRequestError,
+        E.AuthnError,
+        E.StateError,
+        E.ConfigError,
+        E.CryptoError,
+        E.AttributeMappingError,
+        E.JoseError,
+        E.UnknownKeyError,
+        E.JsonError,
+        E.InternalError,
+        E.NoBoundEndpointError,
+        E.UnknownModuleError,
+        E.DpopError,
+        OAuthError,
+    ):
         assert issubclass(cls, E.GrindvaktError), cls
-    for cls in (E.DpopInvalidError, E.DpopReplayError, E.DpopNonceRequiredError, E.DpopServerError):
+    for cls in (
+        E.DpopInvalidError,
+        E.DpopReplayError,
+        E.DpopNonceRequiredError,
+        E.DpopServerError,
+    ):
         assert issubclass(cls, E.DpopError), cls
     assert issubclass(E.UnknownKeyError, E.JoseError)
     assert E.AuthnError.status_hint == 401
@@ -97,3 +130,10 @@ def test_py_typed_is_not_partial():
     marker = pathlib.Path(pygrindvakt.__file__).parent / "py.typed"
     assert marker.exists()
     assert "partial" not in marker.read_text()
+
+
+def test_errors_imports_after_native():
+    """OAuthError must follow _native, which resolves it lazily; keep the order."""
+    tree = ast.parse(pathlib.Path(pygrindvakt.__file__).read_text())
+    mods = [n.module for n in tree.body if isinstance(n, ast.ImportFrom)]
+    assert mods.index("_native") < mods.index("errors"), "OAuthError must follow _native"

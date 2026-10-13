@@ -5,14 +5,17 @@ import hmac
 import time
 
 import pytest
-
-from pygrindvakt import GrindvaktError, jwt, keys, mac, pkce, util
+from pygrindvakt import GrindvaktError, jwt, mac, pkce, util
 
 # ---- jwt --------------------------------------------------------------------
 
 
 def test_sign_and_verify_with_jwks(op_key):
-    tok = jwt.sign(op_key, {"iss": "i", "aud": "a", "sub": "s", "exp": int(time.time()) + 60, "x": [1, 2]}, typ="custom+jwt")
+    tok = jwt.sign(
+        op_key,
+        {"iss": "i", "aud": "a", "sub": "s", "exp": int(time.time()) + 60, "x": [1, 2]},
+        typ="custom+jwt",
+    )
     hdr = jwt.peek_header(tok)
     assert hdr["alg"] == "ES256" and hdr["kid"] == "op-1" and hdr["typ"] == "custom+jwt"
     v = jwt.Validation().with_issuer("i").with_audience("a").with_typ("custom+jwt").require_exp()
@@ -25,7 +28,11 @@ def test_validation_failures(op_key):
     with pytest.raises(GrindvaktError):
         jwt.verify_with_jwks(op_key.to_public_jwks(), tok, jwt.Validation().with_issuer("other"))
     with pytest.raises(GrindvaktError):
-        jwt.verify_with_jwks(op_key.to_public_jwks(), tok, jwt.Validation().with_allowed_algorithms(["RS256"]))
+        jwt.verify_with_jwks(
+            op_key.to_public_jwks(),
+            tok,
+            jwt.Validation().with_allowed_algorithms(["RS256"]),
+        )
     with pytest.raises(GrindvaktError):
         jwt.Validation().with_allowed_algorithms(["nope"])
 

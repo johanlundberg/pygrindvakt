@@ -1,16 +1,16 @@
 """The five OP endpoints as Django views."""
 
+from common.op_config import authenticate, render_login_form
 from django.http import HttpRequest, HttpResponse
 from django.middleware.csrf import get_token
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
-
-from common.op_config import authenticate, render_login_form
-from op.adapters import request_data, to_django
-from op.provider import OP, TOKEN_URL
 from pygrindvakt import OAuthError
 from pygrindvakt.http import Response
 from pygrindvakt.request import AuthorizationRequest
+
+from op.adapters import request_data, to_django
+from op.provider import OP, TOKEN_URL
 
 
 @require_GET

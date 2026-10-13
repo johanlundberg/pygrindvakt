@@ -18,7 +18,6 @@ import os
 
 import flask
 from flask import Flask, abort, session
-
 from pygrindvakt import GrindvaktError, rp
 from pygrindvakt.http import ReqwestClient
 
@@ -62,7 +61,10 @@ def create_app() -> Flask:
         if pending is None or args.get("state") != pending["state"]:
             abort(400, "state mismatch")
         if "error" in args:
-            return f"<p>The OP refused: <b>{html.escape(args['error'])}</b> {html.escape(args.get('error_description', ''))}", 403
+            return (
+                f"<p>The OP refused: <b>{html.escape(args['error'])}</b> {html.escape(args.get('error_description', ''))}",
+                403,
+            )
         code = args.get("code")
         if not code:
             abort(400, "missing code")
@@ -71,12 +73,19 @@ def create_app() -> Flask:
             tokens = rp.exchange_code(HTTP_CLIENT, prov, CLIENT, code, pending["verifier"])
             jwks = rp.fetch_jwks(HTTP_CLIENT, prov.jwks_uri, prov.issuer)
             id_claims = rp.verify_id_token(
-                jwks, tokens.id_token, prov.issuer, CLIENT.client_id,
-                pending["nonce"], ["ES256"],
+                jwks,
+                tokens.id_token,
+                prov.issuer,
+                CLIENT.client_id,
+                pending["nonce"],
+                ["ES256"],
             )
             userinfo = rp.fetch_userinfo(
-                HTTP_CLIENT, prov.userinfo_endpoint, tokens.access_token,
-                id_claims["sub"], prov.issuer,
+                HTTP_CLIENT,
+                prov.userinfo_endpoint,
+                tokens.access_token,
+                id_claims["sub"],
+                prov.issuer,
             )
         except GrindvaktError as e:
             # Error details stay in the server log; never echo str(e) to the browser.

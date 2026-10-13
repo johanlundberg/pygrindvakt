@@ -12,9 +12,14 @@ from pygrindvakt import http
 def test_request_data_normalization():
     """Path loses its leading slash, method is upper-cased, header names lower-cased."""
     r = http.HttpRequestData(
-        path="/OIDC/token", method="post", uri="https://op/OIDC/token?x=1",
-        query={"x": "1"}, form={"grant_type": "code"}, body=b"grant_type=code",
-        headers={"Authorization": "Bearer t", "Content-Type": "x"}, cookies={"s": "v"},
+        path="/OIDC/token",
+        method="post",
+        uri="https://op/OIDC/token?x=1",
+        query={"x": "1"},
+        form={"grant_type": "code"},
+        body=b"grant_type=code",
+        headers={"Authorization": "Bearer t", "Content-Type": "x"},
+        cookies={"s": "v"},
     )
     assert r.path == "OIDC/token" and r.method == "POST"
     assert r.headers == {"authorization": "Bearer t", "content-type": "x"}
@@ -38,7 +43,10 @@ def test_request_data_preserves_duplicate_parameter_pairs():
         form=[("grant_type", "authorization_code"), ("grant_type", "refresh_token")],
     )
     assert r.query_pairs == [("client_id", "first"), ("client_id", "second")]
-    assert r.form_pairs == [("grant_type", "authorization_code"), ("grant_type", "refresh_token")]
+    assert r.form_pairs == [
+        ("grant_type", "authorization_code"),
+        ("grant_type", "refresh_token"),
+    ]
 
 
 def test_response_builders():
@@ -266,7 +274,17 @@ def test_reqwest_get_sends_headers():
     try:
         c = http.ReqwestClient()
         url = f"http://127.0.0.1:{srv.server_port}/"
-        assert c.get(url, headers=[("Authorization", "Bearer t"), ("X-Multi", "1"), ("X-Multi", "2")])[0] == 200
+        assert (
+            c.get(
+                url,
+                headers=[
+                    ("Authorization", "Bearer t"),
+                    ("X-Multi", "1"),
+                    ("X-Multi", "2"),
+                ],
+            )[0]
+            == 200
+        )
         assert seen == {"auth": "Bearer t", "x": ["1", "2"]}
         assert c.get(url, None)[0] == 200 and seen["auth"] is None
     finally:
@@ -275,7 +293,12 @@ def test_reqwest_get_sends_headers():
 
 @pytest.mark.parametrize(
     "headers",
-    [[("bad name", "v")], [("", "v")], [("X-Ok", "line\nbreak")], [("X-Ok", "café\x00")]],
+    [
+        [("bad name", "v")],
+        [("", "v")],
+        [("X-Ok", "line\nbreak")],
+        [("X-Ok", "café\x00")],
+    ],
 )
 def test_reqwest_get_invalid_header_is_bad_request(headers):
     from pygrindvakt import BadRequestError

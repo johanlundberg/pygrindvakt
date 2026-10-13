@@ -23,7 +23,11 @@ RP_REDIRECT_URI = "http://127.0.0.1:5001/callback"
 USERS = {
     "alice": {
         "password": "alice",
-        "claims": {"email": ["alice@example.com"], "email_verified": ["true"], "name": ["Alice"]},
+        "claims": {
+            "email": ["alice@example.com"],
+            "email_verified": ["true"],
+            "name": ["Alice"],
+        },
     },
 }
 

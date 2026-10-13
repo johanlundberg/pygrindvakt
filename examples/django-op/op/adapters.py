@@ -1,7 +1,6 @@
 """Django <-> pygrindvakt request / response adapters."""
 
 from django.http import HttpRequest, HttpResponse
-
 from pygrindvakt.http import HttpRequestData, Response
 
 

@@ -34,6 +34,8 @@ dev = [
     "django",
     "fastapi",
     "httpx",
+    "mypy>=2.4",
+    "ruff==0.16.10",
 ]
 docs = [
     # Sphinx 9.1 needs Python >= 3.12 (what Read the Docs uses); older
@@ -54,3 +56,22 @@ markers = [
     "pkcs11: tests requiring a SoftHSM2 token (auto-skip if unavailable)",
     "redis: tests requiring a live Redis at REDIS_URL (auto-skip if unset)",
 ]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+# `select` (not `extend-select`) so ruff's implicit defaults cannot change the gate.
+# F821 must stay enabled for the stubs. Whole families where the repo is clean,
+# individual codes (S1xx, TRY) where only part of a family was ever enabled.
+select = [
+    "ASYNC", "B", "BLE", "C4", "DTZ", "E4", "E7", "E9", "EXE", "F", "FA", "FLY", "G", "I", "INT", "LOG",
+    "PERF", "PIE", "PLE", "PYI", "RUF", "S102", "S110", "S112", "SIM", "T10", "TC", "TRY002", "TRY004", "TRY201", "TRY203", "TRY401", "UP", "W6", "YTT",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# PYI029 autofix deletes `__repr__` from stubs. Several runtime reprs redact
+# secrets on purpose, and tests/test_stubs.py requires the stub to declare them.
+# PYI021: the stubs carry the user-facing docstrings on purpose.
+"*.pyi" = ["PYI029", "PYI021"]

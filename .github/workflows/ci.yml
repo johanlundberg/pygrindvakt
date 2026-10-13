@@ -5,9 +5,12 @@ on:
       - 'src/**'
       - 'python/**'
       - 'tests/**'
+      - 'examples/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'pyproject.toml'
+      - 'uv.lock'
+      - 'justfile'
       - 'build-wheels.sh'
       - '.github/workflows/**'
       - '.github/scripts/**'
@@ -115,9 +118,27 @@ jobs:
 
     - name: Run mypy
       run: |
-        uv venv
-        uv pip install mypy
+        uv sync --frozen --only-group dev
         MYPYPATH=python .venv/bin/mypy --strict tests/typecheck_usage.py
+
+  # Lint + format check, same as `just lint` and `just format-check`.
+  ruff:
+    name: ruff (lint + format)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install UV
+      run: |
+        python3 -m pip install --user "uv==${UV_VERSION}"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Run ruff
+      run: |
+        uv sync --frozen --only-group dev
+        .venv/bin/ruff check python tests examples
+        .venv/bin/ruff format --check python tests examples
 
   #manylinux_aarch64:
     #runs-on: ubuntu-24-arm

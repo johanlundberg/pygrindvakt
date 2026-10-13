@@ -24,6 +24,7 @@ class SigningKey:
         """The public JWK (no private components) as a dict."""
     def to_public_jwks(self) -> dict[str, Any]:
         """A one-key JWKS document (``{"keys": [...]}``) as a dict."""
+    def __repr__(self) -> str: ...
 
 def signing_key_from_pem(data: bytes, alg: str | None = ..., kid: str | None = ...) -> SigningKey:
     """Load a signing key from PEM (or DER) bytes: PKCS#8, PKCS#1 or SEC1.

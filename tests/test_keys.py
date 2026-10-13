@@ -1,7 +1,6 @@
 """Signing-key loading: JWK, PEM (openssl-generated), PKCS#11 (SoftHSM2)."""
 
 import pytest
-
 from pygrindvakt import CryptoError, GrindvaktError, jwt, keys
 
 
@@ -91,6 +90,6 @@ def test_pkcs11_signing_key(softhsm):
 
 @pytest.mark.pkcs11
 def test_pkcs11_wrong_pin(softhsm):
-    module, pin, label = softhsm
+    module, _pin, label = softhsm
     with pytest.raises(CryptoError):
         keys.signing_key_from_pkcs11(module, "9999", label, "ES256")
