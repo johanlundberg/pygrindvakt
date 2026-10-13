@@ -28,7 +28,7 @@ SUBMODULES = [
 
 def test_version():
     """The version is pinned in Cargo.toml and pyproject.toml; keep them in sync."""
-    assert pygrindvakt.__version__ == "0.1.0"
+    assert pygrindvakt.__version__ == "0.2.0"
 
 
 def test_submodules_importable():
