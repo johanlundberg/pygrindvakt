@@ -10,6 +10,7 @@ on:
       - 'Cargo.toml'
       - 'pyproject.toml'
       - 'uv.lock'
+      - 'justfile'
       - 'build-wheels.sh'
       - '.github/workflows/**'
       - '.github/scripts/**'
