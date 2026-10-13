@@ -2,7 +2,7 @@ pygrindvakt
 ===========
 
 **pygrindvakt** is a Python binding for `grindvakt
-<https://github.com/kushaldas/grindvakt>`_ 0.7.x, a runtime-agnostic Rust
+<https://github.com/kushaldas/grindvakt>`_ 0.9.x, a runtime-agnostic Rust
 library for **OAuth 2.0**, **OpenID Connect** and **OpenID Federation 1.1**. It
 exposes grindvakt's OpenID Provider engine, its Relying Party toolkit,
 federation trust-chain resolution, DPoP (RFC 9449) proof validation, and the
@@ -47,8 +47,14 @@ binding turns that into something a Python web application can call directly:
 * **Fail-closed hardening beyond upstream.** The binding refuses several
   things grindvakt silently accepts: an id_token verified without a nonce,
   duplicate client ids, unknown ``Client`` fields, reserved id_token claims in
-  ``extra_claims``, and outbound redirects. Each guard is escapable only
-  through an explicit, warning-emitting ``unsafe_*`` argument.
+  ``extra_claims``, outbound redirects, a per-call ``redirect_uri`` override
+  that is not registered on the :class:`pygrindvakt.rp.RpClient`, a
+  ``post_logout_redirect_uri`` that is not registered, and a non-https or
+  malformed endpoint URL in a provider metadata document. Most guards are
+  escapable only through an explicit ``unsafe_*`` argument that emits a
+  ``UserWarning``; the redirect-registration check is escaped with
+  ``allow_unregistered_redirect_uri=True``, which is set at construction and
+  shows up in ``repr()`` but warns nothing.
 
 The binding mirrors grindvakt's modules as Python submodules:
 
@@ -130,6 +136,31 @@ crosses into Python at all.
 
    exceptions
 
+Release notes
+-------------
+
+The `CHANGELOG
+<https://github.com/kushaldas/pygrindvakt/blob/main/CHANGELOG.md>`_ is the
+release-by-release record, and the only place where breaking changes between
+releases are listed in full; it is not mirrored into this manual. The table
+below maps each binding release to the protocol engine it binds (the same
+version is what ``Cargo.lock`` pins).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - pygrindvakt
+     - grindvakt
+     - Notes
+   * - 0.2.0
+     - 0.9.0
+     - id_token hash binding (``strict_hashes``), registered redirect and
+       post-logout redirect URIs, metadata URL validation.
+   * - 0.1.0
+     - 0.8.0
+     - initial binding with fail-closed OIDC validation.
+
 Architecture decision records
 -----------------------------
 
@@ -142,6 +173,8 @@ repository rather than in this manual:
   Python protocol adapters for stores and outbound HTTP, failing closed.
 * `ADR 0003 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0003-fail-closed-hardening.md>`_:
   fail-closed hardening added at the binding boundary.
+* `ADR 0004 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0004-redirect-registration-and-hash-binding.md>`_:
+  redirect registration and opt-in id_token hash binding (0.2.0).
 
 The full list lives in the `docs/adr
 <https://github.com/kushaldas/pygrindvakt/tree/main/docs/adr>`_ directory.

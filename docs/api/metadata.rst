@@ -47,6 +47,13 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       ``id_token_signing_alg_values_supported``. Unknown extras are always
       kept.
 
+      .. versionchanged:: 0.2.0
+         ``exclude_defaults=True`` no longer drops every ``false``, ``[]`` and
+         ``None``: only members equal to their spec default are omitted. The
+         earlier blanket behaviour re-published a source
+         ``request_uri_parameter_supported: false`` with the member absent
+         (default ``true``), flipping policy.
+
       The full ``to_dict()`` still emits ``[]`` for absent members of these
       lists, including the three required ones (the upstream model cannot represent absence; a proper fix needs
       ``Option<Vec<_>>`` upstream), but ``exclude_defaults=True`` keeps them
@@ -201,6 +208,13 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
    :class:`~pygrindvakt.rp.ProviderInfo` (the constructor raises on an unsafe or cross-origin
    ``end_session_endpoint``; ``from_metadata`` drops it) and calling
    :func:`~pygrindvakt.rp.end_session_url` validate it again.
+
+   .. versionchanged:: 0.2.0
+      The five modelled endpoints became URL-validated in the constructor and
+      ``from_dict`` (previously only the extension members were), the
+      ``issuer`` became validated, and an empty-string
+      ``userinfo_endpoint`` / ``registration_endpoint`` now makes
+      ``from_dict`` raise.
 
    Documents returned by :func:`~pygrindvakt.rp.discover` are not type-checked
    against the known extension members (discovery never fails over them). For a

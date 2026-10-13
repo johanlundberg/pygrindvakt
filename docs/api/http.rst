@@ -63,7 +63,8 @@ supports headers if either
 ``headers`` is a list of ``(name, value)`` pairs. A client that supports
 neither raises :class:`~pygrindvakt.ConfigError` when a GET with headers is
 requested; plain ``get`` and ``post_form`` are unaffected. The type-checking
-protocol for such a client is ``HttpClientWithHeadersProtocol`` (stub-only).
+protocols for such a client are :class:`HttpClientWithHeadersProtocol` and
+:class:`HttpClientGetWithHeadersProtocol` (both stub-only).
 
 Inbound request
 ---------------
@@ -268,6 +269,32 @@ Outbound HTTP client protocol
 
       md = rp.discover(HttpxClient("/etc/ssl/private-ca.pem"), "https://op.example.com")
 
+.. py:class:: HttpClientWithHeadersProtocol
+
+   The :class:`HttpClientProtocol` variant whose ``get`` also takes request
+   headers: ``get(url, headers: list[tuple[str, str]] | None = None)``. Needed
+   to type-check a client passed to
+   :func:`pygrindvakt.rp.fetch_userinfo(method="GET") <pygrindvakt.rp.fetch_userinfo>`.
+
+   **Stub-only:** it exists in ``http.pyi`` for static checkers and is not
+   importable at runtime; any object with the right methods is accepted. A
+   client may instead provide ``get_with_headers(url, headers)``, which is
+   preferred when present. Either way the client must not follow redirects, or
+   must strip ``Authorization`` on a cross-origin redirect: those headers carry
+   the access token.
+
+   .. versionadded:: 0.2.0
+
+.. py:class:: HttpClientGetWithHeadersProtocol
+
+   The :class:`HttpClientProtocol` variant that provides
+   ``get_with_headers(url, headers)`` instead of a ``headers`` parameter on
+   ``get``. The runtime prefers this method when both forms exist.
+
+   **Stub-only**, as for :class:`HttpClientWithHeadersProtocol`.
+
+   .. versionadded:: 0.2.0
+
 .. py:class:: HttpFetchResponse(status: int, body: bytes, content_type: str | None = None, headers: list[tuple[str, str]] | None = None)
 
    The result of an outbound fetch made through an ``HttpClient``. A Python
@@ -284,6 +311,8 @@ Outbound HTTP client protocol
 
       Read-only response ``(name, value)`` pairs; names are lower-cased,
       order and repeats kept. Empty when none were given.
+
+      .. versionadded:: 0.2.0
 
    .. py:method:: text() -> str
 
@@ -354,6 +383,10 @@ Built-in client
       redirect target. An invalid header name or value raises
       :class:`pygrindvakt.BadRequestError`. Raises :class:`pygrindvakt.InternalError` on
       connection failure or when the body exceeds ``max_response_bytes``.
+
+      .. versionchanged:: 0.2.0
+         Added the ``headers`` parameter and the recording of response headers
+         on the internal fetch response.
 
    .. py:method:: post_form(url: str, form: list[tuple[str, str]], headers: list[tuple[str, str]] | None = None) -> tuple[int, bytes, str | None]
 

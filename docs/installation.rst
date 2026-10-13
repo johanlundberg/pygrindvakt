@@ -4,8 +4,9 @@ Installation
 Requirements
 ------------
 
-* Python 3.10 or newer. The wheels are built against the stable ABI
-  (``abi3``), so one wheel per platform covers every supported interpreter.
+* CPython 3.10 or newer. The wheels are built against the stable ABI
+  (``abi3``, tagged ``cp310-abi3``), so one wheel covers every supported
+  CPython interpreter; PyPy is not supported.
 * Nothing else at runtime: TLS is provided by ``rustls`` with a bundled
   Mozilla root store (compiled in), so there is no OpenSSL dependency, and
   outbound HTTP uses the bundled ``reqwest`` client.
@@ -28,9 +29,18 @@ or, with `uv <https://docs.astral.sh/uv/>`_:
 
    uv pip install pygrindvakt
 
-Prebuilt ``manylinux`` wheels include the compiled extension (with grindvakt's
-``pkcs11`` and ``redis`` features enabled) and PEP 561 type stubs, so no Rust
-toolchain is required.
+Prebuilt wheels include the compiled extension (with grindvakt's ``pkcs11`` and
+``redis`` features enabled) and PEP 561 type stubs, so no Rust toolchain is
+required.
+
+.. note:: Which platforms have a prebuilt wheel
+
+   Releases currently publish one wheel: ``cp310-abi3-manylinux_2_28_x86_64``
+   (plus the source distribution). ``aarch64`` Linux, macOS and Windows jobs
+   exist in ``.github/workflows/release.yml`` but are disabled, so on those
+   platforms ``pip`` falls back to the sdist and needs a Rust toolchain; see
+   `From source`_ below. Check `the PyPI file list
+   <https://pypi.org/project/pygrindvakt/#files>`_ for the current set.
 
 .. tip:: HSM / PKCS#11 deployments
 
@@ -44,7 +54,8 @@ toolchain is required.
 From source
 -----------
 
-Building from source needs a Rust toolchain (1.75 or newer) and `maturin
+Building from source needs a Rust toolchain (1.88 or newer, the
+``rust-version`` declared in ``Cargo.toml``) and `maturin
 <https://www.maturin.rs>`_. The project uses uv:
 
 .. code-block:: console
@@ -84,13 +95,20 @@ suite use a few:
      - ``examples/fastapi-op`` (``httpx`` drives FastAPI's test client).
    * - ``pytest``
      - The test suite.
+   * - ``mypy``, ``ruff``
+     - ``just typecheck`` / ``just lint``, and the matching CI jobs.
 
 Install them all with:
 
 .. code-block:: console
 
-   uv pip install --python .venv/bin/python pytest cryptography flask django fastapi httpx
+   uv pip install --python .venv/bin/python --group dev
    .venv/bin/python -m pytest tests/
+
+The ``dev`` dependency group carries ``pytest``, ``cryptography``, ``flask``,
+``django``, ``fastapi``, ``httpx``, ``mypy`` and the pinned ``ruff``; ``just
+--list`` shows the recipes CI runs (``just check`` = lint, format check,
+mypy, tests).
 
 Tests that need a SoftHSM2 token or a Redis server skip themselves when the
 tooling is missing.
@@ -148,10 +166,16 @@ pyright pick up types with no extra configuration:
 Building this documentation
 ---------------------------
 
-The API reference is hand-written (no autodoc), so the docs build does not
-need the compiled extension. From the repository root:
+The API reference is hand-written from the type stubs (the ``sphinx.ext.autodoc``
+extension is configured, but no page uses it), so the docs build does not need
+the compiled extension. From the repository root:
 
 .. code-block:: console
 
    uv pip install --python .venv/bin/python --group docs
    .venv/bin/python -m sphinx -b html -W docs docs/_build/html
+
+Read the Docs builds with ``-W``, so a warning fails the build; there is no CI
+job for it, so run the command above before pushing docs changes. ``just
+docs-version`` checks the narrower mistake: that the ``grindvakt`` version named
+in ``README.md`` and ``docs/index.rst`` is still the one ``Cargo.lock`` pins.

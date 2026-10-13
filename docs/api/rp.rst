@@ -107,6 +107,12 @@ Provider and client
    host). Use it only for RFC 7591 dynamic registrations, never with a value
    derived from request data.
 
+   .. versionadded:: 0.2.0
+      The ``post_logout_redirect_uris``, ``redirect_uris`` and
+      ``allow_unregistered_redirect_uri`` parameters (and their read-only
+      properties). Before 0.2.0 any syntactically valid per-call
+      ``redirect_uri`` override was accepted.
+
    .. warning::
 
       ``client_secret`` is a credential. Load it from a secret store or an
@@ -255,6 +261,8 @@ Discovery and keys
    or invalid input. ``state`` is echoed back to ``post_logout_redirect_uri``
    by the OP; generate it like the login ``state`` and verify it.
 
+   .. versionadded:: 0.2.0
+
 .. py:function:: fetch_jwks(http: HttpClientProtocol | None, jwks_uri: str, issuer: str) -> dict[str, Any]
 
    Fetch a JWKS document from ``jwks_uri`` for its associated ``issuer``
@@ -359,6 +367,8 @@ Discovery and keys
       fetch). A set whose keys have no ``kid``, and a token without one,
       behave as in :func:`verify_id_token`: no refresh, and the usual
       :class:`pygrindvakt.AuthnError`.
+
+   .. versionadded:: 0.2.0
 
 Finishing the flow
 ------------------
@@ -466,6 +476,13 @@ Finishing the flow
       (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
       it for the standard code flow allows id_token replay.
 
+   .. versionchanged:: 0.2.0
+      Added the keyword-only ``leeway``, ``max_age``, ``acr_values``,
+      ``access_token`` / ``require_at_hash``, ``authorization_code`` /
+      ``require_c_hash`` and ``strict_hashes`` options, and the requirement
+      that the token carry a ``kid`` when the key set holds more than one key.
+      ``jwks`` now also accepts a :class:`JwksCache`.
+
 .. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str | None, access_token: str, expected_sub: str, issuer: str, *, method: Literal["POST", "GET"] = "POST", jwks: dict[str, Any] | JwksCache | None = None, client_id: str | None = None, allowed_algorithms: list[str] | None = None, trust: str | None = None, typ: str | None = None, max_age: int | None = 300, require_exp: bool = False) -> dict[str, Any]
 
    Fetch the UserInfo response with a Bearer ``access_token`` and return its
@@ -543,6 +560,13 @@ Finishing the flow
 
    Encrypted (JWE) responses are not supported and raise
    :class:`pygrindvakt.AuthnError` with ``code == "userinfo_encrypted"``.
+
+   .. versionchanged:: 0.2.0
+      ``userinfo_endpoint`` became ``str | None`` (a provider that does not
+      advertise UserInfo yields ``None`` from ``ProviderInfo``, and passing it
+      through raises :class:`pygrindvakt.ConfigError`), and the ``method``,
+      ``jwks``, ``client_id``, ``allowed_algorithms``, ``trust``, ``typ``,
+      ``max_age`` and ``require_exp`` options were added.
 
    .. code-block:: python
 

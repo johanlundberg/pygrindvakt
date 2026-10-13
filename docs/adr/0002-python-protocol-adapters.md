@@ -1,6 +1,9 @@
 # ADR 0002: Python protocol adapters for stores and outbound HTTP, failing closed
 
-- **Status:** Amended by the 0.8 OIDC conformance hardening
+- **Status:** Amended by the grindvakt 0.8 conformance hardening (pygrindvakt
+  0.1.0). Since pygrindvakt 0.2.0 (grindvakt 0.9.0) the `HttpClient` return
+  also accepts a 4th `headers` element and an `HttpFetchResponse`; see the
+  *Outbound HTTP client protocol* page of the API reference
 - **Date:** 2026-09-02
 - **Deciders:** pygrindvakt maintainers
 

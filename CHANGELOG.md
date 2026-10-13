@@ -58,35 +58,10 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   properties `RpClient.redirect_uris` and
   `RpClient.allow_unregistered_redirect_uri`.
 
-### Documentation
-
-- `ProviderMetadata.raw` is documented as an unvalidated snapshot for
-  display / audit, not for reading policy (extension members read from it
-  bypass the type checks; use the typed properties).
-
-### Fixed
-
-- `ProviderMetadata.to_dict(exclude_defaults=True)` no longer drops every
-  `false`, `[]` and `None`; it omits only members equal to their spec default.
-  This corrects the earlier blanket behaviour, which re-published a source
-  `request_uri_parameter_supported: false` with the member absent (default
-  `true`), flipping policy. Members that now stay in the output:
-  `request_uri_parameter_supported: false`, and `[]` for
-  `response_modes_supported`, `grant_types_supported`,
-  `token_endpoint_auth_methods_supported`, `claim_types_supported` (non-empty
-  spec defaults, so `[]` means "none") and the required
-  `response_types_supported`, `subject_types_supported`,
-  `id_token_signing_alg_values_supported`. `request_uri_parameter_supported:
-  true` is now dropped. Limit: the full `to_dict()` still emits `[]` for
-  absent `response_modes_supported`, `grant_types_supported` (and the required lists) and
-  `token_endpoint_auth_methods_supported` (the upstream model cannot represent
-  absence; a proper fix needs `Option<Vec<_>>` upstream). With
-  `exclude_defaults=True` they stay absent when `raw` shows the source lacked
-  them and the value is still `[]`; constructor-built metadata (no `raw`)
-  keeps the `[]`.
-
 ### Changed
 
+- Updated to `grindvakt` 0.9.0 (see its changelog for the full list; notable
+  effects for Python users below).
 - `JwksCache` now emits one `UserWarning` (per cache, on its first fetch) when
   the `HttpClient` returns a response with no headers at all. Without headers
   the cache cannot see `Cache-Control` / `Age`, so it silently used
@@ -130,6 +105,71 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `frontchannel_logout_supported` / `backchannel_logout_supported` /
   `require_pushed_authorization_requests` to true: the engine implements none
   of them. Publishing is still allowed; `ProviderMetadata` setters stay silent.
+
+- **Breaking:** known extension members in `ProviderMetadata.extra` are now
+  type-checked: a wrong-typed `acr_values_supported`, `backchannel_logout_supported`,
+  `revocation_endpoint`, etc. raises `ValueError` from `from_dict`,
+  `extra = ...` and `set_extra_field` (previously accepted silently).
+- `ProviderMetadata.extra` may now contain `end_session_endpoint`, fixing
+  `from_dict(md.to_dict())` raising `ValueError` for discovered documents that
+  carry it. `from_dict(md.to_dict()).to_dict() == md.to_dict()` now holds for metadata built
+  through the validated paths (not for discovered documents with malformed known
+  extension members, which `to_dict()` preserves and `from_dict()` rejects).
+- **Breaking:** `rp.fetch_userinfo` now takes `userinfo_endpoint: str | None`
+  and raises `ConfigError` for `None`; a signed (`application/jwt`) UserInfo
+  response that previously failed generically now raises `AuthnError` with a
+  precise code unless verification inputs are supplied. A GET with a Python
+  client that supports no headers raises `ConfigError`.
+
+- **Breaking:** exception instances now always have `code` and `upstream_*`
+  attributes; code that set or relied on the absence of an attribute named
+  `code` on non-`OAuthError` exceptions is affected. `InternalError` raised
+  for transport failures now has a `__cause__` where it previously had none.
+- **Breaking:** `ProviderMetadata.userinfo_endpoint` is now `str | None`
+  (and settable to `None`); providers that do not advertise UserInfo are
+  accepted by `rp.discover`, and `ProviderInfo.from_metadata` then yields
+  `userinfo_endpoint = None`.
+- **Breaking:** `rp.verify_id_token` requires the id_token to carry a `kid`
+  when the JWK Set has more than one key (OIDC Core 10.1).
+- Failures from the token, UserInfo, JWKS, discovery and federation
+  endpoints are reported upstream as `Error::UpstreamHttp`; the binding maps
+  token/UserInfo failures to `AuthnError` and the rest to `InternalError`,
+  as before. Messages are unchanged except that the token-endpoint message
+  no longer embeds the upstream body (`token endpoint returned 400`), and
+  the federation resolve failure now reads `resolve endpoint returned N ...`
+  under `InternalError`.
+- State parameters over 1024 characters or outside printable ASCII are
+  rejected, and `OAuthError` wire descriptions are normalized (upstream
+  hardening).
+- The built-in `ReqwestClient` now records lower-cased response headers on
+  the internal fetch response. Python HTTP clients may supply headers too (see
+  "Python `HttpClient` adapters can report response headers").
+- `py.typed` is now empty (the package is fully typed) instead of `partial`.
+- The `http` argument of `rp`, `federation` and `discovery` functions is typed
+  as `HttpClientProtocol | ReqwestClient | None` instead of `Any | None`, and
+  `HttpClientProtocol` methods are typed as returning a
+  `(status, body, content_type)` tuple or an `HttpFetchResponse`.
+
+### Fixed
+
+- `ProviderMetadata.to_dict(exclude_defaults=True)` no longer drops every
+  `false`, `[]` and `None`; it omits only members equal to their spec default.
+  This corrects the earlier blanket behaviour, which re-published a source
+  `request_uri_parameter_supported: false` with the member absent (default
+  `true`), flipping policy. Members that now stay in the output:
+  `request_uri_parameter_supported: false`, and `[]` for
+  `response_modes_supported`, `grant_types_supported`,
+  `token_endpoint_auth_methods_supported`, `claim_types_supported` (non-empty
+  spec defaults, so `[]` means "none") and the required
+  `response_types_supported`, `subject_types_supported`,
+  `id_token_signing_alg_values_supported`. `request_uri_parameter_supported:
+  true` is now dropped. Limit: the full `to_dict()` still emits `[]` for
+  absent `response_modes_supported`, `grant_types_supported` (and the required lists) and
+  `token_endpoint_auth_methods_supported` (the upstream model cannot represent
+  absence; a proper fix needs `Option<Vec<_>>` upstream). With
+  `exclude_defaults=True` they stay absent when `raw` shows the source lacked
+  them and the value is still `[]`; constructor-built metadata (no `raw`)
+  keeps the `[]`.
 
 ### Added
 
@@ -233,55 +273,13 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 - Tests (two local servers) that credentials and form bodies are never
   forwarded on cross-origin 301/302/303/307/308 redirects.
 
-### Changed
-
-- **Breaking:** known extension members in `ProviderMetadata.extra` are now
-  type-checked: a wrong-typed `acr_values_supported`, `backchannel_logout_supported`,
-  `revocation_endpoint`, etc. raises `ValueError` from `from_dict`,
-  `extra = ...` and `set_extra_field` (previously accepted silently).
-- `ProviderMetadata.extra` may now contain `end_session_endpoint`, fixing
-  `from_dict(md.to_dict())` raising `ValueError` for discovered documents that
-  carry it. `from_dict(md.to_dict()).to_dict() == md.to_dict()` now holds for metadata built
-  through the validated paths (not for discovered documents with malformed known
-  extension members, which `to_dict()` preserves and `from_dict()` rejects).
-- **Breaking:** `rp.fetch_userinfo` now takes `userinfo_endpoint: str | None`
-  and raises `ConfigError` for `None`; a signed (`application/jwt`) UserInfo
-  response that previously failed generically now raises `AuthnError` with a
-  precise code unless verification inputs are supplied. A GET with a Python
-  client that supports no headers raises `ConfigError`.
-
-- **Breaking:** exception instances now always have `code` and `upstream_*`
-  attributes; code that set or relied on the absence of an attribute named
-  `code` on non-`OAuthError` exceptions is affected. `InternalError` raised
-  for transport failures now has a `__cause__` where it previously had none.
-- Updated to `grindvakt` 0.9 (see its changelog for the full list; notable
-  effects for Python users below).
-- **Breaking:** `ProviderMetadata.userinfo_endpoint` is now `str | None`
-  (and settable to `None`); providers that do not advertise UserInfo are
-  accepted by `rp.discover`, and `ProviderInfo.from_metadata` then yields
-  `userinfo_endpoint = None`.
-- **Breaking:** `rp.verify_id_token` requires the id_token to carry a `kid`
-  when the JWK Set has more than one key (OIDC Core 10.1).
-- Failures from the token, UserInfo, JWKS, discovery and federation
-  endpoints are reported upstream as `Error::UpstreamHttp`; the binding maps
-  token/UserInfo failures to `AuthnError` and the rest to `InternalError`,
-  as before. Messages are unchanged except that the token-endpoint message
-  no longer embeds the upstream body (`token endpoint returned 400`), and
-  the federation resolve failure now reads `resolve endpoint returned N ...`
-  under `InternalError`.
-- State parameters over 1024 characters or outside printable ASCII are
-  rejected, and `OAuthError` wire descriptions are normalized (upstream
-  hardening).
-- The built-in `ReqwestClient` now records lower-cased response headers on
-  the internal fetch response. Python HTTP clients may supply headers too (see
-  "Python `HttpClient` adapters can report response headers").
-- `py.typed` is now empty (the package is fully typed) instead of `partial`.
-- The `http` argument of `rp`, `federation` and `discovery` functions is typed
-  as `HttpClientProtocol | ReqwestClient | None` instead of `Any | None`, and
-  `HttpClientProtocol` methods are typed as returning a
-  `(status, body, content_type)` tuple or an `HttpFetchResponse`.
+- CI job running `mypy --strict` over `tests/typecheck_usage.py`.
 
 ### Documentation
+
+- `ProviderMetadata.raw` is documented as an unvalidated snapshot for
+  display / audit, not for reading policy (extension members read from it
+  bypass the type checks; use the typed properties).
 
 - Documented that `from pygrindvakt import http` shadows the standard-library
   `http` package, with `from pygrindvakt import http as gv_http` /
@@ -291,10 +289,6 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   Python HTTP clients. Fork is supported only while no other thread is inside
   a pygrindvakt call; a lock held by another thread at fork time is inherited
   locked by the child and can deadlock it.
-
-### Added
-
-- CI job running `mypy --strict` over `tests/typecheck_usage.py`.
 
 ## [0.1.0] - 2026-09-15
 

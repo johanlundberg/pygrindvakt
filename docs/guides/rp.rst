@@ -402,7 +402,8 @@ a private CA, an outbound proxy, per-host allowlists, or tests.
    http_client = HttpxClient(verify="/etc/ssl/private-ca.pem", proxy="http://proxy.internal:3128")
    md = rp.discover(http_client, "https://op.internal.example")
 
-The contract: return ``(status, body: bytes, content_type)`` or an
+The contract: return ``(status, body: bytes, content_type)``, optionally with a
+4th ``headers`` element, or an
 :class:`~pygrindvakt.http.HttpFetchResponse`; **never follow redirects**;
 enforce timeouts; bound the body size. An exception is logged through
 ``sys.unraisablehook`` and surfaces as :class:`pygrindvakt.InternalError`.
