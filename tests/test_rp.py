@@ -648,7 +648,7 @@ def test_begin_pkce_false(prov, rpc):
 
 def test_begin_pkce_false_refused_for_public_client(prov):
     public = rp.RpClient("public", REDIRECT_URI, auth_method="none")
-    with pytest.raises(BadRequestError, match="PKCE"):
+    with pytest.raises(ConfigError, match="PKCE"):
         rp.begin(prov, public, pkce=False)
     url, *_ = rp.begin(prov, public)
     assert "code_challenge" in parse_qs(urlsplit(url).query)
@@ -1555,7 +1555,7 @@ class _NoEndSession:
 
 
 def test_end_session_constructor_error_says_cross_origin():
-    with pytest.raises(BadRequestError, match="different origin"):
+    with pytest.raises(ConfigError, match="different origin"):
         _pi("https://evil.example/logout")
 
 
@@ -1732,9 +1732,9 @@ def test_end_session_url_request_value_cannot_bypass(lprov):
 
 
 def test_end_session_url_post_logout_syntax_still_validated(lprov):
-    with pytest.raises(BadRequestError):
+    with pytest.raises(ConfigError):
         _logout_client(AFTER + "#frag")
-    with pytest.raises(BadRequestError):
+    with pytest.raises(ConfigError):
         _logout_client("relative/path")
     # Without post_logout_redirect_uri nothing changes.
     rp.end_session_url(lprov, client=_logout_client(AFTER), id_token_hint="h")
@@ -1759,7 +1759,7 @@ def test_end_session_url_rejects_reserved_extras_and_empty(lprov):
         f"{ISSUER}/token",
         end_session_endpoint=f"{ISSUER}/logout?state=x",
     )
-    with pytest.raises(BadRequestError, match="library-controlled"):
+    with pytest.raises(ConfigError, match="library-controlled"):
         rp.end_session_url(p)
 
 
@@ -1806,7 +1806,7 @@ def test_verify_strict_hashes(op_key):
     assert _vo(op_key, claims, access_token=at, strict_hashes=True)["sub"] == "alice"
     with pytest.raises(AuthnError, match="c_hash"):
         _vo(op_key, _co(c_hash="x"), strict_hashes=True)
-    # No values and no hash claims: nothing required, no BadRequestError.
+    # No values and no hash claims: nothing required, no ConfigError.
     assert _vo(op_key, _co(), strict_hashes=True)["sub"] == "alice"
     # Default unchanged.
     assert _vo(op_key, claims)["sub"] == "alice"
@@ -1850,7 +1850,7 @@ def test_verify_strict_hashes_requires_claims_when_values_given(op_key):
     assert _vo(op_key, only_at, access_token=at, require_at_hash=True, strict_hashes=True)["sub"] == "alice"
     with pytest.raises(AuthnError, match="missing at_hash"):
         _vo(op_key, _co(), access_token=at, require_at_hash=True, strict_hashes=True)
-    with pytest.raises(BadRequestError, match="require_at_hash needs an access_token"):
+    with pytest.raises(ConfigError, match="require_at_hash needs an access_token"):
         _vo(op_key, _co(), require_at_hash=True, strict_hashes=True)
     # strict_hashes off: absent claim still accepted.
     assert _vo(op_key, _co(), access_token=at, authorization_code=code)["sub"] == "alice"
@@ -1868,7 +1868,7 @@ def test_verify_leeway_makes_expired_token_pass(op_key):
 
 def test_verify_leeway_above_300_rejected(op_key):
     assert _vo(op_key, _co(), leeway=300)["sub"] == "alice"
-    with pytest.raises(BadRequestError, match="leeway"):
+    with pytest.raises(ConfigError, match="leeway"):
         _vo(op_key, _co(), leeway=301)
     with pytest.raises(ValueError, match="negative"):
         _vo(op_key, _co(), leeway=-1)
@@ -1903,7 +1903,7 @@ def test_verify_acr_allow_list(op_key):
         _vo(op_key, _co(acr="pwd"), acr_values=["mfa"])
     with pytest.raises(AuthnError, match="acr"):
         _vo(op_key, _co(), acr_values=["mfa"])
-    with pytest.raises(BadRequestError, match="acr_values"):
+    with pytest.raises(ConfigError, match="acr_values"):
         _vo(op_key, _co(acr="mfa"), acr_values=[])
 
 
@@ -1926,10 +1926,10 @@ def test_verify_require_at_hash(op_key):
     assert _vo(op_key, _co(at_hash=_half_hash(at)), access_token=at, require_at_hash=True)["sub"] == "alice"
 
 
-def test_verify_require_at_hash_without_access_token_is_bad_request(op_key):
-    with pytest.raises(BadRequestError, match="require_at_hash"):
+def test_verify_require_at_hash_without_access_token_is_config_error(op_key):
+    with pytest.raises(ConfigError, match="require_at_hash"):
         _vo(op_key, _co(at_hash="x"), require_at_hash=True)
-    with pytest.raises(BadRequestError, match="require_c_hash"):
+    with pytest.raises(ConfigError, match="require_c_hash"):
         _vo(op_key, _co(c_hash="x"), require_c_hash=True)
 
 

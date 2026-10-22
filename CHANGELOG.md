@@ -7,6 +7,45 @@ needed to track the upstream `grindvakt` library and correct protocol or
 security handling. `pygrindvakt` is a thin PyO3 binding; most entries reflect
 adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
+## Unreleased
+
+### Changed
+
+- The Flask RP example and the RP/security guides map a failed login to 503
+  (`retryable`), 401 (`auth_failure`) or 400 instead of a fixed 502.
+- `BadRequestError` and `ConfigError` now also derive from `ValueError` (MRO:
+  the class, `GrindvaktError`, `ValueError`, `Exception`). Configuration faults
+  in `rp` (`RpClient` auth options, JWS algorithm lists, negative seconds,
+  `leeway` range, `JwksCache` constructor, `ProviderInfo` / `RpClient` URLs,
+  `fetch_userinfo` options) and `ProviderMetadata` URL/extra checks raise
+  `ConfigError` (`status_hint` 500, code `config`), not `BadRequestError`;
+  `except ValueError` keeps working, `except GrindvaktError` now catches them.
+  Catch `ConfigError` first, log `e.log_summary` and re-raise: it is a
+  deployment fault, never a user-visible 4xx or 503. `BadRequestError` (400)
+  stays for values that may come from a request (unregistered
+  `redirect_uri` / `post_logout_redirect_uri` overrides, reserved `extra`
+  parameters). Still plain `ValueError` (follow-up):
+  `ProviderMetadata.from_dict`/`from_json` parse failures, rp `extra` and
+  `extra_params`, `parse_oauth_code`/`oauth_error_redirect`, and the `client`,
+  `tokens`, `dpop`, `provider`, `request` and `http` modules.
+- `str(OAuthError)` now escapes control, bidi, invisible-format and tag
+  characters in the description and caps it at 512 characters (behaviour
+  change). `OAuthError.description` remains raw and untrusted; the wire output
+  of `to_response()` / `to_redirect()` is unchanged. `log_summary` now escapes
+  the full invisible-character set of grindvakt (tag characters, variation
+  selectors and more), not just bidi and zero-width characters.
+- `ProviderMetadata(issuer, base)` no longer embeds the nested exception type
+  name in its "invalid endpoint" message.
+
+### Added
+
+- `GrindvaktError.auth_failure` (from `Error::is_auth_failure()`; true for
+  `AuthnError`), `GrindvaktError.retryable` (upstream status >= 500 or 429, or
+  code `transport`, `jwks_fetch_timeout`, `discovery_backoff`) and the
+  `GrindvaktError.log_summary` property (safe to log, not to send to clients).
+  `retryable` is never derived from an upstream-supplied `code`: an IdP
+  answering `error=transport` with HTTP 400/401 stays non-retryable.
+
 ## [0.2.0] - 2026-10-13
 
 ### Breaking

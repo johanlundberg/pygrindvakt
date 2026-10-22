@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pygrindvakt import _native
 
+_STR_DESCRIPTION_MAX = 512
+
 
 class OAuthError(_native.GrindvaktError):
     """An OAuth 2.0 / OpenID Connect protocol error (RFC 6749 section 5.2).
@@ -20,7 +22,9 @@ class OAuthError(_native.GrindvaktError):
 
     Attributes:
         code: the OAuth error string, e.g. ``"invalid_request"``.
-        description: optional human-readable ``error_description``.
+        description: optional human-readable ``error_description``. Raw and
+            untrusted (it may carry control, bidi or tag characters);
+            ``str(exc)`` is the escaped form.
         state: the client's ``state`` value to echo back, if known.
     """
 
@@ -38,8 +42,11 @@ class OAuthError(_native.GrindvaktError):
         self.state = state
 
     def __str__(self) -> str:
+        # description is untrusted and may be attacker-influenced; escape and
+        # cap it so str(exc) is safe to log. .description stays raw.
         if self.description:
-            return f"{self.code}: {self.description}"
+            safe = _native.escape_untrusted_text(self.description, _STR_DESCRIPTION_MAX)
+            return f"{self.code}: {safe}"
         return self.code
 
     def __repr__(self) -> str:

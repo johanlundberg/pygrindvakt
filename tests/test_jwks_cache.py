@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from pygrindvakt import (
     AuthnError,
-    BadRequestError,
+    ConfigError,
     GrindvaktError,
     InternalError,
     JoseError,
@@ -698,7 +698,7 @@ def test_rp_verify_id_token_with_cache_rejects_issuer_mismatch():
     cache, _ = make_cache(http)
     other = "https://other.example.com"
     # Token claims iss == other and is signed by the cache's key.
-    with pytest.raises(BadRequestError, match="issuer"):
+    with pytest.raises(ConfigError, match="issuer"):
         rp.verify_id_token(cache, id_token(k1, issuer=other), other, CLIENT_ID, "n", ["ES256"])
     # Rejected before any fetch.
     assert http.calls == 0
@@ -781,11 +781,11 @@ def test_cache_argument_errors_do_not_fetch():
     tok = id_token(k1)
     with pytest.raises(AuthnError, match="expected_nonce is required"):
         cache.verify_id_token(tok, CLIENT_ID, None, ["ES256"])
-    with pytest.raises(BadRequestError, match="leeway"):
+    with pytest.raises(ConfigError, match="leeway"):
         verify(cache, tok, leeway=301)
-    with pytest.raises(BadRequestError, match="require_at_hash"):
+    with pytest.raises(ConfigError, match="require_at_hash"):
         verify(cache, tok, require_at_hash=True)
-    with pytest.raises(BadRequestError, match="acr_values"):
+    with pytest.raises(ConfigError, match="acr_values"):
         verify(cache, tok, acr_values=[])
     with pytest.raises(ValueError, match="algorithm"):
         cache.verify_id_token(tok, CLIENT_ID, "n", ["nope"])
@@ -855,7 +855,7 @@ def test_fetch_userinfo_with_cache_rejects_issuer_mismatch():
     claims = {"iss": other, "sub": "alice", "aud": CLIENT_ID, "iat": now}
     http = UserinfoHttp(jwks_doc(k1), jwt.sign(k1, claims))
     cache, _ = make_cache(http)
-    with pytest.raises(BadRequestError, match="issuer"):
+    with pytest.raises(ConfigError, match="issuer"):
         rp.fetch_userinfo(
             http,
             f"{other}/userinfo",

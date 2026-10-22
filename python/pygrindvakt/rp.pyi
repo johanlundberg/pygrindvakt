@@ -12,7 +12,7 @@ class ProviderInfo:
     ``end_session_endpoint`` receives ``id_token_hint`` (the full ID token) in
     the query string, so it must have the same origin as ``issuer`` (scheme,
     host, effective port) unless ``allow_cross_origin_end_session=True``. The
-    constructor raises ``BadRequestError`` for a cross-origin endpoint without
+    constructor raises ``ConfigError`` for a cross-origin endpoint without
     the opt-in; ``from_metadata`` drops it to ``None`` instead (so
     ``end_session_url`` raises ``ConfigError``). The opt-in still requires the
     scheme/userinfo/fragment checks to pass. Other metadata endpoints are not
@@ -52,7 +52,8 @@ class RpClient:
     ``auth_method`` is one of ``"none"``, ``"client_secret_basic"``,
     ``"client_secret_post"`` or ``"private_key_jwt"``; it defaults to
     ``client_secret_basic`` when ``client_secret`` is given, else ``none``.
-    Inconsistent combinations raise ``ValueError``.
+    Inconsistent combinations raise :class:`ConfigError` (also a
+    ``ValueError``).
 
     ``post_logout_redirect_uris`` registers the only values
     :func:`end_session_url` will accept as ``post_logout_redirect_uri`` (exact
@@ -194,7 +195,7 @@ def verify_id_token(
     off by default:
 
     * ``leeway``: clock-skew tolerance in seconds (default 60; above 300 raises
-      ``BadRequestError``).
+      ``ConfigError``).
     * ``max_age``: needs a numeric ``auth_time`` no older than ``max_age``
       seconds (``iat`` is not used; a missing or non-numeric ``auth_time`` is
       an ``AuthnError``; leeway is not added).
@@ -202,7 +203,7 @@ def verify_id_token(
     * ``access_token`` / ``authorization_code``: check ``at_hash`` / ``c_hash``
       when present; ``require_at_hash`` / ``require_c_hash`` also reject
       tokens lacking the claim (and need the matching value, else
-      ``BadRequestError``). ``EdDSA`` tokens carrying a hash claim cannot be
+      ``ConfigError``). ``EdDSA`` tokens carrying a hash claim cannot be
       checked (``CryptoError``).
     * ``strict_hashes``: rejects (``AuthnError``) an id_token carrying
       ``at_hash`` / ``c_hash`` that cannot be checked (no matching

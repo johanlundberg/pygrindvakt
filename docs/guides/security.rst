@@ -183,8 +183,8 @@ Everything else should become a generic ``server_error``:
        tr = op.handle_token_request(form_pairs, TOKEN_URL, auth_header=auth)
    except OAuthError as e:
        return to_flask(e.to_response())
-   except GrindvaktError:
-       log.exception("token endpoint failure")             # str(e) goes to the log
+   except GrindvaktError as e:
+       log.error("token endpoint failure: %s", e.log_summary)   # log only, never the client
        return to_flask(OAuthError("server_error").to_response())
 
 The structured attributes on upstream failures need the same care.
@@ -196,8 +196,32 @@ log them verbatim and never return them to end users.
 
 On the RP side the same applies to :class:`pygrindvakt.AuthnError` raised by
 :func:`~pygrindvakt.rp.exchange_code` or
-:func:`~pygrindvakt.rp.verify_id_token`: log it, show the user a generic
-"login failed" page.
+:func:`~pygrindvakt.rp.verify_id_token`: log it
+(``e.log_summary``), show the user a generic "login failed" page. Catch
+:class:`pygrindvakt.ConfigError` first: it is a deployment fault (a bad
+``auth_method``, algorithm list or ``JwksCache`` argument), not a failed login.
+Log it and re-raise, never render it as "login failed" or as a 4xx/503, so a
+broken configuration is noticed:
+
+.. code-block:: python
+
+   try:
+       ts = rp.exchange_code(http, info, client, code, code_verifier=verifier)
+       claims = rp.verify_id_token(jwks, ts.id_token, info.issuer, client.client_id, nonce, ["ES256"])
+   except ConfigError as e:
+       log.error("RP misconfigured: %s", e.log_summary)
+       raise
+   except GrindvaktError as e:
+       log.warning("login failed: %s", e.log_summary)
+       if e.retryable:                                   # OP or network trouble
+           return render_template("login_unavailable.html"), 503
+       return render_template("login_failed.html"), 401 if e.auth_failure else 400
+
+``ConfigError`` is handled before the generic branch. There, ``retryable``
+(OP or network trouble, the same callback may be retried later) gives 503,
+``auth_failure`` gives 401 and anything else gives 400. The status is for
+monitors and clients only; the body stays generic and no error detail is sent
+to the browser.
 
 
 The redirect policy

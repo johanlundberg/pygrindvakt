@@ -12,7 +12,7 @@ class ProviderMetadata:
     live in ``extra``. Protocol-owned fields are rejected when supplied through
     ``extra``, and known OIDC extension members (``acr_values_supported``,
     ``revocation_endpoint``, ``end_session_endpoint``, ...) must have their
-    documented JSON type (``ValueError`` otherwise). Their typed properties
+    documented JSON type (``ConfigError``, also a ``ValueError``, otherwise). Their typed properties
     return ``None`` when the member is absent (not an empty list / ``False``).
     ``extra`` / ``set_extra_field`` / ``from_dict`` and the typed setters
     type-check these members, and additionally validate URL-typed ones: the
@@ -21,12 +21,12 @@ class ProviderMetadata:
     the constructor, for the endpoints built from ``base``), every extension
     ``*_endpoint`` and ``check_session_iframe``: absolute https URL (loopback
     http for a loopback issuer), no userinfo, no fragment, no control
-    characters (``ValueError`` naming the member). Assigning ``issuer``
+    characters (``ConfigError`` naming the member). Assigning ``issuer``
     re-validates all of them against the new issuer (old issuer kept on
     failure). The issuer itself must be a valid issuer URL (constructor,
-    ``from_dict`` and the ``issuer`` setter raise ``ValueError`` otherwise);
+    ``from_dict`` and the ``issuer`` setter raise ``ConfigError`` otherwise);
     a constructor ``base`` whose derived endpoints are invalid raises
-    ``ValueError`` (``base "..." yields an invalid endpoint: ...``). An
+    ``ConfigError`` (``base "..." yields an invalid endpoint: ...``). An
     empty-string ``userinfo_endpoint`` / ``registration_endpoint`` makes
     ``from_dict`` raise; ``authorization_endpoint`` query parameters are not
     checked. The host is NOT compared with the issuer here; an OP may
@@ -42,7 +42,7 @@ class ProviderMetadata:
     by ``rp.ProviderInfo`` and ``rp.end_session_url``. Documents from ``rp.discover`` are not type-checked:
     a malformed known member makes the getter return ``None`` while ``raw`` /
     ``to_dict()`` keep the original (and ``from_dict(to_dict())`` then raises
-    ``ValueError``).
+    ``ConfigError``).
     """
 
     def __init__(self, issuer: str, base: str | None = ...) -> None: ...

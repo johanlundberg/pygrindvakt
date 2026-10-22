@@ -38,7 +38,7 @@ Provider and client
    normalisation, and effective port; an explicit default port equals the
    implicit one), because :func:`end_session_url` sends ``id_token_hint`` (the
    full ID token) to that endpoint's host. A cross-origin endpoint raises
-   :class:`pygrindvakt.BadRequestError` unless
+   :class:`pygrindvakt.ConfigError` unless
    ``allow_cross_origin_end_session=True`` is passed, for OPs that legitimately
    log out on another origin; the scheme, userinfo and fragment checks still
    apply then. No other endpoint is origin-checked.
@@ -81,7 +81,7 @@ Provider and client
    ``auth_method`` is one of ``"none"``, ``"client_secret_basic"``,
    ``"client_secret_post"`` or ``"private_key_jwt"``. When omitted it
    defaults to ``client_secret_basic`` if ``client_secret`` is given, else
-   ``none``. Inconsistent combinations raise ``ValueError`` rather than
+   ``none``. Inconsistent combinations raise :class:`~pygrindvakt.ConfigError` (also a ``ValueError``) rather than
    being ignored: a secret method without ``client_secret``,
    ``private_key_jwt`` without ``signing_key``, an empty secret, or a secret
    or key that the chosen method would not use.
@@ -202,7 +202,7 @@ Starting the flow
    ``verifier`` (and ``redirect_uri`` if overridden) in the user's session.
 
    ``pkce=False`` omits PKCE and returns ``None`` as the verifier; it is
-   refused with :class:`pygrindvakt.BadRequestError` for public clients
+   refused with :class:`pygrindvakt.ConfigError` for public clients
    (``auth_method="none"``). With ``request_object_key`` a signed request
    object (see :func:`signed_request_object`) is added as the ``request``
    parameter. ``extra`` and ``redirect_uri`` behave as in
@@ -257,8 +257,9 @@ Discovery and keys
    own query. ``id_token_hint`` is sent to the first hop, the host of
    ``provider.end_session_endpoint``. Raises :class:`pygrindvakt.ConfigError`
    when the provider's endpoint was missing, unsafe, or on a different origin
-   than the issuer (so it is ``None``), and :class:`pygrindvakt.BadRequestError` for unsafe
-   or invalid input. ``state`` is echoed back to ``post_logout_redirect_uri``
+   than the issuer (so it is ``None``), or invalid, and
+   :class:`pygrindvakt.BadRequestError` for unregistered or invalid
+   caller-supplied values. ``state`` is echoed back to ``post_logout_redirect_uri``
    by the OP; generate it like the login ``state`` and verify it.
 
    .. versionadded:: 0.2.0
@@ -289,7 +290,7 @@ Discovery and keys
    response is still reused for 60 seconds, protecting the OP from a refetch
    on every request. Pass ``min_ttl=0`` to honour those directives literally
    (every use refetches). ``min_ttl`` must not exceed ``max_ttl``; negative
-   values raise ``ValueError``.
+   values raise :class:`~pygrindvakt.ConfigError` (also a ``ValueError``).
 
    .. note::
 
@@ -318,7 +319,7 @@ Discovery and keys
    (with the GIL released) and reuse its result. The GIL is released during
    the fetch. Do not call a cache from inside its own HTTP client.
 
-   ``fetch_timeout`` (seconds, finite and at least 1e-9, else ``ValueError``;
+   ``fetch_timeout`` (seconds, finite and at least 1e-9, else :class:`~pygrindvakt.ConfigError`;
    default 45, the built-in client's 30 second timeout plus margin; also a
    read-only attribute) bounds how long a thread *waits* for another thread's in-flight
    fetch, in :meth:`jwks`, :meth:`refresh` and both verification paths
@@ -412,8 +413,8 @@ Finishing the flow
    ``leeway``
       Clock-skew tolerance in seconds for ``exp`` / ``nbf`` / ``iat`` and for
       the future-``auth_time`` check; default 60. Above 300 raises
-      :class:`pygrindvakt.BadRequestError` (it is for clock drift, not for
-      reviving expired tokens); negative raises ``ValueError``. It is not
+      :class:`pygrindvakt.ConfigError` (it is for clock drift, not for
+      reviving expired tokens); negative raises :class:`~pygrindvakt.ConfigError`. It is not
       added to ``max_age``.
 
    ``max_age``
@@ -428,7 +429,7 @@ Finishing the flow
    ``acr_values``
       Allow-list: the ``acr`` claim must be a string in the list, else
       :class:`pygrindvakt.AuthnError`. An empty list is a
-      :class:`pygrindvakt.BadRequestError`.
+      :class:`pygrindvakt.ConfigError`.
 
    ``access_token``, ``require_at_hash``
       ``at_hash`` is compared with the hash of ``access_token`` (constant
@@ -436,7 +437,7 @@ Finishing the flow
       lacking ``at_hash`` is accepted, so it is **not** bound to the access
       token; set ``require_at_hash=True`` when the binding must hold (implicit
       and hybrid flows, or an OP known to emit it). ``require_at_hash`` without
-      ``access_token`` raises :class:`pygrindvakt.BadRequestError`.
+      ``access_token`` raises :class:`pygrindvakt.ConfigError`.
 
    ``authorization_code``, ``require_c_hash``
       The same for ``c_hash`` (hybrid flows need ``require_c_hash=True``).
@@ -449,7 +450,7 @@ Finishing the flow
       that cannot be checked, and ``at_hash`` / ``c_hash`` is required whenever
       ``access_token`` / ``authorization_code`` is passed (as if
       ``require_at_hash`` / ``require_c_hash`` were set; no
-      :class:`pygrindvakt.BadRequestError` when the value is absent). With
+      :class:`pygrindvakt.ConfigError` when the value is absent). With
       neither value passed and no hash claim, nothing is required. Code-flow
       callers who pass ``access_token`` but whose OP omits ``at_hash`` must
       leave ``strict_hashes`` off. An ``EdDSA`` token cannot satisfy the
@@ -545,8 +546,8 @@ Finishing the flow
      ``max_age`` seconds. Prefer ``"typed"`` or ``"dedicated_keys"``.
 
    ``typ`` is only valid with ``trust="typed"``, and ``trust="typed"``
-   requires it (``ValueError`` otherwise, as for an unknown ``trust`` or
-   ``method``).
+   requires it (:class:`~pygrindvakt.ConfigError` otherwise, as for an
+   unknown ``trust`` or ``method``).
 
    ``max_age`` (default 300 seconds) requires an ``iat`` claim and rejects a
    token older than that (plus the library's 60 second clock-skew leeway), so

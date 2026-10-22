@@ -2,12 +2,15 @@
 //!
 //! ```text
 //! GrindvaktError(Exception)            status_hint: int, code: str (class attributes;
-//!                                      `code` is overridden per instance when known)
-//! ├── BadRequestError (400)            grindvakt::Error::BadRequest
+//!                                      `code` is overridden per instance when known),
+//!                                      auth_failure, retryable: bool, log_summary
+//! ├── BadRequestError (400)            grindvakt::Error::BadRequest, and argument
+//! │                                    validation; also derives from ValueError
 //! ├── AuthnError (401)                 grindvakt::Error::Authn, and
 //! │                                    Error::UpstreamHttp from token/UserInfo
 //! ├── StateError (500)                 grindvakt::Error::State
-//! ├── ConfigError (500)                grindvakt::Error::Config
+//! ├── ConfigError (500)                grindvakt::Error::Config, and RP/metadata
+//! │                                    configuration faults; also a ValueError
 //! ├── CryptoError (500)                grindvakt::Error::Crypto
 //! ├── AttributeMappingError (500)      grindvakt::Error::Attribute
 //! ├── JoseError (500)                  grindvakt::Error::Jose
@@ -27,6 +30,11 @@
 //!     └── DpopServerError
 //! ```
 //!
+//! `BadRequestError` and `ConfigError` have two bases (`GrindvaktError`,
+//! `ValueError`), which `create_exception!` cannot express, so they are built
+//! with `type(...)` and kept in `BAD_REQUEST` / `CONFIG`; `bad_request_err`
+//! and `config_err` raise them.
+//!
 //! `OAuthError` needs data attributes *and* methods (`to_response()`,
 //! `to_redirect()`), and `#[pyclass(extends = PyException)]` is not available
 //! under the abi3 limited API below Python 3.12. It is therefore a plain Python
@@ -39,7 +47,7 @@ use std::fmt::Display;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::PyType;
+use pyo3::types::{PyDict, PyType};
 use pyo3::{create_exception, exceptions::PyException};
 
 use grindvakt::OAuthErrorCode;
@@ -53,12 +61,6 @@ create_exception!(
 );
 create_exception!(
     pygrindvakt,
-    BadRequestError,
-    GrindvaktError,
-    "The request was malformed."
-);
-create_exception!(
-    pygrindvakt,
     AuthnError,
     GrindvaktError,
     "Authentication failed somewhere in the flow."
@@ -68,12 +70,6 @@ create_exception!(
     StateError,
     GrindvaktError,
     "Flow state could not be sealed/unsealed."
-);
-create_exception!(
-    pygrindvakt,
-    ConfigError,
-    GrindvaktError,
-    "Configuration is invalid."
 );
 create_exception!(
     pygrindvakt,
@@ -155,19 +151,179 @@ create_exception!(
     "The replay store failed; the proof could not be evaluated."
 );
 
-/// Set the machine-readable `code` on a freshly built exception, overriding
-/// the class-level default.
-pub fn with_code(py: Python<'_>, e: PyErr, code: &str) -> PyErr {
-    // Setting an attribute on a plain exception instance cannot realistically
-    // fail; if it does the class-level default still applies.
-    let _ = e.value(py).setattr("code", code);
-    e
+static BAD_REQUEST: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static CONFIG: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+/// Build `name(GrindvaktError, ValueError)`. `code` and `status_hint` are set
+/// in the class dict here, so they hold on every instance whether or not
+/// `register` has run yet.
+fn build_value_error_type(
+    py: Python<'_>,
+    name: &str,
+    doc: &str,
+    status: u16,
+    code: &str,
+) -> PyResult<Py<PyType>> {
+    let dict = PyDict::new(py);
+    dict.set_item("__module__", "pygrindvakt")?;
+    dict.set_item("__doc__", doc)?;
+    dict.set_item("status_hint", status)?;
+    dict.set_item("code", code)?;
+    let bases = (
+        py.get_type::<GrindvaktError>(),
+        py.get_type::<PyValueError>(),
+    );
+    let t = py
+        .import("builtins")?
+        .getattr("type")?
+        .call1((name, bases, dict))?;
+    Ok(t.cast_into::<PyType>().map_err(PyErr::from)?.unbind())
 }
 
-fn set_opt<T: for<'py> IntoPyObject<'py>>(py: Python<'_>, e: &PyErr, name: &str, v: Option<T>) {
-    if let Some(v) = v {
-        let _ = e.value(py).setattr(name, v);
+fn bad_request_type<'py>(py: Python<'py>) -> PyResult<&'py Bound<'py, PyType>> {
+    BAD_REQUEST
+        .get_or_try_init(py, || {
+            build_value_error_type(
+                py,
+                "BadRequestError",
+                "The request was malformed.",
+                400,
+                "bad_request",
+            )
+        })
+        .map(|t| t.bind(py))
+}
+
+fn config_type<'py>(py: Python<'py>) -> PyResult<&'py Bound<'py, PyType>> {
+    CONFIG
+        .get_or_try_init(py, || {
+            build_value_error_type(
+                py,
+                "ConfigError",
+                "Configuration is invalid.",
+                500,
+                "config",
+            )
+        })
+        .map(|t| t.bind(py))
+}
+
+fn raise_value_error_type(
+    get: for<'py> fn(Python<'py>) -> PyResult<&'py Bound<'py, PyType>>,
+    msg: String,
+) -> PyErr {
+    // `register` forces both types at import, so a failure to *build* one
+    // fails the import loudly. The fallback below is only reachable when
+    // instantiating an already-built type fails (e.g. out of memory); the
+    // failure is chained as `__cause__` so it is not silent.
+    Python::attach(|py| match get(py).and_then(|t| t.call1((msg.as_str(),))) {
+        Ok(exc) => PyErr::from_value(exc),
+        Err(cause) => {
+            let fallback = PyValueError::new_err(msg);
+            fallback.set_cause(py, Some(cause));
+            fallback
+        }
+    })
+}
+
+/// Build a `BadRequestError` (also a `ValueError`) with a message. If the
+/// type cannot be built, fall back to a plain `ValueError` with the same
+/// message so the validation text is never hidden.
+pub fn bad_request_err(msg: impl Into<String>) -> PyErr {
+    raise_value_error_type(bad_request_type, msg.into())
+}
+
+/// Build a `ConfigError` (also a `ValueError`, status_hint 500) with a
+/// message. Same fallback as `bad_request_err`.
+pub fn config_err(msg: impl Into<String>) -> PyErr {
+    raise_value_error_type(config_type, msg.into())
+}
+
+/// Like `err`, but a `BadRequest` becomes a `ConfigError`: for validators
+/// that run on integrator-supplied configuration, not on request input.
+pub fn config_from(e: RsError) -> PyErr {
+    match e {
+        RsError::BadRequest(m) => config_err(m),
+        other => err(other),
     }
+}
+
+/// Codes of failures worth retrying (transient by nature).
+///
+/// `discovery_backoff` is not raised by the binding yet; it is listed so the
+/// discovery back-off error (G1) is retryable from the day it appears.
+const RETRYABLE_CODES: [&str; 3] = ["transport", "jwks_fetch_timeout", "discovery_backoff"];
+
+/// Single source of truth for `retryable`. The status rule (upstream 5xx or
+/// 429) is not spoofable and applies to any upstream failure. The code rule
+/// applies ONLY to codes the binding itself sets (`with_code`); a `code`
+/// adopted from upstream OAuth text in `err()` must never reach it.
+fn is_retryable(binding_code: Option<&str>, upstream_status: Option<u16>) -> bool {
+    binding_code.is_some_and(|c| RETRYABLE_CODES.contains(&c))
+        || upstream_status.is_some_and(|st| st >= 500 || st == 429)
+}
+
+/// Best-effort setter for the per-instance attributes of a typed error.
+///
+/// Invariant: the typed exception is never replaced. Every attribute is
+/// attempted independently, so one failure cannot leave later ones unset. A
+/// failure is recorded and `finish` attaches a note (via `add_note`, Python
+/// 3.11+, ignored where missing) describing it. Whatever could not be set
+/// degrades to the class-level default, which is safe by default
+/// (`auth_failure` False, `retryable` False): a failed override for a 503
+/// therefore reads as `retryable` False. Setting an attribute on a plain
+/// exception instance cannot realistically fail; this is defence in depth.
+struct Attrs<'a, 'py> {
+    py: Python<'py>,
+    exc: &'a PyErr,
+    failed: Vec<String>,
+}
+
+impl<'a, 'py> Attrs<'a, 'py> {
+    fn new(py: Python<'py>, exc: &'a PyErr) -> Self {
+        Self {
+            py,
+            exc,
+            failed: Vec::new(),
+        }
+    }
+
+    fn set<T: IntoPyObject<'py>>(&mut self, name: &str, v: T) {
+        if let Err(err) = self.exc.value(self.py).setattr(name, v) {
+            self.failed.push(format!("{name}: {err}"));
+        }
+    }
+
+    fn set_opt<T: IntoPyObject<'py>>(&mut self, name: &str, v: Option<T>) {
+        if let Some(v) = v {
+            self.set(name, v);
+        }
+    }
+
+    fn finish(self) {
+        if self.failed.is_empty() {
+            return;
+        }
+        let note = format!(
+            "pygrindvakt: could not set error attribute(s), class defaults apply: {}",
+            self.failed.join("; ")
+        );
+        // `add_note` exists on 3.11+ only; any failure here is ignored.
+        let _ = self.exc.value(self.py).call_method1("add_note", (note,));
+    }
+}
+
+/// Set the machine-readable `code` on a freshly built exception, overriding
+/// the class-level default. Transient codes also set `retryable`. Always
+/// returns `e` itself (see `Attrs`).
+pub fn with_code(py: Python<'_>, e: PyErr, code: &str) -> PyErr {
+    let mut attrs = Attrs::new(py, &e);
+    attrs.set("code", code);
+    if is_retryable(Some(code), None) {
+        attrs.set("retryable", true);
+    }
+    attrs.finish();
+    e
 }
 
 /// Map a `grindvakt::Error` onto the typed exception hierarchy.
@@ -194,26 +350,29 @@ pub fn err(e: RsError) -> PyErr {
                 (_, false) => Some("upstream_http".to_string()),
                 (None, true) => None,
             };
-            set_opt(py, &exc, "code", code);
-            set_opt(py, &exc, "upstream_status", u.status);
-            set_opt(py, &exc, "upstream_error", u.error.clone());
-            set_opt(
-                py,
-                &exc,
-                "upstream_error_description",
-                u.error_description.clone(),
-            );
-            set_opt(py, &exc, "upstream_body", u.body.clone());
+            // `code` may be upstream-controlled text: derive retryable from status only.
+            let retry = is_retryable(None, u.status);
+            let mut attrs = Attrs::new(py, &exc);
+            attrs.set_opt("code", code);
+            attrs.set("auth_failure", auth);
+            if retry {
+                attrs.set("retryable", true);
+            }
+            attrs.set_opt("upstream_status", u.status);
+            attrs.set_opt("upstream_error", u.error.clone());
+            attrs.set_opt("upstream_error_description", u.error_description.clone());
+            attrs.set_opt("upstream_body", u.body.clone());
+            attrs.finish();
             exc
         });
     }
     match e {
         RsError::NoBoundEndpoint(_) => NoBoundEndpointError::new_err(msg),
         RsError::UnknownModule(_) => UnknownModuleError::new_err(msg),
-        RsError::BadRequest(_) => BadRequestError::new_err(msg),
+        RsError::BadRequest(_) => bad_request_err(msg),
         RsError::Authn(_) => AuthnError::new_err(msg),
         RsError::State(_) => StateError::new_err(msg),
-        RsError::Config(_) => ConfigError::new_err(msg),
+        RsError::Config(_) => config_err(msg),
         RsError::Crypto(_) => CryptoError::new_err(msg),
         RsError::Attribute(_) => AttributeMappingError::new_err(msg),
         RsError::Jose(_) => JoseError::new_err(msg),
@@ -236,9 +395,6 @@ pub fn dpop_err(e: RsDpopError) -> PyErr {
 }
 
 /// Generic helpers for errors that only carry a message.
-pub fn config_err<E: Display>(e: E) -> PyErr {
-    ConfigError::new_err(e.to_string())
-}
 pub fn crypto_err<E: Display>(e: E) -> PyErr {
     CryptoError::new_err(e.to_string())
 }
@@ -360,6 +516,121 @@ fn oauth_error_http_status(code: &str) -> PyResult<u16> {
     Ok(parse_oauth_code(code)?.http_status())
 }
 
+/// Private helper behind `OAuthError.__str__`.
+#[pyfunction]
+#[pyo3(name = "escape_untrusted_text")]
+fn escape_untrusted_text_py(s: &str, max_chars: usize) -> String {
+    escape_untrusted_text(s, max_chars)
+}
+
+const LOG_CODE_MAX: usize = 64;
+const LOG_MSG_MAX: usize = 512;
+
+// TODO(core): make grindvakt::error::is_invisible_format pub and delete this copy
+/// Whether `c` is a bidirectional control, line/paragraph separator or other
+/// invisible formatting character. Verbatim copy of grindvakt's
+/// `error::is_invisible_format` (pub(crate) there).
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        // Bidirectional controls and Unicode line/paragraph separators.
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            // Zero-width and other invisible format characters (general
+            // category Cf and Default_Ignorable_Code_Point): soft hyphen,
+            // number-sign prefixes, Mongolian vowel separator, zero-width
+            // space/joiners, word joiner and invisible operators, deprecated
+            // formatting, BOM, interlinear annotation, and similar.
+            | '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}'
+            | '\u{2065}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+            // Invisible fillers and variation selectors.
+            | '\u{034F}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
+            | '\u{3164}' | '\u{FFA0}' | '\u{FE00}'..='\u{FE0F}'
+            // Tag characters (invisible, able to carry hidden data), the
+            // variation selectors supplement and the unassigned
+            // default-ignorable code points around them.
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Escape untrusted text for logs and `str()`: control characters, anything
+/// matching `is_invisible_format`, and backslash become `\n`, `\r`, `\t`,
+/// `\\` or `\u{XXXX}`; the result is capped at `max` characters, ending with
+/// `...` when cut. An escape sequence is never split. Shared by
+/// `log_summary`, `OAuthError.__str__` and (future) `error_description_safe`.
+pub(crate) fn escape_untrusted_text(s: &str, max: usize) -> String {
+    escape_untrusted(s, max, false)
+}
+
+/// Like `escape_untrusted_text`, but a single quote also becomes `\'` before
+/// the cap is applied, so a value rendered inside single quotes stays within
+/// `max` characters.
+fn escape_untrusted_quoted(s: &str, max: usize) -> String {
+    escape_untrusted(s, max, true)
+}
+
+fn escape_untrusted(s: &str, max: usize, escape_quote: bool) -> String {
+    let mut out = String::new();
+    let mut len = 0usize;
+    // Length at which the cut happens, leaving room for the marker.
+    let mut cut: Option<usize> = None;
+    for c in s.chars() {
+        let piece = match c {
+            '\\' => "\\\\".to_string(),
+            '\'' if escape_quote => "\\'".to_string(),
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            c if c.is_control() || is_invisible_format(c) => {
+                format!("\\u{{{:04x}}}", c as u32)
+            }
+            c => c.to_string(),
+        };
+        let n = piece.chars().count();
+        if cut.is_none() && len + n > max.saturating_sub(3) {
+            cut = Some(out.len());
+        }
+        if len + n > max {
+            out.truncate(cut.unwrap_or(out.len()));
+            out.push_str("...");
+            return out;
+        }
+        out.push_str(&piece);
+        len += n;
+    }
+    out
+}
+
+/// Getter behind `GrindvaktError.log_summary`. Never raises: a missing or
+/// non-string `code`, or a missing `status_hint`, falls back to `None`.
+#[pyfunction]
+fn log_summary(slf: &Bound<'_, PyAny>) -> String {
+    let class = slf
+        .get_type()
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "GrindvaktError".to_string());
+    let class = escape_untrusted_text(&class, LOG_CODE_MAX);
+    let code = match slf.getattr("code").and_then(|c| c.extract::<String>()) {
+        Ok(c) => format!("'{}'", escape_untrusted_quoted(&c, LOG_CODE_MAX)),
+        Err(_) => "None".to_string(),
+    };
+    let hint = match slf.getattr("status_hint").and_then(|h| h.extract::<i64>()) {
+        Ok(h) => h.to_string(),
+        Err(_) => "None".to_string(),
+    };
+    let msg = slf
+        .str()
+        .map(|m| m.to_string())
+        .map(|m| escape_untrusted_text(&m, LOG_MSG_MAX))
+        .unwrap_or_default();
+    format!("{class}(code={code}, status_hint={hint}): {msg}")
+}
+
 /// Register exception types (and the OAuthError helpers) on the top-level module.
 pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     macro_rules! add {
@@ -371,10 +642,11 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         }};
     }
     add!(GrindvaktError, 500u16, "internal");
-    add!(BadRequestError, 400u16, "bad_request");
+    m.add("BadRequestError", bad_request_type(py)?)?;
     add!(AuthnError, 401u16, "authn");
+    py.get_type::<AuthnError>().setattr("auth_failure", true)?;
     add!(StateError, 500u16, "state");
-    add!(ConfigError, 500u16, "config");
+    m.add("ConfigError", config_type(py)?)?;
     add!(CryptoError, 500u16, "crypto");
     add!(AttributeMappingError, 500u16, "attribute");
     add!(JoseError, 500u16, "jose");
@@ -400,9 +672,18 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     ] {
         base.setattr(name, py.None())?;
     }
+    base.setattr("auth_failure", false)?;
+    base.setattr("retryable", false)?;
+    let getter = wrap_pyfunction!(log_summary, m)?;
+    let prop = py
+        .import("builtins")?
+        .getattr("property")?
+        .call1((getter,))?;
+    base.setattr("log_summary", prop)?;
 
     m.add_function(wrap_pyfunction!(oauth_error_response, m)?)?;
     m.add_function(wrap_pyfunction!(oauth_error_redirect, m)?)?;
     m.add_function(wrap_pyfunction!(oauth_error_http_status, m)?)?;
+    m.add_function(wrap_pyfunction!(escape_untrusted_text_py, m)?)?;
     Ok(())
 }

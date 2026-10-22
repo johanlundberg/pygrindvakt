@@ -234,6 +234,38 @@ def use_errors() -> None:
         description: str | None = e.upstream_error_description
         body: str | None = e.upstream_body
         cause: BaseException | None = e.__cause__
+        auth_failure: bool = e.auth_failure
+        retryable: bool = e.retryable
+        summary: str = e.log_summary
         del code, status, upstream_error, description, body, cause
+        del auth_failure, retryable, summary
     except (AuthnError, InternalError, OAuthError) as e:
         print(e.code)
+
+
+def use_bad_request() -> None:
+    try:
+        rp.RpClient("c", "https://x/cb", auth_method="x")
+    # BadRequestError is also a ValueError: its clause must come first or the
+    # ValueError clause shadows it.
+    except pygrindvakt.BadRequestError as bre:
+        as_value_error: ValueError = bre
+        as_base: GrindvaktError = bre
+        del as_value_error, as_base
+    except ValueError as ve:
+        other: ValueError = ve
+        del other
+
+
+def use_config_error() -> None:
+    try:
+        rp.RpClient("c", "https://x/cb", auth_method="x")
+    except pygrindvakt.ConfigError as ce:
+        as_value_error: ValueError = ce
+        as_base: GrindvaktError = ce
+        hint: int = ce.status_hint
+        summary: str = ce.log_summary
+        del as_value_error, as_base, hint, summary
+        raise
+    except GrindvaktError as ge:
+        print(ge.log_summary)

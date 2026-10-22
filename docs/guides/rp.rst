@@ -49,7 +49,8 @@ An :class:`~pygrindvakt.rp.RpClient` carries the ``client_id``, the
 ``redirect_uri`` registered at the OP, the requested ``scope`` and how the
 client authenticates at the token endpoint. The method defaults to
 ``client_secret_basic`` when a secret is given and ``none`` otherwise;
-inconsistent combinations raise ``ValueError`` rather than being ignored.
+inconsistent combinations raise :class:`~pygrindvakt.ConfigError` (also a
+``ValueError``) rather than being ignored.
 
 .. code-block:: python
 
@@ -151,7 +152,7 @@ process-wide :class:`~pygrindvakt.rp.JwksCache`.
 
 .. code-block:: python
 
-   from pygrindvakt import AuthnError, GrindvaktError
+   from pygrindvakt import AuthnError, ConfigError, GrindvaktError
 
    # Created once at startup, next to `info`; thread-safe, shared by all requests.
    jwks_cache = rp.JwksCache(http_client, info.jwks_uri, info.issuer)
@@ -170,11 +171,23 @@ process-wide :class:`~pygrindvakt.rp.JwksCache`.
                jwks_cache, ts.id_token, info.issuer, me.client_id,
                pending["nonce"], ["ES256"],
            )
-       except GrindvaktError:
-           log.exception("login failed")                     # str(e) is for logs only
-           return render_template("login_failed.html")
+       except ConfigError as e:
+           log.error("RP misconfigured: %s", e.log_summary)  # deployment fault: log, alert, 500
+           raise
+       except GrindvaktError as e:
+           log.warning("login failed: %s", e.log_summary)    # log_summary is for logs only
+           if e.retryable:                                   # OP or network trouble
+               return render_template("login_unavailable.html"), 503
+           return render_template("login_failed.html"), 401 if e.auth_failure else 400
        session["user"] = {"sub": claims["sub"], "email": claims.get("email")}
        return redirect("/")
+
+:class:`~pygrindvakt.ConfigError` is handled before the generic branch, so a
+broken deployment never looks like a failed login. In the generic branch the
+status comes from the exception attributes: ``retryable`` (OP or network
+trouble, the same callback may be retried later) gives 503, ``auth_failure``
+gives 401, anything else gives 400. The status is for monitors and clients
+only; the page body is generic and error details never reach the browser.
 
 :func:`~pygrindvakt.rp.verify_id_token` checks the signature against the
 JWKS, the explicit signing-algorithm allowlist, ``iss``, ``sub``, every
@@ -240,7 +253,7 @@ return them (a ``(status, body, content_type, headers)`` tuple or
 
 ``rp.verify_id_token(jwks_cache, id_token, issuer, ...)`` is equivalent, but
 ``issuer`` must equal the cache's own issuer: a mismatch raises
-:class:`pygrindvakt.BadRequestError` before any fetch, so one provider's keys
+:class:`pygrindvakt.ConfigError` before any fetch, so one provider's keys
 can never vouch for another provider's ``iss``. The cache is accepted as ``jwks=`` by :func:`~pygrindvakt.rp.fetch_userinfo`
 for signed UserInfo responses. Extra checks are keyword options on both:
 ``max_age`` (against ``auth_time``), ``acr_values``, ``access_token`` /
@@ -470,7 +483,7 @@ host the attacker chose. A provider without an ``end_session_endpoint`` makes ``
 host of the ``end_session_endpoint``. Therefore ``ProviderInfo`` requires that
 endpoint to have the same origin as the issuer (scheme, host, effective port),
 besides the https / no-credentials / no-fragment checks. ``ProviderInfo(...)``
-raises ``BadRequestError`` for a cross-origin endpoint, and
+raises ``ConfigError`` for a cross-origin endpoint, and
 ``ProviderInfo.from_metadata`` drops it, so ``info.end_session_endpoint`` is
 ``None`` and ``end_session_url`` raises ``ConfigError`` (the advertised endpoint
 was missing, unsafe, or on a different origin than the issuer). If the OP

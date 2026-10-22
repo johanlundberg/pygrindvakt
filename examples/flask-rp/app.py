@@ -18,7 +18,7 @@ import os
 
 import flask
 from flask import Flask, abort, session
-from pygrindvakt import GrindvaktError, rp
+from pygrindvakt import ConfigError, GrindvaktError, rp
 from pygrindvakt.http import ReqwestClient
 
 OP_ISSUER = os.environ.get("OP_ISSUER", "http://127.0.0.1:5000")
@@ -87,10 +87,18 @@ def create_app() -> Flask:
                 id_claims["sub"],
                 prov.issuer,
             )
+        except ConfigError as e:
+            # A deployment fault, not a failed login: log it and let it surface
+            # as a 500 instead of a user-visible 4xx/503.
+            app.logger.error("RP misconfigured: %s", e.log_summary)
+            raise
         except GrindvaktError as e:
-            # Error details stay in the server log; never echo str(e) to the browser.
-            app.logger.warning("login failed: %s", e)
-            return "<p>Login failed; please try again.", 502
+            # Error details stay in the server log; never echo them to the browser.
+            # The status is for monitors and clients only.
+            app.logger.warning("login failed: %s", e.log_summary)
+            if e.retryable:  # OP or network trouble
+                return "<p>The sign-in service is unavailable; please try again shortly.", 503
+            return "<p>Login failed; please start again.", 401 if e.auth_failure else 400
         return (
             f"<h1>Signed in as {html.escape(id_claims['sub'])}</h1>"
             f"<h2>id_token claims</h2><pre>{html.escape(json.dumps(id_claims, indent=2))}</pre>"

@@ -29,7 +29,9 @@ use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
 use crate::convert::{from_py, new_submodule, to_py, warn};
-use crate::errors::{err, with_code, AuthnError, ConfigError, InternalError, UnknownKeyError};
+use crate::errors::{
+    config_err, config_from, err, with_code, AuthnError, InternalError, UnknownKeyError,
+};
 use crate::http::extract_http_client;
 use crate::jwt::jwks_from_py;
 use crate::keys::SigningKey;
@@ -113,12 +115,12 @@ fn validate_end_session_endpoint(
     allow_cross_origin: bool,
 ) -> PyResult<()> {
     check_end_session_endpoint(endpoint, issuer, allow_cross_origin).map_err(|r| match r {
-        EndSessionReject::Unsafe(e) => err(e),
-        EndSessionReject::CrossOrigin => err(RsError::BadRequest(format!(
+        EndSessionReject::Unsafe(e) => config_from(e),
+        EndSessionReject::CrossOrigin => config_err(format!(
             "end_session_endpoint {endpoint:?} is on a different origin than the issuer \
              {issuer:?}; id_token_hint would be sent to that host. Pass \
              allow_cross_origin_end_session=True only if the OP legitimately logs out there"
-        ))),
+        )),
     })
 }
 
@@ -142,7 +144,7 @@ impl ProviderInfo {
             userinfo_endpoint,
             jwks_uri,
         };
-        inner.validate().map_err(err)?;
+        inner.validate().map_err(config_from)?;
         if let Some(e) = &end_session_endpoint {
             validate_end_session_endpoint(e, &inner.issuer, allow_cross_origin_end_session)?;
         }
@@ -166,7 +168,7 @@ impl ProviderInfo {
         allow_cross_origin_end_session: bool,
     ) -> PyResult<Self> {
         let inner = grp::ProviderInfo::from(metadata.inner.clone());
-        inner.validate().map_err(err)?;
+        inner.validate().map_err(config_from)?;
         let end_session_endpoint = metadata
             .inner
             .extra
@@ -276,7 +278,7 @@ fn resolve_client_auth(
     signing_key: Option<SigningKey>,
 ) -> PyResult<ClientAuth> {
     if matches!(client_secret.as_deref(), Some("")) {
-        return Err(PyValueError::new_err("client_secret must not be empty"));
+        return Err(config_err("client_secret must not be empty"));
     }
     let method = match auth_method {
         Some(m) => m,
@@ -286,7 +288,7 @@ fn resolve_client_auth(
     let auth = match method {
         "none" => {
             if client_secret.is_some() {
-                return Err(PyValueError::new_err(
+                return Err(config_err(
                     "auth_method='none' does not take a client_secret",
                 ));
             }
@@ -294,7 +296,7 @@ fn resolve_client_auth(
         }
         "client_secret_basic" | "client_secret_post" => {
             let secret = client_secret.ok_or_else(|| {
-                PyValueError::new_err(format!("auth_method={method:?} requires client_secret"))
+                config_err(format!("auth_method={method:?} requires client_secret"))
             })?;
             if method == "client_secret_basic" {
                 ClientAuth::ClientSecretBasic(secret)
@@ -304,24 +306,24 @@ fn resolve_client_auth(
         }
         "private_key_jwt" => {
             if client_secret.is_some() {
-                return Err(PyValueError::new_err(
+                return Err(config_err(
                     "auth_method='private_key_jwt' does not take a client_secret",
                 ));
             }
-            let key = signing_key.clone().ok_or_else(|| {
-                PyValueError::new_err("auth_method='private_key_jwt' requires signing_key")
-            })?;
+            let key = signing_key
+                .clone()
+                .ok_or_else(|| config_err("auth_method='private_key_jwt' requires signing_key"))?;
             ClientAuth::PrivateKeyJwt(key.inner)
         }
         other => {
-            return Err(PyValueError::new_err(format!(
+            return Err(config_err(format!(
                 "unknown auth_method {other:?}; expected one of \
                  'none', 'client_secret_basic', 'client_secret_post', 'private_key_jwt'"
             )))
         }
     };
     if signing_key.is_some() && !matches!(auth, ClientAuth::PrivateKeyJwt(_)) {
-        return Err(PyValueError::new_err(format!(
+        return Err(config_err(format!(
             "signing_key is only used with auth_method='private_key_jwt' (resolved method: {:?})",
             auth_method_name(&auth)
         )));
@@ -337,7 +339,7 @@ fn resolve_client_auth(
 /// `client_secret_basic` if `client_secret` is given, else `none`.
 /// Inconsistent combinations (a secret method without `client_secret`,
 /// `private_key_jwt` without `signing_key`, a secret or key that the chosen
-/// method would ignore) raise `ValueError`.
+/// method would ignore) raise `ConfigError` (also a `ValueError`).
 ///
 /// SECURITY: `client_secret` is a credential. Load it from a secret store or
 /// environment variable rather than embedding it in source, and note that it
@@ -407,12 +409,12 @@ impl RpClient {
     ) -> PyResult<Self> {
         let redirect_uris = redirect_uris.unwrap_or_default();
         for uri in &redirect_uris {
-            grp::validate_redirect_uri_syntax(uri).map_err(err)?;
-            check_redirect_uri_transport(uri).map_err(err)?;
+            grp::validate_redirect_uri_syntax(uri).map_err(config_from)?;
+            check_redirect_uri_transport(uri).map_err(config_from)?;
         }
         let post_logout_redirect_uris = post_logout_redirect_uris.unwrap_or_default();
         for uri in &post_logout_redirect_uris {
-            grp::validate_redirect_uri_syntax(uri).map_err(err)?;
+            grp::validate_redirect_uri_syntax(uri).map_err(config_from)?;
         }
         let auth = resolve_client_auth(auth_method, client_secret, signing_key)?;
         Ok(Self {
@@ -656,7 +658,7 @@ fn signed_request_object(
 /// `redirect_uri`, if overridden) in the user's session.
 ///
 /// Public clients (`auth_method="none"`) cannot disable PKCE: `pkce=False`
-/// raises `BadRequestError`. When `request_object_key` is given, a signed
+/// raises `ConfigError`. When `request_object_key` is given, a signed
 /// request object (RFC 9101) is added as `extra["request"]`.
 #[pyfunction]
 #[pyo3(signature = (provider, client, *, extra = None, redirect_uri = None, pkce = true, request_object_key = None))]
@@ -672,9 +674,7 @@ fn begin(
     // Refuse before generating anything: a public client must not run the
     // code flow without PKCE (upstream also enforces this; do not depend on it).
     if !pkce && matches!(client.auth, ClientAuth::None) {
-        return Err(err(RsError::BadRequest(
-            "public clients must use S256 PKCE".into(),
-        )));
+        return Err(config_err("public clients must use S256 PKCE"));
     }
     let mut extra = extra_params(extra)?;
     let state = grindvakt::util::random_token(32);
@@ -827,7 +827,8 @@ fn non_empty(name: &str, v: Option<&str>) -> PyResult<()> {
 /// without a fragment and registered with the OP.
 /// `extra` (dict or list of pairs) may not contain the parameters controlled
 /// by this function. Raises `ConfigError` if the provider has no
-/// `end_session_endpoint`, `BadRequestError` for unsafe or invalid input.
+/// `end_session_endpoint` or it is unsafe, `BadRequestError` for invalid or
+/// unregistered caller-supplied values.
 #[pyfunction]
 #[pyo3(signature = (provider, *, id_token_hint = None, client = None, post_logout_redirect_uri = None, state = None, logout_hint = None, ui_locales = None, extra = None))]
 #[allow(clippy::too_many_arguments)]
@@ -851,18 +852,15 @@ fn end_session_url(
     // Origin binding was decided when the ProviderInfo was built (it may have
     // opted in); re-check only the shared safety rules here.
     validate_end_session_endpoint(endpoint, &provider.inner.issuer, true)?;
-    let mut url = url::Url::parse(endpoint).map_err(|e| {
-        err(RsError::BadRequest(format!(
-            "invalid end_session_endpoint: {e}"
-        )))
-    })?;
+    let mut url = url::Url::parse(endpoint)
+        .map_err(|e| config_err(format!("invalid end_session_endpoint: {e}")))?;
     if url
         .query_pairs()
         .any(|(k, _)| END_SESSION_RESERVED.contains(&k.as_ref()))
     {
-        return Err(err(RsError::BadRequest(
-            "end_session_endpoint query contains a library-controlled parameter".into(),
-        )));
+        return Err(config_err(
+            "end_session_endpoint query contains a library-controlled parameter",
+        ));
     }
     for (name, v) in [
         ("id_token_hint", id_token_hint),
@@ -981,17 +979,15 @@ fn exchange_code(
 
 /// Convert a Python int option to an unsigned seconds value.
 fn seconds(name: &str, v: Option<i64>) -> PyResult<Option<u64>> {
-    v.map(|v| {
-        u64::try_from(v).map_err(|_| PyValueError::new_err(format!("{name} must not be negative")))
-    })
-    .transpose()
+    v.map(|v| u64::try_from(v).map_err(|_| config_err(format!("{name} must not be negative"))))
+        .transpose()
 }
 
 fn parse_algorithms(algs: &[String]) -> PyResult<Vec<JwsAlgorithm>> {
     algs.iter()
         .map(|alg| {
             JwsAlgorithm::from_str(alg)
-                .map_err(|e| PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}")))
+                .map_err(|e| config_err(format!("invalid JWS algorithm {alg:?}: {e}")))
         })
         .collect()
 }
@@ -1063,14 +1059,14 @@ impl IdTokenPolicy {
         // Fail on configuration errors before any key-set fetch; upstream
         // repeats these checks.
         if policy.require_at_hash && policy.access_token.is_none() {
-            return Err(err(RsError::BadRequest(
-                "require_at_hash needs an access_token to check against".into(),
-            )));
+            return Err(config_err(
+                "require_at_hash needs an access_token to check against",
+            ));
         }
         if policy.require_c_hash && policy.authorization_code.is_none() {
-            return Err(err(RsError::BadRequest(
-                "require_c_hash needs an authorization_code to check against".into(),
-            )));
+            return Err(config_err(
+                "require_c_hash needs an authorization_code to check against",
+            ));
         }
         // `strict_hashes` requires the claim whenever the value to bind it to
         // is in hand (blocks token substitution by omission). Applied after
@@ -1078,15 +1074,13 @@ impl IdTokenPolicy {
         policy.require_at_hash |= policy.strict_hashes && policy.access_token.is_some();
         policy.require_c_hash |= policy.strict_hashes && policy.authorization_code.is_some();
         if policy.leeway.is_some_and(|l| l > grp::MAX_ID_TOKEN_LEEWAY) {
-            return Err(err(RsError::BadRequest(format!(
+            return Err(config_err(format!(
                 "id_token leeway must be at most {} seconds",
                 grp::MAX_ID_TOKEN_LEEWAY
-            ))));
+            )));
         }
         if policy.acr_values.as_ref().is_some_and(Vec::is_empty) {
-            return Err(err(RsError::BadRequest(
-                "acr_values must not be empty when set".into(),
-            )));
+            return Err(config_err("acr_values must not be empty when set"));
         }
         Ok(policy)
     }
@@ -1171,7 +1165,7 @@ impl IdTokenPolicy {
 /// Optional extra checks (keyword-only, all off by default):
 ///
 /// * `leeway`: clock-skew tolerance in seconds for `exp` / `nbf` / `iat` and
-///   the future-`auth_time` check (default 60; above 300 is `BadRequestError`).
+///   the future-`auth_time` check (default 60; above 300 is `ConfigError`).
 /// * `max_age`: requires a numeric `auth_time` claim no older than `max_age`
 ///   seconds (`iat` is not used; a missing or non-numeric `auth_time` is an
 ///   `AuthnError`; leeway is not added).
@@ -1179,7 +1173,7 @@ impl IdTokenPolicy {
 /// * `access_token` / `authorization_code`: validate `at_hash` / `c_hash`
 ///   when the id_token carries one. `require_at_hash` / `require_c_hash`
 ///   additionally reject tokens without the claim (they need the matching
-///   value, else `BadRequestError`). An `EdDSA` token carrying a hash claim
+///   value, else `ConfigError`). An `EdDSA` token carrying a hash claim
 ///   cannot be checked (`CryptoError`).
 /// * `strict_hashes`: reject (`AuthnError`) an id_token carrying `at_hash` /
 ///   `c_hash` that cannot be checked (no matching `access_token` /
@@ -1263,9 +1257,9 @@ impl<'py> JwksSource<'py> {
     /// before any network request.
     fn check_issuer(&self, issuer: &str) -> PyResult<()> {
         match self {
-            Self::Cache(cache) if cache.get().issuer != issuer => Err(err(RsError::BadRequest(
-                "JwksCache issuer does not match the issuer argument".into(),
-            ))),
+            Self::Cache(cache) if cache.get().issuer != issuer => Err(config_err(
+                "JwksCache issuer does not match the issuer argument",
+            )),
             _ => Ok(()),
         }
     }
@@ -1610,8 +1604,9 @@ impl JwksCache {
     ) -> PyResult<Self> {
         // Validate the client and the URLs now rather than on first use.
         extract_http_client(http)?;
-        grp::validate_issuer(&issuer).map_err(err)?;
-        grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer).map_err(err)?;
+        grp::validate_issuer(&issuer).map_err(config_from)?;
+        grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer)
+            .map_err(config_from)?;
         let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
         let (default_ttl, min_ttl, max_ttl) = (
             get("default_ttl", default_ttl)?,
@@ -1619,10 +1614,10 @@ impl JwksCache {
             get("max_ttl", max_ttl)?,
         );
         if min_ttl > max_ttl {
-            return Err(PyValueError::new_err("min_ttl must not exceed max_ttl"));
+            return Err(config_err("min_ttl must not exceed max_ttl"));
         }
         if !(fetch_timeout.is_finite() && fetch_timeout > 0.0) {
-            return Err(PyValueError::new_err(
+            return Err(config_err(
                 "fetch_timeout must be a finite number of seconds, at least 1e-9",
             ));
         }
@@ -1630,7 +1625,7 @@ impl JwksCache {
         let fetch_timeout = std::time::Duration::try_from_secs_f64(fetch_timeout)
             .unwrap_or(std::time::Duration::MAX);
         if fetch_timeout.is_zero() {
-            return Err(PyValueError::new_err(
+            return Err(config_err(
                 "fetch_timeout must be a finite number of seconds, at least 1e-9",
             ));
         }
@@ -1789,7 +1784,7 @@ fn fetch_userinfo<'py>(
         "POST" => grp::UserinfoMethod::Post,
         "GET" => grp::UserinfoMethod::Get,
         other => {
-            return Err(PyValueError::new_err(format!(
+            return Err(config_err(format!(
                 "method must be \"POST\" or \"GET\", got {other:?}"
             )))
         }
@@ -1797,18 +1792,16 @@ fn fetch_userinfo<'py>(
     if let Some(other) =
         trust.filter(|t| !matches!(*t, "typed" | "dedicated_keys" | "untyped_shared_key_compat"))
     {
-        return Err(PyValueError::new_err(format!(
+        return Err(config_err(format!(
             "trust must be \"typed\", \"dedicated_keys\" or \"untyped_shared_key_compat\", \
              got {other:?}"
         )));
     }
     if trust == Some("typed") && typ.is_none() {
-        return Err(PyValueError::new_err("trust=\"typed\" requires typ"));
+        return Err(config_err("trust=\"typed\" requires typ"));
     }
     if typ.is_some() && trust != Some("typed") {
-        return Err(PyValueError::new_err(
-            "typ is only used with trust=\"typed\"",
-        ));
+        return Err(config_err("typ is only used with trust=\"typed\""));
     }
     let jwks = jwks.map(JwksSource::from_py).transpose()?;
     if let Some(jwks) = &jwks {
@@ -1818,15 +1811,14 @@ fn fetch_userinfo<'py>(
         .map(|algs| {
             algs.iter()
                 .map(|alg| {
-                    JwsAlgorithm::from_str(alg).map_err(|e| {
-                        PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}"))
-                    })
+                    JwsAlgorithm::from_str(alg)
+                        .map_err(|e| config_err(format!("invalid JWS algorithm {alg:?}: {e}")))
                 })
                 .collect::<PyResult<Vec<_>>>()
         })
         .transpose()?;
     let Some(userinfo_endpoint) = userinfo_endpoint else {
-        return Err(ConfigError::new_err(
+        return Err(config_err(
             "provider does not advertise a userinfo_endpoint",
         ));
     };

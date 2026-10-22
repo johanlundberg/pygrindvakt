@@ -175,6 +175,8 @@ repository rather than in this manual:
   fail-closed hardening added at the binding boundary.
 * `ADR 0004 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0004-redirect-registration-and-hash-binding.md>`_:
   redirect registration and opt-in id_token hash binding (0.2.0).
+* `ADR 0005 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0005-error-layout.md>`_:
+  error layout: `BadRequestError` and `ConfigError` are also `ValueError`s; `auth_failure`, `retryable`, `log_summary` (0.3.0).
 
 The full list lives in the `docs/adr
 <https://github.com/kushaldas/pygrindvakt/tree/main/docs/adr>`_ directory.

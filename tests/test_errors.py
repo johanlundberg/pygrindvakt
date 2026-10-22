@@ -15,6 +15,8 @@ from pygrindvakt import (
     InternalError,
     OAuthError,
     federation,
+    metadata,
+    request,
     rp,
 )
 from pygrindvakt.http import ReqwestClient
@@ -348,3 +350,440 @@ def test_tolerated_earlier_failure_is_not_blamed_for_a_later_error():
     else:
         assert e.__cause__ is None
         assert e.upstream_status == 500
+
+
+# --- error layout: BadRequestError is a ValueError ---------------------------------
+
+
+def test_bad_request_mro():
+    assert pygrindvakt.BadRequestError.__mro__[:4] == (
+        pygrindvakt.BadRequestError,
+        GrindvaktError,
+        ValueError,
+        Exception,
+    )
+    assert pygrindvakt.BadRequestError.__module__ == "pygrindvakt"
+    assert pygrindvakt.BadRequestError.status_hint == 400
+
+
+def test_value_error_catches_config_faults():
+    with pytest.raises(ValueError) as ei:
+        rp.RpClient("demo", "https://rp.example.com/cb", auth_method="x")
+    assert isinstance(ei.value, pygrindvakt.ConfigError)
+    assert isinstance(ei.value, GrindvaktError)
+    assert ei.value.code == "config"
+
+    with pytest.raises(ValueError) as ei2:
+        rp.JwksCache(None, "https://x/jwks", "https://x").verify_id_token("t", "c", "n", ["NOPE"])
+    assert isinstance(ei2.value, pygrindvakt.ConfigError)
+
+
+def test_config_error_mro_and_defaults():
+    cls = pygrindvakt.ConfigError
+    assert cls.__mro__[:4] == (cls, GrindvaktError, ValueError, Exception)
+    assert cls.__module__ == "pygrindvakt"
+    assert cls.status_hint == 500
+    assert cls.code == "config"
+    e = cls("boom")
+    assert e.auth_failure is False
+    assert e.retryable is False
+    assert e.log_summary == "ConfigError(code='config', status_hint=500): boom"
+
+
+def _cfg_jwks_cache(**kw):
+    return lambda: rp.JwksCache(None, "https://x/jwks", "https://x", **kw)
+
+
+CONFIG_FAULTS = {
+    "unknown auth_method": lambda: rp.RpClient("d", "https://rp.example.com/cb", auth_method="x"),
+    "secret missing": lambda: rp.RpClient("d", "https://rp.example.com/cb", auth_method="client_secret_post"),
+    "empty secret": lambda: rp.RpClient("d", "https://rp.example.com/cb", client_secret=""),
+    "bad algorithm": lambda: rp.JwksCache(None, "https://x/jwks", "https://x").verify_id_token("t", "c", "n", ["NOPE"]),
+    "negative ttl": _cfg_jwks_cache(default_ttl=-1),
+    "min above max": _cfg_jwks_cache(min_ttl=10, max_ttl=5),
+    "bad fetch_timeout": _cfg_jwks_cache(fetch_timeout=0.0),
+    "metadata base": lambda: metadata.ProviderMetadata("https://op.example.com", "http://evil.example"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(CONFIG_FAULTS))
+def test_config_faults_are_config_error_not_bad_request(name):
+    with pytest.raises(pygrindvakt.ConfigError) as ei:
+        CONFIG_FAULTS[name]()
+    e = ei.value
+    assert isinstance(e, ValueError)
+    assert isinstance(e, GrindvaktError)
+    assert not isinstance(e, pygrindvakt.BadRequestError)
+    assert e.status_hint == 500
+    assert e.code == "config"
+
+
+def test_negative_seconds_is_config_error():
+    with pytest.raises(pygrindvakt.ConfigError):
+        rp.JwksCache(None, "https://x/jwks", "https://x", default_ttl=-1)
+
+
+def test_request_input_faults_stay_bad_request():
+    client = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
+    with pytest.raises(pygrindvakt.BadRequestError) as ei:
+        rp.authorization_url(PROV, client, "s", "n", redirect_uri="https://evil.example/cb")
+    assert not isinstance(ei.value, pygrindvakt.ConfigError)
+    assert ei.value.status_hint == 400
+
+
+def test_bad_request_clause_must_precede_value_error_and_grindvakt_error():
+    """BadRequestError is a ValueError and a GrindvaktError: only the first matching clause runs."""
+    client = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
+
+    def classify(call):
+        try:
+            call()
+        except pygrindvakt.BadRequestError:
+            return "bad-request"
+        except pygrindvakt.ConfigError:
+            return "config"
+        except GrindvaktError:
+            return "grindvakt"
+        except ValueError:
+            return "value-error"
+        return "no-error"
+
+    bad_request = lambda: rp.authorization_url(PROV, client, "s", "n", redirect_uri="https://evil.example/cb")  # noqa: E731
+    config_fault = lambda: rp.RpClient("c", "https://x/cb", auth_method="x")  # noqa: E731
+    assert classify(bad_request) == "bad-request"
+    # A config fault is not a BadRequestError, so it reaches its own clause.
+    assert classify(config_fault) == "config"
+
+
+def test_handler_separates_config_fault_from_login_failure():
+    """``except ConfigError: raise`` first keeps a deployment fault out of the login-failed page."""
+
+    def handler(call):
+        try:
+            return call()
+        except pygrindvakt.ConfigError:
+            raise
+        except GrindvaktError:
+            return "login-failed"
+
+    # A real login failure: the token endpoint rejects the code.
+    body = b'{"error":"invalid_grant"}'
+    login = lambda: rp.exchange_code(FakeTokenClient(400, body), PROV, RPC, "code", VERIFIER)  # noqa: E731
+    assert handler(login) == "login-failed"
+
+    # A configuration fault propagates (to a 500 / alert), never to the user as a login error.
+    with pytest.raises(pygrindvakt.ConfigError):
+        handler(CONFIG_FAULTS["unknown auth_method"])
+
+
+def test_bad_request_pickle_and_repr():
+    import pickle
+
+    e = pygrindvakt.BadRequestError("boom")
+    e2 = pickle.loads(pickle.dumps(e))
+    assert type(e2) is pygrindvakt.BadRequestError
+    assert str(e2) == "boom"
+    assert repr(e) == "BadRequestError('boom')"
+
+
+# --- auth_failure / retryable / log_summary --------------------------------------
+
+
+def test_defaults():
+    assert GrindvaktError.auth_failure is False
+    assert GrindvaktError.retryable is False
+    assert AuthnError.auth_failure is True
+    assert InternalError("x").auth_failure is False
+    assert OAuthError("invalid_request").retryable is False
+
+
+def test_token_endpoint_400_is_auth_failure_not_retryable():
+    with pytest.raises(AuthnError) as ei:
+        rp.exchange_code(FakeTokenClient(400, b"{}"), PROV, RPC, "code", VERIFIER)
+    assert ei.value.auth_failure is True
+    assert ei.value.retryable is False
+
+
+def test_token_endpoint_503_is_retryable():
+    with pytest.raises(AuthnError) as ei:
+        rp.exchange_code(FakeTokenClient(503, b"down", "text/plain"), PROV, RPC, "code", VERIFIER)
+    assert ei.value.retryable is True
+
+
+def test_token_endpoint_429_is_retryable():
+    with pytest.raises(AuthnError) as ei:
+        rp.exchange_code(FakeTokenClient(429, b"slow", "text/plain"), PROV, RPC, "code", VERIFIER)
+    assert ei.value.retryable is True
+
+
+def test_jwks_500_is_not_auth_failure_and_retryable():
+    with pytest.raises(InternalError) as ei:
+        rp.fetch_jwks(FakeTokenClient(500, b"oops"), "http://127.0.0.1:1/jwks", "http://127.0.0.1:1")
+    assert ei.value.auth_failure is False
+    assert ei.value.retryable is True
+
+
+def test_jwks_404_is_not_retryable():
+    with pytest.raises(InternalError) as ei:
+        rp.fetch_jwks(FakeTokenClient(404, b"no"), "http://127.0.0.1:1/jwks", "http://127.0.0.1:1")
+    assert ei.value.auth_failure is False
+    assert ei.value.retryable is False
+
+
+def test_transport_is_retryable():
+    with pytest.raises(InternalError) as ei:
+        rp.fetch_jwks(RaisingClient(OSError("down")), "http://127.0.0.1:1/jwks", "http://127.0.0.1:1")
+    assert ei.value.code == "transport"
+    assert ei.value.retryable is True
+
+
+def test_transport_error_is_typed_with_chained_cause():
+    cause = OSError("down")
+    with pytest.raises(InternalError) as ei:
+        rp.exchange_code(RaisingClient(cause), PROV, RPC, "code", VERIFIER)
+    assert type(ei.value) is InternalError
+    assert ei.value.code == "transport"
+    assert ei.value.auth_failure is False
+    assert ei.value.__cause__ is not None
+    assert not getattr(ei.value, "__notes__", None)
+
+
+@pytest.mark.parametrize("spoof", ["transport", "jwks_fetch_timeout", "discovery_backoff"])
+def test_upstream_error_string_cannot_spoof_retryable(spoof):
+    body = f'{{"error":"{spoof}"}}'.encode()
+    for status in (400, 401):
+        with pytest.raises(AuthnError) as ei:
+            rp.exchange_code(FakeTokenClient(status, body), PROV, RPC, "code", VERIFIER)
+        assert ei.value.auth_failure is True
+        assert ei.value.code == spoof
+        assert ei.value.retryable is False
+
+
+@pytest.mark.parametrize("spoof", ["transport", "jwks_fetch_timeout", "discovery_backoff"])
+def test_upstream_error_string_with_5xx_is_retryable_by_status(spoof):
+    body = f'{{"error":"{spoof}"}}'.encode()
+    with pytest.raises(AuthnError) as ei:
+        rp.exchange_code(FakeTokenClient(503, body), PROV, RPC, "code", VERIFIER)
+    assert ei.value.code == spoof
+    assert ei.value.retryable is True
+
+
+def test_binding_raised_transport_in_exchange_code_is_retryable():
+    with pytest.raises(InternalError) as ei:
+        rp.exchange_code(RaisingClient(OSError("down")), PROV, RPC, "code", VERIFIER)
+    assert ei.value.code == "transport"
+    assert ei.value.retryable is True
+
+
+def test_userinfo_upstream_error_string_cannot_spoof_retryable():
+    body = b'{"error":"transport"}'
+    with pytest.raises(AuthnError) as ei:
+        rp.fetch_userinfo(FakeTokenClient(401, body), "http://127.0.0.1:1/ui", "tok", "sub", "http://127.0.0.1:1")
+    assert ei.value.auth_failure is True
+    assert ei.value.code == "transport"
+    assert ei.value.retryable is False
+
+
+def _login_failed_status(e: GrindvaktError) -> int:
+    """Mirror of the status mapping in examples/flask-rp/app.py and the RP guide."""
+    if e.retryable:
+        return 503
+    return 401 if e.auth_failure else 400
+
+
+def test_login_failed_status_mapping():
+    with pytest.raises(GrindvaktError) as ei:
+        rp.exchange_code(FakeTokenClient(503, b"down", "text/plain"), PROV, RPC, "code", VERIFIER)
+    assert _login_failed_status(ei.value) == 503
+
+    body = b'{"error":"invalid_grant","error_description":"expired"}'
+    with pytest.raises(GrindvaktError) as ei:
+        rp.exchange_code(FakeTokenClient(400, body), PROV, RPC, "code", VERIFIER)
+    assert ei.value.auth_failure is True
+    assert _login_failed_status(ei.value) == 401
+
+    with pytest.raises(GrindvaktError) as ei:
+        rp.fetch_jwks(FakeTokenClient(404, b"no"), "http://127.0.0.1:1/jwks", "http://127.0.0.1:1")
+    assert not ei.value.auth_failure and not ei.value.retryable
+    assert _login_failed_status(ei.value) == 400
+
+
+def test_log_summary_format_and_excludes_body():
+    body = b'{"error":"invalid_grant","error_description":"code expired for s3cret"}'
+    with pytest.raises(AuthnError) as ei:
+        rp.exchange_code(FakeTokenClient(400, body), PROV, RPC, "code", VERIFIER)
+    e = ei.value
+    summary = e.log_summary
+    assert summary == (
+        "AuthnError(code='invalid_grant', status_hint=401): authentication error: token endpoint returned 400"
+    )
+    assert "s3cret" not in summary
+    assert e.upstream_body is not None and e.upstream_body not in summary
+
+
+def test_log_summary_plain_exception():
+    assert InternalError("x").log_summary == "InternalError(code='internal', status_hint=500): x"
+    assert pygrindvakt.BadRequestError("y").log_summary == "BadRequestError(code='bad_request', status_hint=400): y"
+
+
+def test_log_summary_escapes_and_caps_message():
+    e = InternalError("line1\nline2\r\x1b[31m " + "x" * 1000)
+    summary = e.log_summary
+    assert "\n" not in summary and "\r" not in summary and "\x1b" not in summary
+    assert "line1\\nline2\\r\\u{001b}" in summary
+    assert summary.endswith("...")
+    prefix = "InternalError(code='internal', status_hint=500): "
+    assert len(summary) - len(prefix) <= 512
+
+
+# Mirrors grindvakt::error::is_invisible_format (inclusive ranges).
+INVISIBLE_RANGES = [
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x0600, 0x0605),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200D),
+    (0x200E, 0x200F),
+    (0x2028, 0x2029),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2065, 0x2065),
+    (0x2066, 0x2069),
+    (0x206A, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+]
+
+
+def _invisible_samples():
+    for lo, hi in INVISIBLE_RANGES:
+        yield from sorted({lo, hi, (lo + hi) // 2, min(lo + 1, hi), max(hi - 1, lo)})
+
+
+@pytest.mark.parametrize("cp", list(_invisible_samples()), ids=lambda cp: f"U+{cp:04X}")
+def test_log_summary_escapes_every_invisible_range(cp):
+    summary = InternalError(f"a{chr(cp)}b").log_summary
+    assert chr(cp) not in summary
+    assert f"a\\u{{{cp:04x}}}b" in summary
+
+
+def _tag_char_error() -> OAuthError:
+    req = request.AuthorizationRequest.from_params(
+        [
+            ("client_id", "demo"),
+            ("response_type", "code"),
+            ("redirect_uri", "https://rp.example/cb"),
+            ("scope", "openid"),
+            ("response_mode", "\U000e0041smuggled\U000e0042"),
+        ]
+    )
+    with pytest.raises(OAuthError) as exc:
+        req.validate_response_mode()
+    return exc.value
+
+
+def test_log_summary_escapes_tag_chars_in_oauth_error_description():
+    e = _tag_char_error()
+    assert e.description is not None and "\U000e0041" in e.description
+    assert "\U000e0041" not in e.log_summary
+    assert "\U000e0042" not in e.log_summary
+    # str(e) is already escaped, so log_summary escapes its backslashes again.
+    assert "u{e0041}smuggled" in e.log_summary and "u{e0042}" in e.log_summary
+    assert "\U000e0041" not in str(e)
+
+
+def test_oauth_error_str_escapes_but_description_and_wire_unchanged():
+    raw = "bad\n\x1b[31m\u202e\u200b\U000e0041 \\ end"
+    e = OAuthError("invalid_request", raw)
+    assert e.description == raw
+    text = str(e)
+    assert text == "invalid_request: bad\\n\\u{001b}[31m\\u{202e}\\u{200b}\\u{e0041} \\\\ end"
+    resp = e.to_response()
+    assert resp.status == 400
+    assert resp.body == OAuthError("invalid_request", raw).to_response().body
+    assert resp.body == pygrindvakt._native.oauth_error_response("invalid_request", raw, None).body
+    assert "\x1b" not in resp.body.decode() and "\u202e" not in resp.body.decode()
+
+
+def test_oauth_error_str_caps_description():
+    text = str(OAuthError("invalid_request", "x" * 2000))
+    assert text.endswith("...")
+    assert len(text) - len("invalid_request: ") <= 512
+    assert str(OAuthError("invalid_request")) == "invalid_request"
+
+
+def test_log_summary_escapes_and_caps_code():
+    e = InternalError("x")
+    e.code = "a\nb" + "c" * 200
+    summary = e.log_summary
+    assert "\n" not in summary
+    assert "code='a\\nb" in summary
+    code_part = summary.split("code=", 1)[1].split(", status_hint", 1)[0]
+    assert len(code_part) <= 64 + 2
+
+
+@pytest.mark.parametrize("ch", ["'", "\\", "\n"])
+def test_log_summary_code_bound_holds_for_escaped_characters(ch):
+    e = InternalError("x")
+    e.code = ch * 64
+    code_part = e.log_summary.split("code=", 1)[1].split(", status_hint", 1)[0]
+    # Surrounding quotes are not part of the 64-character bound.
+    assert len(code_part) <= 64 + 2
+    # Every quote inside the field is escaped, so none can close it early.
+    inner = code_part[1:-1]
+    assert "'" not in inner.replace("\\'", "").replace("\\\\", "")
+
+
+def test_log_summary_robust_to_bad_code_and_hint():
+    e = InternalError("x")
+    e.code = 123
+    assert e.log_summary == "InternalError(code=None, status_hint=500): x"
+    del e.__dict__["code"]
+    e.code = None
+    e.status_hint = None
+    assert e.log_summary == "InternalError(code=None, status_hint=None): x"
+    e2 = InternalError("y")
+    e2.status_hint = "nope"
+    assert e2.log_summary == "InternalError(code='internal', status_hint=None): y"
+
+
+def test_bad_request_instance_has_code_and_status_hint():
+    e = pygrindvakt.BadRequestError()
+    assert e.code == "bad_request"
+    assert e.status_hint == 400
+    assert isinstance(e, ValueError)
+
+
+@pytest.mark.parametrize(
+    ("cls", "expected"),
+    [
+        (pygrindvakt.AuthnError, True),
+        (pygrindvakt.UnknownKeyError, False),
+        (pygrindvakt.DpopReplayError, False),
+        (pygrindvakt.DpopInvalidError, False),
+        (pygrindvakt.DpopNonceRequiredError, False),
+        (pygrindvakt.DpopServerError, False),
+        (pygrindvakt.BadRequestError, False),
+        (pygrindvakt.ConfigError, False),
+    ],
+)
+def test_auth_failure_class_layout(cls, expected):
+    # Pins the documented layout: auth_failure is the core's narrow
+    # "authentication step" flag, not a general "authentication failed" one.
+    assert cls.auth_failure is expected
