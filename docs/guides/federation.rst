@@ -139,6 +139,11 @@ order:
    claims = rp.verify_id_token(op_jwks, id_token, entity.subject, my_client_id,
                                nonce, ["ES256"])
 
+``entity.subject_jwks`` has any symmetric (``oct``) key dropped with a
+``UserWarning``, and ``entity_metadata_jwks`` drops them from the key set it
+verifies a ``signed_jwks_uri`` document with: federation entities sign with
+asymmetric keys, and symmetric keys cannot be published.
+
 Metadata policy
 ---------------
 

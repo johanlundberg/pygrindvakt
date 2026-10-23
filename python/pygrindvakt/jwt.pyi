@@ -42,10 +42,28 @@ def sign(key: SigningKey, claims: dict[str, Any], typ: str | None = ...) -> str:
 
 def verify_with_jwks(jwks: dict[str, Any], token: str, validation: Validation) -> dict[str, Any]:
     """Verify a compact JWS against a JWKS dict (``{"keys": [...]}``) and
-    return the validated claims as a dict."""
+    return the validated claims as a dict.
+
+    .. versionchanged:: 0.3.0
+       BEHAVIOUR CHANGE: for an ``HS256`` / ``HS384`` / ``HS512`` token, an
+       ``oct`` key the token selects (by ``kid``; without one, every key jose-rs
+       would try) shorter than 32 / 48 / 64 bytes (RFC 7518 section 3.2) or
+       with ``k`` that is not strict unpadded base64url raises
+       ``ConfigError`` (``code == "weak_shared_secret"``), and a selected ``oct``
+       key without ``alg`` is pinned to the token's ``alg``. Previously such
+       keys (e.g. 40 bytes for ``HS512``) verified. No opt-out.
+    """
 
 def verify_with_jwk(jwk: dict[str, Any], token: str, validation: Validation) -> dict[str, Any]:
-    """Verify a compact JWS against a single JWK dict."""
+    """Verify a compact JWS against a single JWK dict.
+
+    .. versionchanged:: 0.3.0
+       BEHAVIOUR CHANGE: the same RFC 7518 section 3.2 minimum-key-length
+       gate as :func:`verify_with_jwks` applies to an ``oct`` ``jwk`` and an
+       ``HS*`` token (``ConfigError``, ``code == "weak_shared_secret"``); the
+       token's ``kid`` is ignored, as this is the only key used.
+       No opt-out.
+    """
 
 def peek_header(token: str) -> dict[str, Any]:
     """The protected header of a compact JWS as a dict, WITHOUT verification."""

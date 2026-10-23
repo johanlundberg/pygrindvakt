@@ -12,3 +12,4 @@ new record that supersedes the old one.
 | [0003](0003-fail-closed-hardening.md) | Fail-closed hardening added at the binding boundary | Accepted, extended by 0004 |
 | [0004](0004-redirect-registration-and-hash-binding.md) | Redirect registration and opt-in hash binding at the binding boundary | Accepted |
 | [0005](0005-error-layout.md) | Error layout: BadRequestError and ConfigError are ValueErrors, plus error attributes | Accepted |
+| [0006](0006-shared-secret-algorithms-and-published-jwks.md) | Shared-secret algorithms and published JWKS | Accepted |

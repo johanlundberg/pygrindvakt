@@ -51,7 +51,81 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   (like the other `jwt.*` primitives) and for `EdDSA`;
   `supports_oidc_token_hash` returns `False` for both and never raises.
 
+### Security
+
+- **Behaviour change (0.3.0):** `jwt.verify_with_jwks` and `jwt.verify_with_jwk`
+  now apply the same RFC 7518 section 3.2 minimum-key-length gate as `rp.*`.
+  For a token whose header `alg` is `HS256` / `HS384` / `HS512` (and allowed
+  by the `Validation`, or any HMAC `alg` when it sets no allow-list), a
+  `oct` key the token selects (by `kid`; without one, every key jose-rs
+  would try) shorter than 32 / 48 / 64 bytes raises `ConfigError`
+  (`code == "weak_shared_secret"`), `k` that is not strict unpadded base64url
+  is refused the same way, and a selected `oct` key without an `alg` is
+  pinned to the token's `alg`. A weak `oct` key the token does not select does
+  not raise. Previously these two functions were ungated: an unpinned
+  40-byte `oct` key verified an `HS512` token (the spec needs 64), and a
+  16-byte `HS256` key was refused only by jose-rs' key-type heuristic with an
+  unrelated error. Callers using short secrets (or relying on the old
+  accidental behaviour) with `jwt.verify_with_*` must now use a long enough
+  secret; there is no opt-out. A 32-byte unpinned `HS256` key, which the
+  heuristic used to reject, now verifies. Asymmetric tokens are unaffected.
+- **Behaviour change:** `JwksCache.verify_id_token`, and `rp.verify_id_token` /
+  `rp.fetch_userinfo` given a `JwksCache`, now raise `ConfigError`
+  (`code == "shared_secret_algorithm"`) when `allowed_algorithms` contains
+  `HS256`, `HS384` or `HS512`, before any fetch and with no override. OIDC Core
+  section 10.1 derives the MAC key from the `client_secret`, so an OP's
+  published JWK Set never carries it. Verify MAC-signed ID tokens with
+  `rp.verify_id_token` and a key set you build from the `client_secret`
+  (`{"keys": [{"kty": "oct", "k": <base64url(secret)>}]}`); a caller-built key
+  set with `HS*` keeps working unchanged. See ADR 0006.
+- **Behaviour change:** a symmetric (`oct`) key in a JWK Set fetched from a
+  `jwks_uri` is dropped from the result and a `UserWarning` is emitted (once
+  per fetch). This covers `rp.fetch_jwks`, `JwksCache` (so `JwksCache.jwks()`
+  and the cached set) and the federation helpers `federation.entity_metadata_jwks`
+  / `federation.fetch_signed_jwks`. An OP must not publish symmetric keys, so a
+  dict from `rp.fetch_jwks` can no longer verify an `HS*` token.
+  `federation.entity_metadata_jwks` also filters inline `jwks` metadata. The
+  drop is unconditional: a warning filter set to "error" does not stop it.
+- **Security:** federation no longer verifies with a symmetric key. An `oct` key
+  is now dropped (with a `UserWarning`) from every key set that enters
+  federation verification: the `jwks` of `federation.verify` / `verify_typed`,
+  the `trust_anchors` map of `federation.resolve_via_trust_anchors`, the
+  `subject_fed_jwks` of `federation.entity_metadata_jwks` /
+  `federation.fetch_signed_jwks`, and the getters `EntityStatement.jwks()` and
+  `ResolvedEntity.subject_jwks`. Before, an entity that published a public
+  `oct` key could sign a `jwk-set+jwt` or entity statement with `HS256` and
+  have it accepted (injecting an attacker key as the OP's signing key).
+  `federation.verify`, `verify_typed` and `verify_self_signed` also refuse a
+  token whose header `alg` is `HS256` / `HS384` / `HS512` / `none` with
+  `AuthnError` (`code == "symmetric_algorithm"`). See ADR 0006.
+  `kty` is matched case-insensitively.
+- **Behaviour change:** for a caller-built key set and an `HS*` token,
+  `rp.verify_id_token` and `rp.fetch_userinfo` refuse an `oct` key shorter than
+  the hash output (32 / 48 / 64 bytes for `HS256` / `HS384` / `HS512`, RFC 7518
+  section 3.2) with `ConfigError` (`code == "weak_shared_secret"`; the message
+  does not contain the key); only the key the token selects (its `kid`, or
+  the only key of a one-key set) is checked, so keep weak keys out of
+  verifier sets. Previously `HS384` / `HS512` accepted any `oct`
+  key of 33 bytes or more, and a 32-byte `HS256` secret failed with a
+  `JoseError` (jose-rs took the unpinned key for an AES key). Only `oct` keys
+  usable for HMAC verification with the token's algorithm are checked (`alg`
+  absent or equal, `use` absent or `sig`, `key_ops` absent or containing
+  `verify`); `k` must be strict unpadded base64url, otherwise the same
+  `weak_shared_secret` code is raised with "invalid oct key material". The binding now
+  pins the token's `alg` on the selected unpinned `oct` key, so exactly-32-byte `HS256`
+  secrets verify. A short `client_secret` with `HS*` is now refused; use a
+  secret of at least that length. `none` stays refused when the algorithm
+  list is parsed.
+
 ### Changed
+
+- **Warning (0.3.0):** `federation.build_entity_configuration` emits a
+  `UserWarning` when `public_jwks` contains an `oct` key (OPs and federation
+  entities must not publish symmetric keys, OIDC Core section 10.1). The key
+  is not dropped. `Provider.jwks_document()` cannot contain one (`HS*` signing
+  keys are refused at construction). `rp.fetch_jwks` documents that its `oct`
+  drop warning fires once per call (no global dedup), so the returned dict may
+  differ from the OP's document. See ADR 0006.
 
 - `OAuthError.to_redirect` now raises `BadRequestError` when the base redirect
   URI contains whitespace/control/bidi/invisible characters or userinfo, is

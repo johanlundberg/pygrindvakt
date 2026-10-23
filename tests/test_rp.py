@@ -8,7 +8,12 @@ without any network.
 
 from __future__ import annotations
 
+import base64
+import copy
+import hashlib
+import hmac
 import json
+import os
 import threading
 import time
 import warnings
@@ -22,6 +27,7 @@ from pygrindvakt import (
     CryptoError,
     GrindvaktError,
     InternalError,
+    JoseError,
     OAuthError,
     client,
     jwt,
@@ -2207,3 +2213,421 @@ def test_backslash_gate_leaves_accepted_forms_unchanged():
     assert rp.validate_issuer("https://op.example.com/path") is None
     assert rp.validate_service_endpoint("t", "https://op.example.com/path") is None
     assert rp.validate_redirect_uri_syntax("com.example.app:/cb") is None
+
+
+# --- shared-secret (HS*) algorithms and published JWKS (ADR 0006) ----------------
+
+HS_HASHES = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+HS_MIN = {"HS256": 32, "HS384": 48, "HS512": 64}
+
+
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _mac_token(secret: bytes, alg="HS256", kid="c", claims=None):
+    """Sign an id_token by hand, so secrets shorter than the minimum can be used."""
+    header = {"alg": alg, "typ": "JWT"}
+    if kid is not None:
+        header["kid"] = kid
+    h = _b64u(json.dumps(header).encode())
+    p = _b64u(json.dumps(claims or _co()).encode())
+    sig = hmac.new(secret, f"{h}.{p}".encode(), HS_HASHES[alg]).digest()
+    return f"{h}.{p}.{_b64u(sig)}"
+
+
+def _oct_set(secret: bytes, **extra):
+    return {"keys": [{"kty": "oct", "k": _b64u(secret), "kid": "c", **extra}]}
+
+
+def _verify_hs(jwks, token, alg="HS256"):
+    return rp.verify_id_token(jwks, token, ISSUER, CLIENT_ID, "n", [alg])
+
+
+class OctJwksHttp(FakeHttpClient):
+    """An OP that (wrongly) publishes a symmetric key next to its signing key."""
+
+    secret = b"s" * 64
+
+    def get(self, url):
+        if url == f"{ISSUER}/jwks":
+            doc = self.op.jwks_document()
+            return self._json({"keys": [*doc["keys"], *_oct_set(self.secret)["keys"]]})
+        return super().get(url)
+
+
+@pytest.mark.parametrize(
+    ("alg", "size"),
+    [("HS256", 32), ("HS256", 33), ("HS256", 64), ("HS384", 48), ("HS512", 64), ("HS512", 100)],
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_hs_id_token_verifies_with_caller_built_oct_set(alg, size, pinned):
+    """OIDC Core 10.1: the caller builds the key set from the client_secret."""
+    secret = os.urandom(size)
+    jwks = _oct_set(secret, **({"alg": alg} if pinned else {}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        claims = _verify_hs(jwks, _mac_token(secret, alg), alg)
+    assert claims["sub"] == "alice"
+    # A key without kid is used for a token without kid too.
+    del jwks["keys"][0]["kid"]
+    assert _verify_hs(jwks, _mac_token(secret, alg, kid=None), alg)["sub"] == "alice"
+
+
+def test_hs_poc_with_real_signing_key_roundtrip():
+    secret = b"client-secret-with-at-least-32-bytes!"
+    sk = keys.signing_key_from_jwk({"kty": "oct", "k": _b64u(secret)}, alg="HS256", kid="c")
+    token = jwt.sign(sk, _co())
+    assert _verify_hs(_oct_set(secret), token)["sub"] == "alice"
+
+
+def test_hs_wrong_secret_fails_verification():
+    token = _mac_token(b"a" * 40)
+    with pytest.raises(GrindvaktError):
+        _verify_hs(_oct_set(b"b" * 40), token)
+
+
+@pytest.mark.parametrize(
+    ("alg", "size"),
+    [
+        ("HS256", 1),
+        ("HS256", 16),
+        ("HS256", 24),
+        ("HS256", 31),
+        ("HS384", 32),
+        ("HS384", 47),
+        ("HS512", 48),
+        ("HS512", 63),
+    ],
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_hs_weak_shared_secret_refused(alg, size, pinned):
+    """RFC 7518 3.2: a key shorter than the hash output is a ConfigError, key not echoed."""
+    secret = bytes(range(1, size + 1))
+    jwks = _oct_set(secret, **({"alg": alg} if pinned else {}))
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(secret, alg), alg)
+    assert exc.value.code == "weak_shared_secret"
+    assert isinstance(exc.value, ValueError)
+    assert exc.value.status_hint == 500
+    assert f"{alg} needs a shared secret of at least {HS_MIN[alg]} bytes" in str(exc.value)
+    assert _b64u(secret) not in str(exc.value) and _b64u(secret) not in repr(exc.value)
+
+
+def test_hs_weak_check_considers_only_the_key_named_by_kid():
+    good = b"g" * 40
+    jwks = {"keys": [{"kty": "oct", "k": _b64u(b"short"), "kid": "other"}, _oct_set(good)["keys"][0]]}
+    assert _verify_hs(jwks, _mac_token(good))["sub"] == "alice"
+    # F3: no kid on the token and several keys. verify_id_token itself refuses
+    # that (OIDC Core 10.1) with an authn error, so the weak key never raises.
+    with pytest.raises(AuthnError) as exc:
+        _verify_hs(jwks, _mac_token(good, kid=None))
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+
+
+def _ec_plus_weak_oct(op_key, **extra):
+    weak = {"kty": "oct", "k": _b64u(b"short"), "kid": "legacy", **extra}
+    return {"keys": [*op_key.to_public_jwks()["keys"], weak]}
+
+
+def test_hs_weak_oct_not_selected_by_kid_is_not_a_config_error(op_key):
+    """F3 PoC: an anonymous HS256 token naming the OP's EC key must not 500 as weak_shared_secret."""
+    jwks = _ec_plus_weak_oct(op_key)
+    token = _mac_token(b"x" * 40, kid="op-1")
+    with pytest.raises(JoseError) as exc:
+        _verify_hs(jwks, token)
+    assert not isinstance(exc.value, ConfigError)
+    assert exc.value.code == "jose"
+    assert "does not match token header alg" in str(exc.value)
+    with pytest.raises(JoseError) as exc:
+        jwt.verify_with_jwks(jwks, token, jwt.Validation().with_allowed_algorithms(["HS256"]))
+    assert not isinstance(exc.value, ConfigError)
+    assert exc.value.code == "jose"
+    # A kid that names no key fails as an authn error, not a config fault.
+    with pytest.raises(AuthnError) as exc:
+        _verify_hs(jwks, _mac_token(b"x" * 40, kid="nope"))
+    assert exc.value.code == "authn"
+
+
+def test_hs_weak_oct_selected_by_kid_is_still_a_config_error(op_key):
+    """Residual: a weak oct key in a verifier set is selectable by its kid."""
+    jwks = _ec_plus_weak_oct(op_key)
+    token = _mac_token(b"short", kid="legacy")
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, token)
+    assert exc.value.code == "weak_shared_secret"
+    with pytest.raises(ConfigError) as exc:
+        jwt.verify_with_jwks(jwks, token, jwt.Validation().with_allowed_algorithms(["HS256"]))
+    assert exc.value.code == "weak_shared_secret"
+
+
+def test_hs_kidless_token_single_weak_oct_key_is_a_config_error():
+    weak = b"short"
+    jwks = {"keys": [{"kty": "oct", "k": _b64u(weak)}]}
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(weak, kid=None))
+    assert exc.value.code == "weak_shared_secret"
+
+
+def test_hs_kidless_token_multi_key_set_is_not_a_config_error(op_key):
+    jwks = _ec_plus_weak_oct(op_key)
+    with pytest.raises(AuthnError) as exc:
+        _verify_hs(jwks, _mac_token(b"short", kid=None))
+    assert exc.value.code == "authn"
+
+
+def test_hs_good_oct_named_by_kid_in_mixed_set_verifies(op_key):
+    good = b"g" * 32
+    jwks = {"keys": [*_ec_plus_weak_oct(op_key)["keys"], {"kty": "oct", "k": _b64u(good), "kid": "good"}]}
+    before = copy.deepcopy(jwks)
+    assert _verify_hs(jwks, _mac_token(good, kid="good"))["sub"] == "alice"
+    assert jwks == before
+
+
+def test_hs_only_the_allowed_algorithm_is_used():
+    """An HS256 token is not verified when only ES256 is allowed (algorithm confusion)."""
+    secret = b"x" * 40
+    with pytest.raises(GrindvaktError):
+        rp.verify_id_token(_oct_set(secret), _mac_token(secret), ISSUER, CLIENT_ID, "n", ["ES256"])
+    # And the weak-key check does not fire for an algorithm that was not allowed.
+    with pytest.raises(GrindvaktError) as exc:
+        rp.verify_id_token(_oct_set(b"x"), _mac_token(b"x" * 40), ISSUER, CLIENT_ID, "n", ["ES256"])
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+
+
+@pytest.mark.parametrize("alg", ["none", "None", "NONE"])
+def test_none_algorithm_is_refused_at_parse(op_key, alg):
+    token = jwt.sign(op_key, _co())
+    with pytest.raises(ConfigError, match="invalid JWS algorithm") as exc:
+        rp.verify_id_token(op_key.to_public_jwks(), token, ISSUER, CLIENT_ID, "n", [alg])
+    assert exc.value.code == "config"
+    cache = rp.JwksCache(FakeHttpClient(None), f"{ISSUER}/jwks", ISSUER)
+    with pytest.raises(ConfigError, match="invalid JWS algorithm"):
+        cache.verify_id_token(token, CLIENT_ID, "n", [alg])
+
+
+def test_fetch_jwks_drops_oct_keys_and_warns_once(op, op_key):
+    http = OctJwksHttp(op)
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored") as record:
+        jwks = rp.fetch_jwks(http, f"{ISSUER}/jwks", ISSUER)
+    assert len(record) == 1
+    assert [k["kty"] for k in jwks["keys"]] == ["EC"]
+    assert jwks["keys"][0]["kid"] == "op-1"
+    # The published oct key can never vouch for an HS256 token.
+    token = _mac_token(OctJwksHttp.secret, kid="c")
+    with pytest.raises(AuthnError, match="kid"):
+        _verify_hs(jwks, token)
+    with pytest.raises(GrindvaktError):
+        _verify_hs(jwks, _mac_token(OctJwksHttp.secret, kid=None))
+    # RS/ES tokens still verify against the filtered set.
+    es = jwt.sign(op_key, _co())
+    assert rp.verify_id_token(jwks, es, ISSUER, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+
+
+def test_fetch_jwks_clean_set_has_no_warning(http, prov):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        jwks = rp.fetch_jwks(http, prov.jwks_uri, prov.issuer)
+    assert [k["kid"] for k in jwks["keys"]] == ["op-1"]
+
+
+def test_fetched_jwks_only_oct_gives_empty_set_that_verifies_nothing(op):
+    class OnlyOct(FakeHttpClient):
+        def get(self, url):
+            if url == f"{ISSUER}/jwks":
+                return self._json(_oct_set(OctJwksHttp.secret))
+            return super().get(url)
+
+    with pytest.warns(UserWarning, match="symmetric"):
+        jwks = rp.fetch_jwks(OnlyOct(op), f"{ISSUER}/jwks", ISSUER)
+    assert jwks == {"keys": []}
+    with pytest.raises(GrindvaktError):
+        _verify_hs(jwks, _mac_token(OctJwksHttp.secret))
+
+
+def test_jwks_cache_refuses_hs_algorithms_without_fetching(op):
+    http = OctJwksHttp(op)
+    cache = rp.JwksCache(http, f"{ISSUER}/jwks", ISSUER)
+    token = _mac_token(OctJwksHttp.secret)
+    for algs in (["HS256"], ["ES256", "HS384"], ["HS512"]):
+        with pytest.raises(ConfigError) as exc:
+            cache.verify_id_token(token, CLIENT_ID, "n", algs)
+        assert exc.value.code == "shared_secret_algorithm"
+        assert "client_secret" in str(exc.value) and "10.1" in str(exc.value)
+        # The same through rp.verify_id_token with a cache as the key set.
+        with pytest.raises(ConfigError) as exc:
+            rp.verify_id_token(cache, token, ISSUER, CLIENT_ID, "n", algs)
+        assert exc.value.code == "shared_secret_algorithm"
+    assert http.calls == []
+
+
+def test_jwks_cache_fetch_drops_oct_keys_and_warns(op, op_key):
+    http = OctJwksHttp(op)
+    cache = rp.JwksCache(http, f"{ISSUER}/jwks", ISSUER)
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored") as record:
+        jwks = cache.jwks()
+    assert len([w for w in record if "symmetric" in str(w.message)]) == 1
+    assert [k["kty"] for k in jwks["keys"]] == ["EC"]
+    with warnings.catch_warnings():  # cached: no second fetch, no second warning
+        warnings.simplefilter("error")
+        cache.jwks()
+        es = jwt.sign(op_key, _co())
+        assert cache.verify_id_token(es, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+        assert rp.verify_id_token(cache, es, ISSUER, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+
+
+def test_userinfo_hs256_with_caller_built_set_and_cache_refusal(op):
+    secret = b"u" * 40
+    sk = keys.signing_key_from_jwk({"kty": "oct", "k": _b64u(secret)}, alg="HS256", kid="c")
+    body = jwt.sign(sk, _jwt_claims()).encode()
+    c = UserinfoRecorder(body=body, ctype="application/jwt")
+    out = ui(
+        c,
+        jwks=_oct_set(secret),
+        client_id=CLIENT_ID,
+        allowed_algorithms=["HS256"],
+        trust="untyped_shared_key_compat",
+    )
+    assert out["sub"] == "alice" and out["name"] == "A"
+    # A weak secret is refused here as well.
+    weak = _mac_token(b"w" * 8, claims=_jwt_claims())
+    with pytest.raises(ConfigError) as exc:
+        ui(
+            UserinfoRecorder(body=weak.encode(), ctype="application/jwt"),
+            jwks=_oct_set(b"w" * 8),
+            client_id=CLIENT_ID,
+            allowed_algorithms=["HS256"],
+            trust="untyped_shared_key_compat",
+        )
+    assert exc.value.code == "weak_shared_secret"
+    # A JwksCache never carries the MAC key: refused before any request.
+    cache = rp.JwksCache(OctJwksHttp(op), f"{ISSUER}/jwks", ISSUER)
+    rec = UserinfoRecorder(body=body, ctype="application/jwt")
+    with pytest.raises(ConfigError) as exc:
+        ui(
+            rec,
+            jwks=cache,
+            client_id=CLIENT_ID,
+            allowed_algorithms=["HS256"],
+            trust="untyped_shared_key_compat",
+        )
+    assert exc.value.code == "shared_secret_algorithm"
+    assert rec.calls == []
+
+
+def test_federation_published_jwks_drops_oct_keys():
+    from pygrindvakt import federation
+
+    class Serves:
+        def get(self, url):
+            return 200, json.dumps(_oct_set(b"f" * 40)).encode(), "application/json"
+
+        def post_form(self, *a):
+            return 404, b"", "text/plain"
+
+    meta = {"jwks_uri": f"{ISSUER}/jwks"}
+    with pytest.warns(UserWarning, match="symmetric"):
+        out = federation.entity_metadata_jwks(Serves(), meta, ISSUER, {"keys": []})
+    assert out == {"keys": []}
+
+
+def test_hs_incompatible_oct_keys_are_not_candidates():
+    """Enc-only / other-alg oct keys are neither length-checked nor pinned."""
+    good = b"g" * 40
+    enc = {"kty": "oct", "k": _b64u(b"e" * 16), "alg": "A128KW"}
+    enc_use = {"kty": "oct", "k": _b64u(b"e" * 16), "use": "enc"}
+    enc_ops = {"kty": "oct", "k": _b64u(b"e" * 16), "key_ops": ["encrypt"]}
+    unpinned_enc = {"kty": "oct", "k": _b64u(b"f" * 40), "use": "enc"}
+    other_alg = {"kty": "oct", "k": _b64u(b"e" * 16), "alg": "HS384"}
+    jwks = {"keys": [enc, enc_use, enc_ops, unpinned_enc, other_alg, _oct_set(good)["keys"][0]]}
+    before = copy.deepcopy(jwks)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _verify_hs(jwks, _mac_token(good))["sub"] == "alice"
+    assert jwks == before
+    # Without a kid jose-rs itself refuses a multi-key set; that is not a weak-secret error.
+    with pytest.raises(GrindvaktError) as exc:
+        _verify_hs(jwks, _mac_token(good, kid=None))
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+    assert jwks == before
+
+
+def test_hs_no_candidate_keys_fails_normally():
+    jwks = {"keys": [{"kty": "oct", "k": _b64u(b"e" * 16), "use": "enc"}]}
+    with pytest.raises(GrindvaktError) as exc:
+        _verify_hs(jwks, _mac_token(b"e" * 40, kid=None))
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+
+
+def test_hs_kid_scoped_selection_ignores_incompatible_key_with_other_kid():
+    good = b"g" * 40
+    jwks = {
+        "keys": [
+            {"kty": "oct", "k": _b64u(b"e" * 16), "kid": "c", "use": "enc"},
+            {"kty": "oct", "k": _b64u(good), "kid": "d"},
+        ]
+    }
+    assert _verify_hs(jwks, _mac_token(good, kid="d"))["sub"] == "alice"
+
+
+def test_hs_uppercase_oct_kty_weak_key_refused_deterministically():
+    secret = b"short"
+    jwks = {"keys": [{"kty": "OCT", "k": _b64u(secret), "kid": "c"}]}
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(secret))
+    assert exc.value.code == "weak_shared_secret"
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        lambda k: k + "\n",
+        lambda k: k[:5] + "=" + k[5:],
+        lambda k: k + "==",
+        lambda k: k[:5] + "+" + k[6:],
+        lambda k: k[:5] + "/" + k[6:],
+        lambda k: k[:5] + " " + k[6:],
+        lambda k: k[:-1],  # n % 4 == 1
+    ],
+)
+def test_hs_invalid_oct_key_material_refused(mangle):
+    secret = b"g" * 40
+    k = mangle(_b64u(secret))
+    jwks = {"keys": [{"kty": "oct", "k": k, "kid": "c"}]}
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(secret))
+    assert exc.value.code == "weak_shared_secret"
+    assert "invalid oct key material" in str(exc.value)
+    assert k not in str(exc.value) and k not in repr(exc.value)
+
+
+def test_hs_31_byte_secret_with_stray_chars_not_counted_as_32():
+    secret = b"g" * 31
+    k = _b64u(secret) + "=="
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs({"keys": [{"kty": "oct", "k": k, "kid": "c"}]}, _mac_token(secret))
+    assert exc.value.code == "weak_shared_secret"
+
+
+@pytest.mark.parametrize(("alg", "n"), [("HS256", 32), ("HS384", 48), ("HS512", 64)])
+def test_hs_exact_boundary(alg, n):
+    ok = b"b" * n
+    assert _verify_hs(_oct_set(ok), _mac_token(ok, alg), alg)["sub"] == "alice"
+    bad = b"b" * (n - 1)
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(_oct_set(bad), _mac_token(bad, alg), alg)
+    assert exc.value.code == "weak_shared_secret"
+
+
+def test_fetch_jwks_drops_uppercase_oct_kty(op, op_key):
+    class UpperOct(OctJwksHttp):
+        def get(self, url):
+            if url == f"{ISSUER}/jwks":
+                doc = self.op.jwks_document()
+                oct_key = {**_oct_set(self.secret)["keys"][0], "kty": "OCT"}
+                return self._json({"keys": [*doc["keys"], oct_key]})
+            return super(OctJwksHttp, self).get(url)
+
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored"):
+        jwks = rp.fetch_jwks(UpperOct(op), f"{ISSUER}/jwks", ISSUER)
+    assert all(k["kty"] != "OCT" for k in jwks["keys"])

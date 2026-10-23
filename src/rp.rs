@@ -34,7 +34,7 @@ use crate::errors::{
     UnknownKeyError,
 };
 use crate::http::extract_http_client;
-use crate::jwt::jwks_from_py;
+use crate::jwt::{drop_oct_keys, is_mac, jwks_from_py, prepare_mac_keys, KeySelection};
 use crate::keys::SigningKey;
 use crate::metadata::ProviderMetadata;
 
@@ -977,6 +977,19 @@ fn end_session_url(
 ///
 /// The issuer is required so loopback HTTP is allowed only for an explicitly
 /// loopback HTTP development issuer.
+///
+/// A published JWK Set must not carry symmetric keys (OIDC Core section
+/// 10.1): any `oct` key is dropped from the result and a `UserWarning` is
+/// emitted, so a fetched set can never verify an `HS256` / `HS384` / `HS512`
+/// token. MAC-signed ID tokens are verified with a key set you build from the
+/// `client_secret` instead (see `verify_id_token`).
+///
+/// The warning is emitted once per call (no global dedup): Python's warnings
+/// registry collapses identical messages per location by default, but under
+/// `simplefilter("always")` or `"error"` it fires on every call. The returned
+/// dict may therefore differ from the OP's published document; callers that
+/// cache or diff it should use a warnings filter or `JwksCache`, which caches
+/// the filtered set.
 #[pyfunction]
 #[pyo3(signature = (http, jwks_uri, issuer))]
 fn fetch_jwks<'py>(
@@ -989,7 +1002,7 @@ fn fetch_jwks<'py>(
     let r = crate::runtime::block_on(py, async move {
         grp::fetch_jwks(&http, &jwks_uri, &issuer).await
     })?;
-    let jwks = r.map_err(|e| failures.err(py, e))?;
+    let jwks = drop_published_oct_keys(py, r.map_err(|e| failures.err(py, e))?);
     to_py(py, &jwks)
 }
 
@@ -1037,6 +1050,37 @@ fn parse_algorithms(algs: &[String]) -> PyResult<Vec<JwsAlgorithm>> {
                 .map_err(|e| config_err(format!("invalid JWS algorithm {alg:?}: {e}")))
         })
         .collect()
+}
+
+/// Refuse shared-secret algorithms for a key set that came from a published
+/// JWKS (OIDC Core section 10.1: MAC keys derive from the `client_secret`,
+/// and an OP must not publish symmetric keys). No override.
+fn reject_published_mac(py: Python<'_>, algs: &[JwsAlgorithm]) -> PyResult<()> {
+    if algs.iter().copied().any(is_mac) {
+        return Err(with_code(
+            py,
+            config_err(
+                "HS256/HS384/HS512 are not allowed with a JwksCache: an OP's published JWK Set \
+                 never carries the key for MAC-signed ID tokens (OIDC Core section 10.1: the \
+                 key is derived from the client_secret). Verify with rp.verify_id_token and a \
+                 key set you build from the client_secret instead",
+            ),
+            "shared_secret_algorithm",
+        ));
+    }
+    Ok(())
+}
+
+/// `jwt::drop_oct_keys` for a key set fetched from a published `jwks_uri`.
+/// An OP must not publish symmetric keys (OIDC Core section 10.1), so they
+/// are never used.
+fn drop_published_oct_keys(py: Python<'_>, jwks: JwkSet) -> JwkSet {
+    drop_oct_keys(
+        py,
+        jwks,
+        "published JWKS",
+        "OPs must not publish symmetric keys (OIDC Core section 10.1)",
+    )
 }
 
 /// Enforce the nonce policy shared by `verify_id_token` and
@@ -1141,6 +1185,7 @@ impl IdTokenPolicy {
         client_id: &str,
         expected_nonce: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
+        let jwks = &*prepare_mac_keys(py, jwks, id_token, &self.algorithms, KeySelection::Named)?;
         let trusted = self
             .trusted_additional_audiences
             .iter()
@@ -1209,6 +1254,15 @@ impl IdTokenPolicy {
 /// nonce (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
 /// it for the standard code flow allows id_token replay.
 ///
+/// `HS256` / `HS384` / `HS512` ID tokens are MAC'd with a key derived from the
+/// `client_secret` (OIDC Core section 10.1), never from the OP's JWK Set.
+/// Verify them with a key set you build yourself, for example
+/// `{"keys": [{"kty": "oct", "k": <base64url(client_secret)>}]}`; the key
+/// must be at least as long as the hash output (32 / 48 / 64 bytes, RFC 7518
+/// section 3.2), else `ConfigError(code="weak_shared_secret")`. A `JwksCache`
+/// as `jwks` with an `HS*` algorithm is refused
+/// (`ConfigError(code="shared_secret_algorithm")`); `none` is never accepted.
+///
 /// Optional extra checks (keyword-only, all off by default):
 ///
 /// * `leeway`: clock-skew tolerance in seconds for `exp` / `nbf` / `iat` and
@@ -1274,6 +1328,7 @@ fn verify_id_token<'py>(
     );
     let set = JwksSource::from_py(jwks)?;
     let policy = policy?;
+    set.check_algorithms(py, &policy.algorithms)?;
     let set = set.resolve(py, id_token, issuer)?;
     Ok(policy
         .verify(py, &set, id_token, issuer, client_id, expected_nonce)?
@@ -1308,6 +1363,15 @@ impl<'py> JwksSource<'py> {
                 "JwksCache issuer does not match the issuer argument",
             )),
             _ => Ok(()),
+        }
+    }
+
+    /// A cache is a published JWKS: shared-secret algorithms are refused for
+    /// it. Call this before any network request.
+    fn check_algorithms(&self, py: Python<'_>, algs: &[JwsAlgorithm]) -> PyResult<()> {
+        match self {
+            Self::Cache(_) => reject_published_mac(py, algs),
+            Self::Set(_) => Ok(()),
         }
     }
 
@@ -1431,6 +1495,13 @@ impl Drop for Flight<'_> {
 /// network timeouts, and a stalled adapter still stalls its own caller (the
 /// built-in `ReqwestClient` has a 30s request timeout). The fetch carries on
 /// and its result is cached when it finishes.
+///
+/// Symmetric (`oct`) keys in the fetched document are dropped with a
+/// `UserWarning` (once per fetch): an OP must not publish them (OIDC Core
+/// section 10.1). `verify_id_token` refuses `HS256` / `HS384` / `HS512` in
+/// `allowed_algorithms` with `ConfigError(code="shared_secret_algorithm")`
+/// and no override: use `rp.verify_id_token` with a key set built from the
+/// `client_secret` for those.
 ///
 /// `verify_id_token` refreshes the set at most once when the token's `kid` is
 /// not in it (key rotation), but no more often than `min_refresh_interval`
@@ -1575,7 +1646,7 @@ impl JwksCache {
             .unwrap_or(self.default_ttl)
             .clamp(self.min_ttl, self.max_ttl);
         let entry = Arc::new(CacheEntry {
-            jwks: Arc::new(resp.jwks),
+            jwks: Arc::new(drop_published_oct_keys(py, resp.jwks)),
             expires_at: self.now() + ttl as f64,
         });
         self.state.write().unwrap_or_else(|e| e.into_inner()).entry = Some(entry.clone());
@@ -1784,6 +1855,7 @@ impl JwksCache {
             require_c_hash,
             strict_hashes,
         )?;
+        reject_published_mac(py, &policy.algorithms)?;
         let set = self.resolve_for_token(py, id_token)?;
         Ok(policy
             .verify(py, &set, id_token, &self.issuer, client_id, expected_nonce)?
@@ -1807,6 +1879,11 @@ impl JwksCache {
 /// `"untyped_shared_key_compat"` (weakest). `max_age` bounds the token age
 /// from `iat` (default 300 s); `None` removes the bound, leaving replay
 /// unbounded. Encrypted (JWE) responses are not supported.
+///
+/// `allowed_algorithms` containing `HS*` works with a caller-built `jwks`
+/// (an `oct` key from the `client_secret`, at least 32 / 48 / 64 bytes, else
+/// `ConfigError(code="weak_shared_secret")`); with a `JwksCache` it raises
+/// `ConfigError(code="shared_secret_algorithm")`.
 #[pyfunction]
 #[pyo3(signature = (http, userinfo_endpoint, access_token, expected_sub, issuer, *,
                     method = "POST", jwks = None, client_id = None,
@@ -1857,15 +1934,11 @@ fn fetch_userinfo<'py>(
         jwks.check_issuer(&issuer)?;
     }
     let algs = allowed_algorithms
-        .map(|algs| {
-            algs.iter()
-                .map(|alg| {
-                    JwsAlgorithm::from_str(alg)
-                        .map_err(|e| config_err(format!("invalid JWS algorithm {alg:?}: {e}")))
-                })
-                .collect::<PyResult<Vec<_>>>()
-        })
+        .map(|algs| parse_algorithms(&algs))
         .transpose()?;
+    if let (Some(jwks), Some(algs)) = (&jwks, &algs) {
+        jwks.check_algorithms(py, algs)?;
+    }
     let Some(userinfo_endpoint) = userinfo_endpoint else {
         return Err(config_err(
             "provider does not advertise a userinfo_endpoint",
@@ -1934,6 +2007,7 @@ fn fetch_userinfo<'py>(
         }
         // A cache refreshes once if the response's `kid` is unknown.
         let jwks = jwks.resolve(py, resp.text().trim(), &issuer)?;
+        let jwks = prepare_mac_keys(py, &jwks, resp.text().trim(), &algs, KeySelection::Named)?;
         grp::userinfo_signed_claims(
             &jwks,
             &resp,

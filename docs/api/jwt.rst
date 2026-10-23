@@ -83,9 +83,29 @@ Signing and verifying
    claims as a dict. Raises :class:`pygrindvakt.JoseError` /
    :class:`pygrindvakt.AuthnError` on a bad signature or a failed rule.
 
+   .. versionchanged:: 0.3.0
+      **Behaviour change.** For an ``HS256`` / ``HS384`` / ``HS512`` token
+      (allowed by ``validation``, or any HMAC ``alg`` when it sets no
+      allow-list), the ``oct`` key the token selects (by ``kid``; without
+      one, every key jose-rs would try) when shorter than 32 / 48 / 64 bytes
+      (RFC 7518 section 3.2) raises :class:`pygrindvakt.ConfigError` with
+      ``code == "weak_shared_secret"``; ``k`` that is not strict unpadded
+      base64url is refused the same way; the selected ``oct`` key, if it has no ``alg``, is
+      pinned to the token's ``alg``. Before 0.3.0 this function applied no
+      such check (an unpinned 40-byte key verified ``HS512``). There is no
+      opt-out. The same gate applies to :func:`verify_with_jwk` and to
+      :mod:`pygrindvakt.rp` verification.
+
 .. py:function:: verify_with_jwk(jwk: dict[str, Any], token: str, validation: Validation) -> dict[str, Any]
 
    Verify a compact JWS against a single JWK dict.
+
+   .. versionchanged:: 0.3.0
+      **Behaviour change.** An ``oct`` ``jwk`` verifying an ``HS*`` token is
+      subject to the same minimum-key-length gate as
+      :func:`verify_with_jwks` (``ConfigError``, ``code ==
+      "weak_shared_secret"``); the token's ``kid`` is ignored here, as the
+      key is the only one used. No opt-out.
 
 Inspection without verification
 -------------------------------

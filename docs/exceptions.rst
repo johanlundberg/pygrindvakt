@@ -289,6 +289,28 @@ Instance-level overrides:
 * ``discovery_backoff``: reserved for a discovery fetch refused while a
   previous failure is still backing off. ``retryable`` is ``True``. The
   binding does not raise it yet.
+* ``shared_secret_algorithm`` (``ConfigError``): ``HS256``, ``HS384`` or
+  ``HS512`` in ``allowed_algorithms`` together with a
+  :class:`pygrindvakt.rp.JwksCache`. A published JWK Set never carries the
+  key for MAC-signed ID tokens (OIDC Core section 10.1: it derives from the
+  ``client_secret``). Raised before any fetch; there is no override. Verify
+  with :func:`pygrindvakt.rp.verify_id_token` and a key set built from the
+  ``client_secret`` instead.
+* ``weak_shared_secret`` (``ConfigError``): an ``HS*`` token is verified
+  against a caller-built key set whose ``oct`` key is shorter than the hash
+  output (32, 48 or 64 bytes for ``HS256``, ``HS384``, ``HS512``; RFC 7518
+  section 3.2), or whose ``k`` is not strict unpadded base64url. Only the key
+  the token selects is checked (its ``kid``, or the only key of a one-key
+  set): a weak key elsewhere in the set does not raise, but one selected by
+  its ``kid`` does, so keep weak keys out of verifier sets. Raised by
+  :mod:`pygrindvakt.rp` verification and, since 0.3.0, also by
+  :func:`pygrindvakt.jwt.verify_with_jwks` and
+  :func:`pygrindvakt.jwt.verify_with_jwk`. The message never contains the
+  key.
+* ``symmetric_algorithm`` (``AuthnError``): a federation document passed to
+  :func:`pygrindvakt.federation.verify`, ``verify_typed`` or
+  ``verify_self_signed`` has a header ``alg`` of ``HS256``, ``HS384``,
+  ``HS512`` or ``none``. Entity statements are signed with asymmetric keys.
 * ``upstream_http`` (``InternalError``): a discovery, JWKS or federation
   fetch got a failing status. Always this value for such non-auth failures,
   even if the upstream sent an OAuth ``error`` (that stays in
@@ -305,6 +327,9 @@ Instance-level overrides:
 .. versionchanged:: 0.3.0
    The stable codes ``jwks_fetch_timeout`` and ``discovery_backoff`` are
    listed above together with the ``retryable`` attribute.
+.. versionadded:: 0.3.0
+   The codes ``shared_secret_algorithm``, ``weak_shared_secret`` and
+   ``symmetric_algorithm``.
 
 Transport causes
 ----------------

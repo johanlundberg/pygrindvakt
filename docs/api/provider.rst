@@ -97,6 +97,12 @@ Provider
       The JWKS document (``{"keys": [...]}``) as a dict: the public half of
       the signing key only.
 
+      It never contains a symmetric (``oct``) key: the constructor refuses
+      ``HS256`` / ``HS384`` / ``HS512`` signing keys with
+      :class:`~pygrindvakt.ConfigError`, and a JWK of type ``oct`` cannot be
+      loaded with any other algorithm. An OP must not publish symmetric keys
+      (OIDC Core 10.1); see ADR 0006.
+
    .. py:method:: validate_authorization_request(request: AuthorizationRequest) -> Client
 
       Validate an authorization request against the registered client

@@ -177,6 +177,8 @@ repository rather than in this manual:
   redirect registration and opt-in id_token hash binding (0.2.0).
 * `ADR 0005 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0005-error-layout.md>`_:
   error layout: `BadRequestError` and `ConfigError` are also `ValueError`s; `auth_failure`, `retryable`, `log_summary` (0.3.0).
+* `ADR 0006 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0006-shared-secret-algorithms-and-published-jwks.md>`_:
+  `HS*` ID tokens use a key set built from the `client_secret`; published JWKS never supply shared secrets (0.3.0).
 
 The full list lives in the `docs/adr
 <https://github.com/kushaldas/pygrindvakt/tree/main/docs/adr>`_ directory.

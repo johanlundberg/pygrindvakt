@@ -19,6 +19,7 @@ never contacted by the resolver.
 
 import json
 import time
+import warnings
 from urllib.parse import parse_qs, quote, urlsplit
 
 import pygrindvakt
@@ -941,3 +942,186 @@ def test_apply_policy_requires_dicts():
         federation.apply_policy(["not", "a", "dict"], {})
     with pytest.raises(TypeError):
         federation.apply_policy({}, ["not", "a", "dict"])
+
+
+OCT_KEY = {"kty": "oct", "k": "c" * 43, "kid": "sym"}
+
+
+def test_entity_metadata_jwks_inline_drops_oct_keys_with_warning(fed):
+    """OIDC Core 10.1: symmetric keys in published (inline) metadata are dropped."""
+    pub = fed.leaf_key.to_public_jwks()
+    http = FakeHttpClient({})
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored"):
+        out = federation.entity_metadata_jwks(http, {"jwks": {"keys": [*pub["keys"], OCT_KEY]}}, LEAF, pub)
+    assert out == pub
+
+
+def test_entity_metadata_jwks_uppercase_oct_kty_dropped(fed):
+    pub = fed.leaf_key.to_public_jwks()
+    with pytest.warns(UserWarning, match="symmetric"):
+        out = federation.entity_metadata_jwks(
+            FakeHttpClient({}), {"jwks": {"keys": [*pub["keys"], {**OCT_KEY, "kty": "OCT"}]}}, LEAF, pub
+        )
+    assert out == pub
+
+
+def test_oct_drop_is_unconditional_when_warnings_are_errors(fed):
+    """A warning filter set to "error" is swallowed; the key is dropped regardless."""
+    pub = fed.leaf_key.to_public_jwks()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = federation.entity_metadata_jwks(
+            FakeHttpClient({}), {"jwks": {"keys": [*pub["keys"], OCT_KEY]}}, LEAF, pub
+        )
+    assert out == pub
+
+
+def test_entity_metadata_jwks_signed_uri_drops_oct_keys(fed):
+    pub = fed.leaf_key.to_public_jwks()
+    doc = signed_jwks_document(fed.leaf_key, LEAF, [*pub["keys"], OCT_KEY])
+    http = FakeHttpClient({LEAF + "/signed-jwks": (200, doc, "application/jwk-set+jwt")})
+    with pytest.warns(UserWarning, match="symmetric"):
+        out = federation.entity_metadata_jwks(http, {"signed_jwks_uri": LEAF + "/signed-jwks"}, LEAF, pub)
+    assert out == pub
+
+
+def test_fetch_signed_jwks_drops_oct_keys_with_warning(fed):
+    pub = fed.leaf_key.to_public_jwks()
+    uri = LEAF + "/signed-jwks"
+    doc = signed_jwks_document(fed.leaf_key, LEAF, [OCT_KEY, *pub["keys"]])
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored"):
+        out = federation.fetch_signed_jwks(FakeHttpClient({uri: (200, doc, None)}), uri, LEAF, pub)
+    assert out == pub
+
+
+# ---------------------------------------------------------------------------
+# F1: no federation entry point verifies with a symmetric key (ADR 0006)
+# ---------------------------------------------------------------------------
+
+HS_SECRET = "c" * 43
+HS_JWK = {"kty": "oct", "k": HS_SECRET, "kid": "sym"}
+SYM = r"symmetric \(oct\) key, ignored"
+
+
+def hs256_key():
+    return keys.signing_key_from_jwk({"kty": "oct", "k": HS_SECRET, "kid": "sym"}, alg="HS256", kid="sym")
+
+
+def attacker_ec_jwk() -> dict:
+    return make_key("evil").to_public_jwks()["keys"][0]
+
+
+def test_fetch_signed_jwks_refuses_hs256_signed_document_with_oct_verifier_key(fed):
+    uri = LEAF + "/signed-jwks"
+    doc = signed_jwks_document(hs256_key(), LEAF, [attacker_ec_jwk()])
+    http = FakeHttpClient({uri: (200, doc, None)})
+    with pytest.warns(UserWarning, match=SYM), pytest.raises(pygrindvakt.GrindvaktError):
+        federation.fetch_signed_jwks(http, uri, LEAF, {"keys": [HS_JWK]})
+
+
+def test_entity_metadata_jwks_signed_uri_refuses_hs256_document(fed):
+    uri = LEAF + "/signed-jwks"
+    doc = signed_jwks_document(hs256_key(), LEAF, [attacker_ec_jwk()])
+    http = FakeHttpClient({uri: (200, doc, None)})
+    with pytest.warns(UserWarning, match=SYM), pytest.raises(pygrindvakt.GrindvaktError):
+        federation.entity_metadata_jwks(http, {"signed_jwks_uri": uri}, LEAF, {"keys": [HS_JWK]})
+
+
+def test_verify_refuses_hs256_statement_with_oct_set(fed):
+    token = jwt.sign(hs256_key(), {"iss": LEAF, "sub": LEAF, "exp": now() + 60}, typ=federation.ENTITY_STATEMENT_TYP)
+    with pytest.raises(pygrindvakt.AuthnError) as ei:
+        federation.verify(token, {"keys": [HS_JWK]})
+    assert ei.value.code == "symmetric_algorithm"
+    with pytest.raises(pygrindvakt.AuthnError) as ei:
+        federation.verify_typed(token, fed.ta_key.to_public_jwks(), federation.ENTITY_STATEMENT_TYP)
+    assert ei.value.code == "symmetric_algorithm"
+
+
+def test_verify_self_signed_refuses_hs256_statement(fed):
+    token = jwt.sign(
+        hs256_key(),
+        {"iss": LEAF, "sub": LEAF, "exp": now() + 60, "jwks": {"keys": [HS_JWK]}},
+        typ=federation.ENTITY_STATEMENT_TYP,
+    )
+    with pytest.raises(pygrindvakt.AuthnError) as ei:
+        federation.verify_self_signed(token)
+    assert ei.value.code == "symmetric_algorithm"
+
+
+def test_trust_anchor_map_with_oct_key_does_not_verify_hs_statements(fed):
+    ta_ec = jwt.sign(
+        hs256_key(),
+        {"iss": TA, "sub": TA, "exp": now() + 60, "jwks": {"keys": [HS_JWK]}},
+        typ=federation.ENTITY_STATEMENT_TYP,
+    )
+    resolved = resolve_response(hs256_key(), TA, LEAF, LEAF_METADATA, [fed.leaf_ec, fed.subordinate, ta_ec])
+    http = FakeHttpClient(
+        {
+            TA + WELL_KNOWN: (200, ta_ec, None),
+            RESOLVE_EP: (200, resolved, None),
+        }
+    )
+    with pytest.warns(UserWarning, match=SYM), pytest.raises(pygrindvakt.GrindvaktError):
+        federation.resolve_via_trust_anchors(http, LEAF, {TA: {"keys": [HS_JWK]}})
+
+
+def test_entity_statement_jwks_getter_drops_oct_keys_with_warning(fed):
+    pub = fed.leaf_key.to_public_jwks()
+    token = jwt.sign(
+        fed.ta_key,
+        {"iss": TA, "sub": LEAF, "exp": now() + 60, "jwks": {"keys": [*pub["keys"], HS_JWK]}},
+        typ=federation.ENTITY_STATEMENT_TYP,
+    )
+    stmt = federation.decode_unverified(token)
+    with pytest.warns(UserWarning, match=SYM):
+        assert stmt.jwks() == pub
+
+
+def test_resolved_entity_subject_jwks_drops_oct_keys_with_warning(fed):
+    pub = fed.leaf_key.to_public_jwks()
+    leaf_ec = federation.build_entity_configuration(
+        fed.leaf_key, LEAF, {"keys": [*pub["keys"], HS_JWK]}, [TA], LEAF_METADATA, None, 3600
+    )
+    sub = subordinate_statement(fed.ta_key, TA, LEAF, pub)
+    resolved = resolve_response(fed.ta_key, TA, LEAF, LEAF_METADATA, [leaf_ec, sub, fed.ta_ec])
+    http = FakeHttpClient(
+        {
+            TA + WELL_KNOWN: (200, fed.ta_ec, None),
+            RESOLVE_EP: (200, resolved, None),
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        entity = federation.resolve_via_trust_anchors(http, LEAF, fed.trust_anchors())
+    with pytest.warns(UserWarning, match=SYM):
+        assert entity.subject_jwks == pub
+
+
+def test_clean_key_sets_verify_without_warning(fed):
+    pub = fed.leaf_key.to_public_jwks()
+    uri = LEAF + "/signed-jwks"
+    doc = signed_jwks_document(fed.leaf_key, LEAF, pub["keys"])
+    http = FakeHttpClient({uri: (200, doc, None)})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert federation.fetch_signed_jwks(http, uri, LEAF, pub) == pub
+        assert federation.entity_metadata_jwks(http, {"signed_jwks_uri": uri}, LEAF, pub) == pub
+        assert federation.verify(fed.ta_ec, fed.ta_key.to_public_jwks()).iss() == TA
+        assert federation.decode_unverified(fed.subordinate).jwks() == pub
+        entity = federation.resolve_via_trust_anchors(fed.network(), LEAF, fed.trust_anchors())
+        assert entity.subject_jwks == pub
+
+
+def test_build_entity_configuration_warns_when_publishing_oct_key_but_signs(fed):
+    pub = fed.leaf_key.to_public_jwks()
+    with pytest.warns(UserWarning, match=r"publishing a symmetric \(oct\) key"):
+        token = federation.build_entity_configuration(
+            fed.leaf_key, LEAF, {"keys": [*pub["keys"], OCT_KEY]}, [TA], LEAF_METADATA
+        )
+    assert jwt.peek_claims_unverified(token)["jwks"]["keys"][-1]["kty"] == "oct"
+
+
+def test_build_entity_configuration_no_warning_for_asymmetric_keys(fed):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        federation.build_entity_configuration(fed.leaf_key, LEAF, fed.leaf_key.to_public_jwks(), [TA], LEAF_METADATA)

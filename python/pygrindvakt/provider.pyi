@@ -130,7 +130,11 @@ class Provider:
     def discovery_document(self) -> dict[str, Any]:
         """The ``/.well-known/openid-configuration`` document as a dict."""
     def jwks_document(self) -> dict[str, Any]:
-        """The JWKS document (``{"keys": [...]}``) as a dict."""
+        """The JWKS document (``{"keys": [...]}``) as a dict.
+
+        Never contains an ``oct`` key: the constructor refuses ``HS*`` signing
+        keys (``ConfigError``) and an ``oct`` JWK cannot carry another algorithm.
+        """
     def validate_authorization_request(self, request: AuthorizationRequest) -> Client:
         """Validate an authorization request against the registered client and
         return that ``Client``.

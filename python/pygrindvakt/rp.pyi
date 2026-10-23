@@ -169,7 +169,27 @@ def end_session_url(
     ``id_token_hint`` when the value comes from a request parameter.
     """
 
-def fetch_jwks(http: _HttpArg, jwks_uri: str, issuer: str) -> dict[str, Any]: ...
+def fetch_jwks(http: _HttpArg, jwks_uri: str, issuer: str) -> dict[str, Any]:
+    """Fetch the JWK Set at ``jwks_uri`` and return it as a dict.
+
+    A published JWK Set must not carry symmetric keys (OIDC Core section
+    10.1). Every ``oct`` key is dropped from the result and a ``UserWarning``
+    is emitted ("published JWKS contains a symmetric (oct) key, ignored"), so
+    the returned set can never verify an ``HS256`` / ``HS384`` / ``HS512``
+    token. Build the key set for MAC-signed ID tokens from the ``client_secret``
+    instead; see :func:`verify_id_token`.
+
+    The warning is emitted once per call (there is no global dedup). Python's
+    warnings registry collapses identical messages per location by default,
+    but under ``simplefilter("always")`` or ``"error"`` it fires on every
+    call. The returned dict may therefore not equal the OP's published
+    document; callers that cache or diff it should use a warnings filter or
+    :class:`JwksCache`, which caches the filtered set.
+
+    .. versionchanged:: 0.3.0
+       ``oct`` keys are dropped with a ``UserWarning`` (once per call).
+    """
+
 def exchange_code(
     http: _HttpArg,
     provider: ProviderInfo,
@@ -200,8 +220,27 @@ def verify_id_token(
 ) -> dict[str, Any]:
     """Verify an id_token and return its claims.
 
-    ``jwks`` is a key-set dict or a :class:`JwksCache`. Optional checks, all
-    off by default:
+    ``jwks`` is a key-set dict or a :class:`JwksCache`.
+
+    ``HS256`` / ``HS384`` / ``HS512`` ID tokens are MAC'd with a key derived
+    from the ``client_secret``, never from the OP's published JWK Set (OIDC
+    Core section 10.1). Verify them with a key set you build yourself, for
+    example ``{"keys": [{"kty": "oct", "k": <base64url(client_secret)>}]}``
+    with ``allowed_algorithms=["HS256"]``. The secret must be at least as long
+    as the hash output (32 / 48 / 64 bytes for ``HS256`` / ``HS384`` /
+    ``HS512``, RFC 7518 section 3.2); a shorter ``oct`` key the token selects (by ``kid``) raises
+    ``ConfigError`` with ``code == "weak_shared_secret"`` (the message never
+    contains the key). A :class:`JwksCache` with an ``HS*`` algorithm raises
+    ``ConfigError`` with ``code == "shared_secret_algorithm"``. ``none`` is
+    never accepted (``ConfigError``, invalid algorithm).
+
+    .. versionchanged:: 0.3.0
+       A :class:`JwksCache` with ``HS*`` algorithms is refused, and a caller-built
+       ``oct`` key shorter than the hash output is refused (``weak_shared_secret``;
+       before, ``HS384`` / ``HS512`` keys of 33 bytes or more were accepted, and
+       a 32-byte ``HS256`` secret failed with a confusing ``JoseError``).
+
+    Optional checks, all off by default:
 
     * ``leeway``: clock-skew tolerance in seconds (default 60; above 300 raises
       ``ConfigError``).
@@ -243,6 +282,17 @@ class JwksCache:
     interrupt the thread running the fetch: a Python ``HttpClient`` adapter
     must set its own network timeouts, and a stalled adapter still stalls its
     own caller. The fetch carries on and its result is cached when it ends.
+
+    Symmetric (``oct``) keys in the fetched document are dropped with a
+    ``UserWarning`` (once per fetch): an OP must not publish them (OIDC Core
+    section 10.1). ``HS256`` / ``HS384`` / ``HS512`` in ``allowed_algorithms``
+    of :meth:`verify_id_token` raise ``ConfigError`` with
+    ``code == "shared_secret_algorithm"``, with no override: MAC-signed ID
+    tokens are verified with :func:`verify_id_token` and a key set built from
+    the ``client_secret``.
+
+    .. versionchanged:: 0.3.0
+       ``oct`` keys are dropped with a warning and ``HS*`` algorithms are refused.
     """
 
     def __init__(
@@ -291,6 +341,9 @@ class JwksCache:
         If the token's ``kid`` is missing from a set whose keys have ``kid``s,
         the set is refreshed once (rate-limited by ``min_refresh_interval``)
         and a still-unknown ``kid`` raises ``UnknownKeyError``.
+
+        ``HS256`` / ``HS384`` / ``HS512`` in ``allowed_algorithms`` raise
+        ``ConfigError`` (``code == "shared_secret_algorithm"``) before any fetch.
         """
     def __repr__(self) -> str: ...
 
@@ -327,6 +380,12 @@ def fetch_userinfo(
     token age from ``iat`` (default 300 s); ``None`` removes the bound and
     replay becomes unbounded. Encrypted (JWE) responses are rejected
     (``code == "userinfo_encrypted"``).
+
+    ``HS*`` in ``allowed_algorithms`` works with a caller-built ``jwks`` dict
+    (an ``oct`` key from the ``client_secret``; shorter than 32 / 48 / 64 bytes
+    raises ``ConfigError``, ``code == "weak_shared_secret"``). With a
+    :class:`JwksCache` it raises ``ConfigError``
+    (``code == "shared_secret_algorithm"``).
     """
 
 @overload

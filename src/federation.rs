@@ -20,10 +20,55 @@ use grindvakt::federation as gf;
 use grindvakt::jose_rs::jwk::JwkSet;
 
 use crate::convert::{from_py, new_submodule, to_py};
-use crate::errors::err;
+use crate::errors::{err, with_code, AuthnError};
 use crate::http::extract_http_client;
-use crate::jwt::jwks_from_py;
+use crate::jwt::{drop_oct_keys, jwks_from_py, warn_if_publishing_oct};
 use crate::keys::SigningKey;
+
+// ---------------------------------------------------------------------------
+// Symmetric-key guard (ADR 0006)
+// ---------------------------------------------------------------------------
+
+/// `jwt::drop_oct_keys` for federation key sets. Federation entities sign
+/// with asymmetric keys; a symmetric key in a published or caller-supplied set
+/// would let whoever can read it forge any statement it verifies.
+fn drop_federation_oct_keys(py: Python<'_>, jwks: JwkSet) -> JwkSet {
+    drop_oct_keys(
+        py,
+        jwks,
+        "federation JWKS",
+        "federation entities sign with asymmetric keys; symmetric keys cannot be published",
+    )
+}
+
+/// Refuse a federation document whose JWS header `alg` is `HS256` / `HS384` /
+/// `HS512` or `none`: entity statements and signed JWK Sets are never
+/// MAC-signed or unsigned. Raises `AuthnError(code="symmetric_algorithm")`.
+fn refuse_mac_or_none(py: Python<'_>, token: &str) -> PyResult<()> {
+    let Ok(header) = grindvakt::jwt::peek_header(token) else {
+        return Ok(());
+    };
+    let alg = header.alg.as_str();
+    if ["HS256", "HS384", "HS512", "none"]
+        .iter()
+        .any(|a| alg.eq_ignore_ascii_case(a))
+    {
+        return Err(with_code(
+            py,
+            AuthnError::new_err(format!(
+                "federation document signed with {alg}: entity statements are signed with \
+                 asymmetric keys"
+            )),
+            "symmetric_algorithm",
+        ));
+    }
+    Ok(())
+}
+
+/// `jwks_from_py` followed by the `oct` drop, for every verifier key set.
+fn verifier_jwks(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<JwkSet> {
+    Ok(drop_federation_oct_keys(py, jwks_from_py(obj)?))
+}
 
 // ---------------------------------------------------------------------------
 // EntityStatement
@@ -70,7 +115,7 @@ impl EntityStatement {
     /// as a `{"keys": [...]}` dict. Raises `BadRequestError` if absent.
     fn jwks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let jwks = self.inner.jwks().map_err(err)?;
-        to_py(py, &jwks)
+        to_py(py, &drop_federation_oct_keys(py, jwks))
     }
     /// A metadata sub-document, e.g. `metadata("openid_provider")`, or `None`.
     fn metadata<'py>(&self, py: Python<'py>, kind: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -135,7 +180,10 @@ impl ResolvedEntity {
     /// the start of the returned trust chain, as a `{"keys": [...]}` dict.
     #[getter]
     fn subject_jwks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        to_py(py, &self.inner.subject_jwks)
+        to_py(
+            py,
+            &drop_federation_oct_keys(py, self.inner.subject_jwks.clone()),
+        )
     }
     /// The resolve response's `exp` (seconds since epoch): how long the trust
     /// anchor vouches for the metadata. Use it to bound caching.
@@ -227,6 +275,7 @@ impl CollectionEntity {
 #[pyo3(signature = (key, entity_id, public_jwks, authority_hints, metadata, trust_marks = None, lifetime = 3600))]
 #[allow(clippy::too_many_arguments)]
 fn build_entity_configuration(
+    py: Python<'_>,
     key: &SigningKey,
     entity_id: &str,
     public_jwks: &Bound<'_, PyAny>,
@@ -236,6 +285,12 @@ fn build_entity_configuration(
     lifetime: u64,
 ) -> PyResult<String> {
     let public_jwks = jwks_from_py(public_jwks)?;
+    warn_if_publishing_oct(
+        py,
+        &public_jwks,
+        "federation.build_entity_configuration()",
+        "federation entities sign with asymmetric keys; trust chain validators will ignore it",
+    );
     let metadata: Value = from_py(metadata)?;
     let trust_marks: Vec<Value> = match trust_marks {
         Some(t) if !t.is_none() => from_py(t)?,
@@ -267,8 +322,9 @@ fn decode_unverified(token: &str) -> PyResult<EntityStatement> {
 /// Verify an entity statement's signature against a JWKS dict and require
 /// `typ = entity-statement+jwt` and a present `exp`.
 #[pyfunction]
-fn verify(token: &str, jwks: &Bound<'_, PyAny>) -> PyResult<EntityStatement> {
-    let jwks = jwks_from_py(jwks)?;
+fn verify(py: Python<'_>, token: &str, jwks: &Bound<'_, PyAny>) -> PyResult<EntityStatement> {
+    refuse_mac_or_none(py, token)?;
+    let jwks = verifier_jwks(py, jwks)?;
     gf::verify(token, &jwks)
         .map(EntityStatement::wrap)
         .map_err(err)
@@ -277,8 +333,14 @@ fn verify(token: &str, jwks: &Bound<'_, PyAny>) -> PyResult<EntityStatement> {
 /// Verify a trust-anchor-signed JWT against a JWKS dict, requiring the given
 /// `typ` header (e.g. `RESOLVE_RESPONSE_TYP`) and a present `exp`.
 #[pyfunction]
-fn verify_typed(token: &str, jwks: &Bound<'_, PyAny>, typ: &str) -> PyResult<EntityStatement> {
-    let jwks = jwks_from_py(jwks)?;
+fn verify_typed(
+    py: Python<'_>,
+    token: &str,
+    jwks: &Bound<'_, PyAny>,
+    typ: &str,
+) -> PyResult<EntityStatement> {
+    refuse_mac_or_none(py, token)?;
+    let jwks = verifier_jwks(py, jwks)?;
     gf::verify_typed(token, &jwks, typ)
         .map(EntityStatement::wrap)
         .map_err(err)
@@ -287,7 +349,8 @@ fn verify_typed(token: &str, jwks: &Bound<'_, PyAny>, typ: &str) -> PyResult<Ent
 /// Verify a self-issued Entity Configuration using the keys it carries
 /// (`iss == sub`, signature validates against the embedded `jwks`).
 #[pyfunction]
-fn verify_self_signed(token: &str) -> PyResult<EntityStatement> {
+fn verify_self_signed(py: Python<'_>, token: &str) -> PyResult<EntityStatement> {
+    refuse_mac_or_none(py, token)?;
     gf::verify_self_signed(token)
         .map(EntityStatement::wrap)
         .map_err(err)
@@ -331,7 +394,10 @@ fn resolve_via_trust_anchors(
     trust_anchors: &Bound<'_, PyAny>,
 ) -> PyResult<ResolvedEntity> {
     let (http, failures) = extract_http_client(http)?;
-    let trust_anchors: HashMap<String, JwkSet> = from_py(trust_anchors)?;
+    let trust_anchors: HashMap<String, JwkSet> = from_py::<HashMap<String, JwkSet>>(trust_anchors)?
+        .into_iter()
+        .map(|(id, jwks)| (id, drop_federation_oct_keys(py, jwks)))
+        .collect();
     crate::runtime::block_on(py, async move {
         gf::resolve_via_trust_anchors(&http, &sub, &trust_anchors).await
     })?
@@ -342,6 +408,10 @@ fn resolve_via_trust_anchors(
 /// Resolve an entity type's key set from its metadata (OpenID Federation 1.1
 /// section 5.2.1): inline `jwks`, else `signed_jwks_uri` (verified against
 /// `subject_fed_jwks`), else `jwks_uri`. Returns a `{"keys": [...]}` dict.
+///
+/// Symmetric (`oct`) keys are dropped from the result with a `UserWarning`
+/// (OIDC Core section 10.1: published key sets must not carry them). This also
+/// filters inline `jwks` metadata. The drop is unconditional.
 #[pyfunction]
 #[pyo3(signature = (http, metadata, subject_entity_id, subject_fed_jwks))]
 fn entity_metadata_jwks<'py>(
@@ -353,18 +423,25 @@ fn entity_metadata_jwks<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let (http, failures) = extract_http_client(http)?;
     let metadata: Value = from_py(metadata)?;
-    let subject_fed_jwks = jwks_from_py(subject_fed_jwks)?;
+    let subject_fed_jwks = verifier_jwks(py, subject_fed_jwks)?;
     let jwks = crate::runtime::block_on(py, async move {
         gf::entity_metadata_jwks(&http, &metadata, &subject_entity_id, &subject_fed_jwks).await
     })?
     .map_err(|e| failures.err(py, e))?;
+    let jwks = drop_oct_keys(
+        py,
+        jwks,
+        "published JWKS",
+        "OPs must not publish symmetric keys (OIDC Core section 10.1)",
+    );
     to_py(py, &jwks)
 }
 
 /// Fetch and verify a signed JWK Set document (`typ = jwk-set+jwt`) from
 /// `signed_jwks_uri`. The signature must validate against
 /// `subject_fed_jwks` and the `sub` must equal `subject_entity_id`. Returns a
-/// `{"keys": [...]}` dict.
+/// `{"keys": [...]}` dict. Symmetric (`oct`) keys are dropped from the result
+/// with a `UserWarning` (OIDC Core section 10.1).
 #[pyfunction]
 #[pyo3(signature = (http, signed_jwks_uri, subject_entity_id, subject_fed_jwks))]
 fn fetch_signed_jwks<'py>(
@@ -375,7 +452,7 @@ fn fetch_signed_jwks<'py>(
     subject_fed_jwks: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (http, failures) = extract_http_client(http)?;
-    let subject_fed_jwks = jwks_from_py(subject_fed_jwks)?;
+    let subject_fed_jwks = verifier_jwks(py, subject_fed_jwks)?;
     let jwks = crate::runtime::block_on(py, async move {
         gf::fetch_signed_jwks(
             &http,
@@ -386,6 +463,12 @@ fn fetch_signed_jwks<'py>(
         .await
     })?
     .map_err(|e| failures.err(py, e))?;
+    let jwks = drop_oct_keys(
+        py,
+        jwks,
+        "published JWKS",
+        "OPs must not publish symmetric keys (OIDC Core section 10.1)",
+    );
     to_py(py, &jwks)
 }
 

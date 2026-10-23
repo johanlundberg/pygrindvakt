@@ -209,6 +209,37 @@ log them verbatim or show them to the user.
    token response happens to include an id_token). A nonce that *is* given
    is always enforced, flag or not.
 
+OPs that sign ID tokens with HS256 (the client secret)
+-------------------------------------------------------
+
+An OP that registered ``id_token_signed_response_alg`` as ``HS256``,
+``HS384`` or ``HS512`` MACs the ID token with a key derived from your
+``client_secret`` (OIDC Core 10.1). It does not, and must not, publish that key
+in its ``jwks_uri``. So these tokens are verified with a key set **you** build,
+not with a fetched one:
+
+.. code-block:: python
+
+   import base64
+   from pygrindvakt import rp
+
+   secret = client_secret.encode()          # at least 32 bytes for HS256
+   jwks = {"keys": [{"kty": "oct", "k": base64.urlsafe_b64encode(secret).rstrip(b"=").decode()}]}
+   claims = rp.verify_id_token(jwks, ts.id_token, info.issuer, me.client_id, nonce, ["HS256"])
+
+There is no flag and no warning for this: it is the specified way. Everything
+else is refused. A :class:`~pygrindvakt.rp.JwksCache` with an ``HS*`` algorithm
+raises :class:`~pygrindvakt.ConfigError` (``code == "shared_secret_algorithm"``),
+and an ``oct`` key in a published JWK Set is dropped with a ``UserWarning`` by
+:func:`~pygrindvakt.rp.fetch_jwks` and ``JwksCache``. A secret shorter than the
+hash output (32, 48 or 64 bytes; RFC 7518 3.2) raises ``ConfigError`` with
+``code == "weak_shared_secret"``: ask the OP for a longer client secret. See
+ADR 0006.
+
+.. versionchanged:: 0.3.0
+   ``JwksCache`` with ``HS*`` raises, fetched ``oct`` keys are ignored and
+   short secrets are refused.
+
 Key caching and rotation
 ------------------------
 

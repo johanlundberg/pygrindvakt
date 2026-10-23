@@ -123,6 +123,52 @@ framework integrations cannot accidentally omit deployment-critical choices.
        foreign document; upstream discovery still rejects malformed modelled
        endpoints. Re-validate before you act on what ``raw`` contains.
 
+   * - ``HS256`` / ``HS384`` / ``HS512`` in ``allowed_algorithms`` with a
+       :class:`~pygrindvakt.rp.JwksCache` (also via
+       :func:`~pygrindvakt.rp.verify_id_token` or
+       :func:`~pygrindvakt.rp.fetch_userinfo`) raise
+       :class:`~pygrindvakt.ConfigError` (``code == "shared_secret_algorithm"``).
+       An ``oct`` key in a JWK Set fetched from a ``jwks_uri``
+       (:func:`~pygrindvakt.rp.fetch_jwks`, ``JwksCache``, the federation
+       JWKS helpers, including inline ``jwks`` in entity metadata) is dropped
+       with a ``UserWarning``. The drop is unconditional: it also happens when
+       ``warnings`` is configured as errors (fail-closed). The same drop
+       applies to every key set that enters federation verification: the
+       ``jwks`` of :func:`~pygrindvakt.federation.verify` /
+       ``verify_typed``, the ``trust_anchors`` map of
+       :func:`~pygrindvakt.federation.resolve_via_trust_anchors`, the
+       ``subject_fed_jwks`` of ``entity_metadata_jwks`` / ``fetch_signed_jwks``,
+       and the getters ``EntityStatement.jwks()`` and
+       ``ResolvedEntity.subject_jwks``. ``federation.verify``,
+       ``verify_typed`` and ``verify_self_signed`` also refuse a token whose
+       header ``alg`` is ``HS*`` or ``none`` with
+       :class:`~pygrindvakt.AuthnError` (``code == "symmetric_algorithm"``).
+     - OIDC Core 10.1 derives the MAC key from the ``client_secret``; an OP
+       must not publish symmetric keys. Honouring a published ``oct`` key lets
+       whoever controls the JWKS document (or its transport) mint tokens that
+       pass an ``HS*`` allow-list. In a federation, an entity that publishes
+       an ``oct`` key in its ``jwks`` would otherwise let anyone sign a
+       ``jwk-set+jwt`` or entity statement with ``HS256`` and inject an
+       attacker key as the OP's signing key. Federation entities sign with
+       asymmetric keys; symmetric keys cannot be published.
+     - None, by design (ADR 0006). Verify ``HS*`` tokens with
+       :func:`~pygrindvakt.rp.verify_id_token` and a key set you build from
+       the ``client_secret``; that path needs no flag. The filter covers key
+       sets this library fetches; a JWKS dict you fetched or assembled
+       yourself is a caller-built key set and cannot be told apart from a
+       ``client_secret``-derived one, so never feed a fetched set into an
+       ``HS*`` allow-list.
+   * - An ``HS*`` ID token (or signed UserInfo), or a token passed to
+       :func:`~pygrindvakt.jwt.verify_with_jwks` /
+       :func:`~pygrindvakt.jwt.verify_with_jwk` (since 0.3.0; these were
+       ungated before), verified against a caller-built key set whose ``oct`` key (the one the token
+       selects by ``kid``, or the only key) is shorter than the hash output
+       (32 / 48 / 64 bytes) raises :class:`~pygrindvakt.ConfigError`
+       (``code == "weak_shared_secret"``).
+     - RFC 7518 3.2 requires a key at least as long as the hash output; a short
+       client secret is brute-forceable offline from one captured token.
+     - None; use a longer ``client_secret``.
+
 If grindvakt later adopts these guards upstream, the binding's checks become
 redundant but harmless.
 

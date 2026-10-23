@@ -273,6 +273,33 @@ Discovery and keys
    uncached fetch; use :class:`JwksCache` to cache the key set and handle key
    rotation.
 
+   A published JWK Set must not carry symmetric keys (OIDC Core 10.1). Every
+   ``oct`` key is dropped from the returned dict and a ``UserWarning``
+   ("published JWKS contains a symmetric (oct) key, ignored") is emitted once
+   per call, so the result can never verify an ``HS256`` / ``HS384`` /
+   ``HS512`` token. For MAC-signed ID tokens build the key set from the
+   ``client_secret`` instead (see :func:`verify_id_token`).
+
+   The drop is unconditional and fail-closed: it happens even when
+   :mod:`warnings` is configured to raise (the warning can be suppressed, or
+   turned into an error that is discarded, but the key is dropped regardless).
+   The warning fires once per call; there is no global dedup. Python's
+   warnings registry collapses identical messages per location by default,
+   but under ``simplefilter("always")`` or ``"error"`` it fires on every
+   call. The returned dict therefore may not equal the OP's published
+   document: callers that cache or diff it should use a warnings filter or
+   :class:`JwksCache`, which caches the filtered set.
+   The filter covers key sets this library fetches from a ``jwks_uri``. A JWKS
+   dict you fetched or assembled yourself is a caller-built key set by
+   definition, and the library cannot tell it from one derived from a
+   ``client_secret``: never feed a fetched set into an ``HS*`` allow-list.
+   Inline JWKS in signed federation entity statements is handled by
+   :func:`pygrindvakt.federation.entity_metadata_jwks`, which filters it the
+   same way.
+
+   .. versionchanged:: 0.3.0
+      ``oct`` keys are dropped with a ``UserWarning``.
+
 .. py:class:: JwksCache(http: HttpClientProtocol | None, jwks_uri: str, issuer: str, *, default_ttl: int = 3600, min_ttl: int = 60, max_ttl: int = 86400, min_refresh_interval: int = 30, fetch_timeout: float = 45.0)
 
    A thread-safe cache of one issuer's JWK Set (frozen; read-only
@@ -281,6 +308,21 @@ Discovery and keys
    ``http``; no request is made until first use. Pass the cache wherever a
    ``jwks`` dict is accepted: :func:`verify_id_token` and, for signed
    responses, :func:`fetch_userinfo`.
+
+   **Shared secrets are refused.** The cache holds a *published* JWK Set, and
+   an OP must not publish symmetric keys (OIDC Core 10.1): ``HS256`` /
+   ``HS384`` / ``HS512`` ID tokens are MAC'd with a key derived from the
+   ``client_secret``. So ``HS256``, ``HS384`` or ``HS512`` in
+   ``allowed_algorithms`` of :meth:`verify_id_token` (or of
+   :func:`verify_id_token` / :func:`fetch_userinfo` given the cache) raises
+   :class:`pygrindvakt.ConfigError` with ``code == "shared_secret_algorithm"``,
+   before any fetch and with no override. A fetched ``oct`` key is dropped
+   from the cached set (and from :meth:`jwks`) with a ``UserWarning`` once per
+   fetch. Verify such tokens with :func:`verify_id_token` and a key set you
+   build from the client secret.
+
+   .. versionchanged:: 0.3.0
+      ``HS*`` algorithms are refused and fetched ``oct`` keys are ignored.
 
    **Lifetime.** The set lives for the response's ``Cache-Control: max-age``
    minus its ``Age`` header when present, otherwise ``default_ttl`` seconds,
@@ -477,12 +519,48 @@ Finishing the flow
       (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
       it for the standard code flow allows id_token replay.
 
+   **HS256 / HS384 / HS512 and the client secret.** An OP MACs such an ID
+   token with a key derived from the ``client_secret`` (OIDC Core 10.1), not
+   with a key from its JWK Set, which must not contain one. Build the key set
+   yourself and allow the algorithm explicitly::
+
+      secret = client_secret.encode()
+      jwks = {"keys": [{"kty": "oct", "k": base64.urlsafe_b64encode(secret).rstrip(b"=").decode()}]}
+      claims = rp.verify_id_token(jwks, id_token, issuer, client_id, nonce, ["HS256"])
+
+   This is not an unsafe option: it needs no flag and emits no warning. The
+   secret must be at least as long as the hash output (32, 48 or 64 bytes for
+   ``HS256``, ``HS384``, ``HS512``; RFC 7518 3.2); a shorter ``oct`` key raises
+   :class:`pygrindvakt.ConfigError` with ``code == "weak_shared_secret"``
+   (the message never contains the key). Only the key the token selects is
+   checked: the one its ``kid`` names, or the only key of a one-key set. A
+   ``kid`` naming another key (say the OP's EC key) is not a config fault even
+   if a weak ``oct`` key sits in the set, but a weak key selected by its
+   ``kid`` raises, so keep weak keys out of verifier sets. The key is checked
+   only if it can verify with the token's algorithm (``alg`` absent or equal
+   to it, ``use`` absent or ``sig``, ``key_ops`` absent or containing
+   ``verify``); others are left untouched. ``k`` must be strict unpadded base64url (no
+   ``=``, whitespace, ``+`` or ``/``), otherwise the same code is raised with
+   the message "invalid oct key material". A :class:`JwksCache` with an ``HS*``
+   algorithm raises :class:`~pygrindvakt.ConfigError` with ``code ==
+   "shared_secret_algorithm"``, and an ``oct`` key in a dict from
+   :func:`fetch_jwks` was already dropped. ``none`` is never accepted:
+   it is an invalid algorithm name (:class:`~pygrindvakt.ConfigError`). The
+   same rules apply to ``allowed_algorithms`` in :func:`fetch_userinfo`.
+
    .. versionchanged:: 0.2.0
       Added the keyword-only ``leeway``, ``max_age``, ``acr_values``,
       ``access_token`` / ``require_at_hash``, ``authorization_code`` /
       ``require_c_hash`` and ``strict_hashes`` options, and the requirement
       that the token carry a ``kid`` when the key set holds more than one key.
       ``jwks`` now also accepts a :class:`JwksCache`.
+
+   .. versionchanged:: 0.3.0
+      A :class:`JwksCache` with an ``HS*`` algorithm is refused
+      (``shared_secret_algorithm``), and an ``oct`` key shorter than the hash
+      output is refused (``weak_shared_secret``). Before, an ``HS384`` /
+      ``HS512`` key of 33 bytes or more was accepted whatever its length, and
+      a 32-byte ``HS256`` secret failed with a ``JoseError``.
 
 .. py:function:: fetch_userinfo(http: HttpClientProtocol | None, userinfo_endpoint: str | None, access_token: str, expected_sub: str, issuer: str, *, method: Literal["POST", "GET"] = "POST", jwks: dict[str, Any] | JwksCache | None = None, client_id: str | None = None, allowed_algorithms: list[str] | None = None, trust: str | None = None, typ: str | None = None, max_age: int | None = 300, require_exp: bool = False) -> dict[str, Any]
 
@@ -562,12 +640,24 @@ Finishing the flow
    Encrypted (JWE) responses are not supported and raise
    :class:`pygrindvakt.AuthnError` with ``code == "userinfo_encrypted"``.
 
+   **HS256 / HS384 / HS512.** A UserInfo JWT MACed with the ``client_secret``
+   verifies against a caller-built ``jwks`` dict (an ``oct`` key from the
+   secret, as described under :func:`verify_id_token`), with the same minimum
+   key lengths (``ConfigError``, ``code == "weak_shared_secret"``). With a
+   :class:`JwksCache` an ``HS*`` entry in ``allowed_algorithms`` raises
+   :class:`~pygrindvakt.ConfigError` (``code == "shared_secret_algorithm"``)
+   before the request is made.
+
    .. versionchanged:: 0.2.0
       ``userinfo_endpoint`` became ``str | None`` (a provider that does not
       advertise UserInfo yields ``None`` from ``ProviderInfo``, and passing it
       through raises :class:`pygrindvakt.ConfigError`), and the ``method``,
       ``jwks``, ``client_id``, ``allowed_algorithms``, ``trust``, ``typ``,
       ``max_age`` and ``require_exp`` options were added.
+
+   .. versionchanged:: 0.3.0
+      ``HS*`` with a :class:`JwksCache` is refused and ``oct`` keys shorter
+      than the hash output are refused.
 
    .. code-block:: python
 

@@ -901,3 +901,15 @@ def test_provider_warning_escalates_under_warnings_as_errors(op_key):
         warnings.simplefilter("error", UserWarning)
         with pytest.raises(UserWarning, match="require_pushed_authorization_requests"):
             _build(md, op_key)
+
+
+def test_jwks_document_never_contains_oct_key(op):
+    """A Provider cannot hold a symmetric key (HS* is refused at construction,
+    see test_provider_rejects_symmetric_id_token_signing_key), so its JWKS
+    document is asymmetric and emits no warning (ADR 0006)."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        doc = op.jwks_document()
+    assert doc["keys"] and all(k["kty"] != "oct" for k in doc["keys"])
