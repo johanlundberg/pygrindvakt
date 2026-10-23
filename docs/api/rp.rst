@@ -599,6 +599,132 @@ Client assertions and attribute mapping
    are stringified, and anything else (nested objects, ``null``, empty
    lists) is dropped.
 
+Validators and limits
+---------------------
+
+These check caller-supplied values. :func:`validate_issuer` and
+:func:`validate_service_endpoint` validate integrator configuration or
+provider metadata, so they raise :class:`pygrindvakt.ConfigError` (a
+``ValueError``, ``status_hint`` 500). :func:`validate_redirect_uri_syntax` can
+validate request input, so it raises :class:`pygrindvakt.BadRequestError` (also a ``ValueError``). None of
+them establishes trust.
+
+Which error class? Configuration values (issuer, service endpoints,
+``auth_method``, TTLs, and the algorithm allow-lists passed to ``rp.*``) raise
+:class:`pygrindvakt.ConfigError`. Per-request inputs (a redirect URI override,
+:func:`validate_redirect_uri_syntax`, the OAuth error redirect base) raise
+:class:`pygrindvakt.BadRequestError`. Algorithm names handed to the ``jwt.*``
+primitives (``sign``, ``verify_*``, ``oidc_token_hash``) raise
+:class:`pygrindvakt.CryptoError`. ``ConfigError`` and ``BadRequestError`` are
+both ``ValueError``, so ``except ValueError`` catches either and hides the
+distinction; branch on the class instead.
+
+.. py:function:: validate_issuer(issuer: str) -> None
+
+   Check the syntax of an issuer identifier: an absolute ``https`` URL
+   (``http`` only for loopback hosts) with no userinfo, query, fragment,
+   whitespace, control or invisible characters. Raises
+   :class:`pygrindvakt.ConfigError` otherwise.
+
+   It checks syntax only. It does **not** establish that the issuer is
+   trusted, nor that it matches any discovery metadata. Backslashes are
+   rejected: the URL parser would reinterpret them as ``/``, so the parsed
+   authority would differ from the raw string. Compare issuers byte-for-byte
+   (exact string match); never use suffix/substring checks.
+
+   .. versionadded:: 0.3.0
+
+.. py:function:: validate_redirect_uri_syntax(redirect_uri: str) -> None
+
+   Check that ``redirect_uri`` is an absolute URL without a fragment
+   (upstream's rule). This binding also rejects whitespace, control, bidi and
+   invisible formatting characters and userinfo
+   (``https://good.example@evil.example/cb``); this is binding-side hardening,
+   stricter than core 0.9. Raises :class:`pygrindvakt.BadRequestError`
+   otherwise (not ``ConfigError``: it can validate request input). The same
+   check applies to ``RpClient`` ``redirect_uris`` and
+   ``post_logout_redirect_uris`` (:class:`pygrindvakt.ConfigError`) and to
+   per-request overrides (:class:`pygrindvakt.BadRequestError`).
+
+   This checks syntax only. The scheme is **not** checked: custom native-app
+   schemes such as ``com.example.app:/cb``, ``javascript:``, ``file:`` and
+   ``http://attacker.example/cb`` all pass.
+
+   It is the syntax step of :class:`RpClient`'s redirect URI handling, which
+   also requires registration, exact-string comparison and a transport check
+   (`ADR 0004 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0004-redirect-registration-and-hash-binding.md>`_). It is
+   **not** a registration policy and does **not** make a URI safe to register
+   or redirect to. Do not use it to vet client registrations on an OP: this
+   library provides no OP-side registration policy, so apply an https or
+   scheme allow-list and compare redirect URIs by **exact match** yourself.
+
+   Backslashes are rejected: the URL parser would reinterpret them as ``/``,
+   making the parsed authority differ from the raw string.
+
+   .. versionadded:: 0.3.0
+
+.. py:function:: validate_service_endpoint(name: str, endpoint: str, issuer: str | None = None, *, allow_loopback_http: bool = False) -> None
+
+   The loopback ``http`` exception is opt-in: pass ``allow_loopback_http=True``
+   and an ``issuer`` that is the authenticated, locally configured issuer,
+   never taken from the document being validated. A loopback-``http`` issuer
+   then permits loopback ``http`` endpoints on **any** port.
+
+   Check that a metadata endpoint is an absolute ``https`` URL; ``name`` is
+   used in the error message. By default only ``https`` passes. If ``issuer``
+   is given it is still validated first (as :func:`validate_issuer`; an
+   invalid issuer raises :class:`pygrindvakt.ConfigError` whatever the
+   endpoint) but it never enables loopback ``http``. With
+   ``allow_loopback_http=True``, ``issuer`` is required (otherwise
+   :class:`pygrindvakt.ConfigError`), and loopback ``http`` is also allowed
+   when the issuer is itself a loopback ``http`` origin. A :class:`UserWarning`
+   is emitted whenever a plain ``http`` endpoint is accepted that way. Raises
+   :class:`pygrindvakt.ConfigError` otherwise.
+
+   It checks shape and scheme only. It does **not** require the endpoint to
+   be on the issuer's origin or establish trust. Validating the issuer's
+   syntax does not stop an attacker-supplied ``http://localhost`` issuer, so
+   never enable the opt-in with an issuer taken from an unauthenticated
+   document.
+
+   Backslashes in ``endpoint`` or ``issuer`` are rejected: the URL parser
+   would reinterpret them as ``/``, making the parsed authority differ from
+   the raw string. Compare issuers byte-for-byte (exact string match); never
+   use suffix/substring checks.
+
+   .. versionadded:: 0.3.0
+
+.. py:data:: MAX_ID_TOKEN_LEEWAY
+   :type: int
+
+   The largest ``leeway`` in seconds that :func:`verify_id_token` accepts
+   (300); a larger value raises :class:`pygrindvakt.ConfigError`. It is a cap
+   enforced by the library, **not** a recommended value: keep ``leeway`` as
+   small as your clock skew allows.
+
+   .. versionadded:: 0.3.0
+
+.. py:function:: asymmetric_algorithms() -> list[str]
+
+   A fixed list of the classical asymmetric JWS algorithms the library parses
+   (``RS256``, ``RS384``, ``RS512``, ``PS256``, ``PS384``, ``PS512``,
+   ``ES256``, ``ES384``, ``ES512``, ``ES256K``, ``EdDSA``). ``HS*`` and
+   ``none`` are never included. Post-quantum names (ML-DSA, feature-gated in
+   jose-rs) are **not** included, even if the build parses them.
+
+   It is **not** what an OP advertises (see
+   ``id_token_signing_alg_values_supported`` in its metadata) or what suits
+   your deployment. Pass an explicit allowlist as ``allowed_algorithms``. It is
+   a parser probe, not a recommended allowlist. It includes ``EdDSA``, for
+   which :func:`pygrindvakt.jwt.supports_oidc_token_hash` is ``False``, so
+   ``allowed_algorithms=rp.asymmetric_algorithms()`` together with
+   ``strict_hashes=True`` on a flow that needs ``at_hash`` / ``c_hash`` is
+   unsatisfiable for EdDSA tokens: filter with
+   :func:`pygrindvakt.jwt.supports_oidc_token_hash` or pass an explicit
+   allowlist.
+
+   .. versionadded:: 0.3.0
+
 Example
 -------
 

@@ -170,6 +170,34 @@ fn peek_claims_unverified<'py>(py: Python<'py>, token: &str) -> PyResult<Bound<'
     to_py(py, &c)
 }
 
+/// Parse a JWS `alg` name for the OIDC token-hash helpers.
+fn token_hash_alg(alg: &str) -> PyResult<JwsAlgorithm> {
+    JwsAlgorithm::from_str(alg).map_err(|e| crypto_err(format!("bad algorithm {alg:?}: {e}")))
+}
+
+/// Compute the OIDC Core `at_hash` / `c_hash` value for `value`: the left half
+/// of the SHA-2 digest matching the JWS `alg` (SHA-256, SHA-384 or SHA-512),
+/// base64url-encoded without padding. It also works for `HS256` / `HS384` /
+/// `HS512`, which use the same SHA family.
+///
+/// It only computes the value; it is NOT verification. Compare the result in
+/// constant time with the claim yourself (`pygrindvakt.mac.constant_time_eq`
+/// on the encoded bytes), or use the `at_hash` / `c_hash` checks of
+/// `rp.verify_id_token`. An unknown or unparseable `alg`, and an algorithm
+/// with no defined hash (such as `EdDSA`), both raise `CryptoError`.
+#[pyfunction]
+fn oidc_token_hash(alg: &str, value: &str) -> PyResult<String> {
+    gj::oidc_token_hash(token_hash_alg(alg)?, value).map_err(err)
+}
+
+/// Whether OIDC Core defines a token-hash function for the JWS `alg`, i.e.
+/// whether `oidc_token_hash` succeeds for it. `False` for `EdDSA` and for an
+/// unrecognised `alg` name (it is a predicate and never raises).
+#[pyfunction]
+fn supports_oidc_token_hash(alg: &str) -> bool {
+    JwsAlgorithm::from_str(alg).is_ok_and(gj::supports_oidc_token_hash)
+}
+
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = new_submodule(py, parent, "jwt")?;
     m.add_class::<Validation>()?;
@@ -178,5 +206,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(verify_with_jwk, &m)?)?;
     m.add_function(wrap_pyfunction!(peek_header, &m)?)?;
     m.add_function(wrap_pyfunction!(peek_claims_unverified, &m)?)?;
+    m.add_function(wrap_pyfunction!(oidc_token_hash, &m)?)?;
+    m.add_function(wrap_pyfunction!(supports_oidc_token_hash, &m)?)?;
     Ok(())
 }

@@ -56,3 +56,28 @@ def peek_claims_unverified(token: str) -> dict[str, Any]:
     SECURITY: only for inspection (e.g. reading ``iss`` to choose a key).
     Never trust these values.
     """
+
+def oidc_token_hash(alg: str, value: str) -> str:
+    """Compute the OIDC Core ``at_hash`` / ``c_hash`` value for ``value``.
+
+    The left half of the SHA-2 digest matching the JWS ``alg`` (SHA-256,
+    SHA-384 or SHA-512), base64url-encoded without padding. ``HS256`` /
+    ``HS384`` / ``HS512`` work too (same SHA family). It only computes the
+    value; it is NOT verification. Compare the result in constant time with
+    the claim yourself (:func:`pygrindvakt.mac.constant_time_eq` on the
+    encoded bytes), or use the ``at_hash`` / ``c_hash`` checks of
+    ``rp.verify_id_token``. An unknown or unparseable ``alg``, and an
+    algorithm with no defined hash (such as ``EdDSA``), both raise
+    ``CryptoError``.
+
+    .. versionadded:: 0.3.0
+    """
+
+def supports_oidc_token_hash(alg: str) -> bool:
+    """Whether OIDC Core defines a token-hash function for the JWS ``alg``.
+
+    ``False`` for ``EdDSA`` and for an unrecognised ``alg`` name; it is a
+    predicate and never raises.
+
+    .. versionadded:: 0.3.0
+    """

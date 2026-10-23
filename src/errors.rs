@@ -505,6 +505,16 @@ fn oauth_error_redirect(
             )))
         }
     };
+    // Fail closed: the base is concatenated into `Location` verbatim, so it
+    // must be a clean, fragment-free, userinfo-free URI (RFC 6749 4.1.2.1).
+    // The caller is still responsible for the exact-match registration check.
+    // Core's parse/fragment errors quote the value; never echo it.
+    crate::rp::check_redirect_uri(redirect_uri).map_err(|e| match &e {
+        RsError::BadRequest(m) if !m.contains(redirect_uri) => err(e),
+        _ => {
+            bad_request_err("redirect_uri must be an absolute URI without a fragment (not echoed)")
+        }
+    })?;
     Ok(crate::http::Response::wrap(
         build_oauth_error(code, description, state)?.to_redirect(redirect_uri, fragment),
     ))
@@ -530,7 +540,7 @@ const LOG_MSG_MAX: usize = 512;
 /// Whether `c` is a bidirectional control, line/paragraph separator or other
 /// invisible formatting character. Verbatim copy of grindvakt's
 /// `error::is_invisible_format` (pub(crate) there).
-fn is_invisible_format(c: char) -> bool {
+pub(crate) fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
         // Bidirectional controls and Unicode line/paragraph separators.

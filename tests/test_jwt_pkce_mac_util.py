@@ -1,11 +1,12 @@
 """jwt / pkce / mac / util helpers."""
 
+import base64
 import hashlib
 import hmac
 import time
 
 import pytest
-from pygrindvakt import GrindvaktError, jwt, mac, pkce, util
+from pygrindvakt import CryptoError, GrindvaktError, jwt, mac, pkce, rp, util
 
 # ---- jwt --------------------------------------------------------------------
 
@@ -93,3 +94,56 @@ def test_util():
     t = util.random_token(32)
     assert len(t) == 43 and t != util.random_token(32)
     assert len(util.random_token()) == 43
+
+
+# ---- jwt: OIDC token hash -----------------------------------------------------
+
+
+def test_oidc_token_hash_core_appendix_a3_vector():
+    assert jwt.oidc_token_hash("RS256", "jHkWEdUXMU1BwAsC4vtUsZwnNvTIxEl0z9K3vx5KF0Y") == "77QmUPtjPfzWtF2AnpK9RQ"
+
+
+@pytest.mark.parametrize(
+    ("alg", "digest", "encoded_len"),
+    [
+        ("ES256", hashlib.sha256, 22),
+        ("PS256", hashlib.sha256, 22),
+        ("ES384", hashlib.sha384, 32),
+        ("RS512", hashlib.sha512, 43),
+        ("ES256K", hashlib.sha256, 22),
+        ("HS256", hashlib.sha256, 22),
+        ("HS384", hashlib.sha384, 32),
+        ("HS512", hashlib.sha512, 43),
+    ],
+)
+def test_oidc_token_hash_is_left_half_of_matching_digest(alg, digest, encoded_len):
+    out = jwt.oidc_token_hash(alg, "access-token")
+    raw = digest(b"access-token").digest()
+    assert len(out) == encoded_len
+    assert out == base64.urlsafe_b64encode(raw[: len(raw) // 2]).rstrip(b"=").decode()
+
+
+def test_oidc_token_hash_errors():
+    with pytest.raises(CryptoError):
+        jwt.oidc_token_hash("bogus", "x")
+    with pytest.raises(CryptoError):
+        jwt.oidc_token_hash("EdDSA", "x")
+
+
+@pytest.mark.parametrize("alg", [*rp.asymmetric_algorithms(), "HS256", "HS384", "HS512", "bogus"])
+def test_supports_oidc_token_hash_iff_oidc_token_hash_succeeds(alg):
+    supported = jwt.supports_oidc_token_hash(alg)
+    try:
+        jwt.oidc_token_hash(alg, "x")
+        succeeded = True
+    except CryptoError:
+        succeeded = False
+    assert supported is succeeded
+    assert supported is (alg not in ("EdDSA", "bogus"))
+
+
+def test_supports_oidc_token_hash():
+    assert jwt.supports_oidc_token_hash("ES384") is True
+    assert jwt.supports_oidc_token_hash("EdDSA") is False
+    assert jwt.supports_oidc_token_hash("bogus") is False
+    assert jwt.supports_oidc_token_hash("vendor-alg-1") is False

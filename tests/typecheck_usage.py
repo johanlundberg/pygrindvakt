@@ -14,6 +14,7 @@ from pygrindvakt import (
     OAuthError,
     discovery,
     federation,
+    jwt,
     rp,
 )
 
@@ -269,3 +270,20 @@ def use_config_error() -> None:
         raise
     except GrindvaktError as ge:
         print(ge.log_summary)
+
+
+def use_validators() -> None:
+    # validate_issuer / validate_service_endpoint raise ConfigError;
+    # validate_redirect_uri_syntax raises BadRequestError.
+    rp.validate_issuer("https://op.example")
+    rp.validate_redirect_uri_syntax("https://rp.example/cb")
+    rp.validate_service_endpoint("token_endpoint", "https://op.example/token")
+    rp.validate_service_endpoint("token_endpoint", "https://op.example/token", issuer="https://op.example")
+    rp.validate_service_endpoint(
+        "token_endpoint", "http://localhost:8080/token", "http://localhost:8080", allow_loopback_http=True
+    )
+    cap: int = rp.MAX_ID_TOKEN_LEEWAY
+    algs: list[str] = rp.asymmetric_algorithms()
+    digest: str = jwt.oidc_token_hash("RS256", "token")
+    supported: bool = jwt.supports_oidc_token_hash("RS256")
+    del cap, algs, digest, supported

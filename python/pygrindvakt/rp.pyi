@@ -6,6 +6,15 @@ from .http import _HttpArg, _HttpHeadersArg
 from .keys import SigningKey
 from .metadata import ProviderMetadata
 
+MAX_ID_TOKEN_LEEWAY: int
+"""Largest ``leeway`` (seconds) ``verify_id_token`` accepts (300).
+
+A cap on skew tolerance, not a recommended value. A larger ``leeway`` raises
+``ConfigError``.
+
+.. versionadded:: 0.3.0
+"""
+
 class ProviderInfo:
     """Minimal upstream-provider information the RP needs.
 
@@ -339,3 +348,79 @@ def fetch_userinfo(
 ) -> dict[str, Any]: ...
 def build_client_assertion(key: SigningKey, client_id: str, audience: str) -> str: ...
 def claims_to_attributes(claims: dict[str, Any]) -> dict[str, list[str]]: ...
+def validate_issuer(issuer: str) -> None:
+    """Check the syntax of an issuer identifier.
+
+    Requires an absolute ``https`` URL (``http`` only for loopback hosts) with
+    no userinfo, query, fragment, whitespace, control or invisible characters;
+    raises ``ConfigError`` otherwise (the issuer is integrator configuration
+    or provider metadata, not request input). Syntax only: it does NOT
+    establish that the issuer is trusted, nor that it matches any discovery
+    metadata. Backslashes are rejected (the URL parser would reinterpret them
+    as ``/``, making the parsed authority differ from the raw string). Compare
+    issuers byte-for-byte (exact string match); never suffix/substring checks.
+
+    .. versionadded:: 0.3.0
+    """
+
+def validate_redirect_uri_syntax(redirect_uri: str) -> None:
+    """Check the syntax of a redirect URI.
+
+    Requires an absolute URL without a fragment (upstream's rule). This
+    binding also rejects whitespace, control, bidi and invisible formatting
+    characters and userinfo (binding-side hardening, stricter than core 0.9).
+    Raises ``BadRequestError`` otherwise (not ``ConfigError``: a redirect URI
+    can come from a request). This checks syntax only. The scheme is NOT
+    checked, so ``com.example.app:/cb``, ``javascript:`` and
+    ``http://attacker.example/cb`` all pass. It is the syntax step of
+    ``RpClient``'s redirect URI handling, which also requires registration,
+    exact-string comparison and a transport check (ADR 0004); it is NOT a
+    registration policy. Do not use it to vet client registrations on an OP:
+    this library provides no OP-side registration policy, so apply an https or
+    scheme allow-list and compare by EXACT match yourself. Backslashes are rejected (the URL
+    parser would reinterpret them as ``/``, making the parsed authority differ
+    from the raw string).
+
+    .. versionadded:: 0.3.0
+    """
+
+def validate_service_endpoint(
+    name: str, endpoint: str, issuer: str | None = ..., *, allow_loopback_http: bool = ...
+) -> None:
+    """The loopback ``http`` exception is opt-in (``allow_loopback_http=True``) and ``issuer`` must then be the authenticated, locally configured issuer, never taken from the document being validated.
+
+    Checks that a metadata endpoint is an absolute ``https`` URL. ``name``
+    appears in the error message. By default only ``https`` passes; if
+    ``issuer`` is given it is still validated first (as
+    :func:`validate_issuer`; an invalid issuer raises ``ConfigError``) but
+    never enables loopback ``http``. With ``allow_loopback_http=True``,
+    ``issuer`` is required (else ``ConfigError``) and loopback ``http`` is also
+    allowed on ANY port when the issuer is itself a loopback ``http`` origin; a
+    ``UserWarning`` is emitted whenever a plain ``http`` endpoint is accepted.
+    Raises ``ConfigError`` otherwise (endpoints are integrator configuration or
+    provider metadata, not request input). It does NOT check same-origin with
+    the issuer or establish trust. Backslashes in ``endpoint`` or ``issuer``
+    are rejected (the URL parser would reinterpret them as ``/``, making the
+    parsed authority differ from the raw string). Compare issuers
+    byte-for-byte (exact string match); never suffix/substring checks.
+
+    .. versionadded:: 0.3.0
+    """
+
+def asymmetric_algorithms() -> list[str]:
+    """A fixed list of the classical asymmetric JWS algorithms the library parses.
+
+    ``RS256/384/512``, ``PS256/384/512``, ``ES256/384/512``, ``ES256K`` and
+    ``EdDSA``; never ``HS*`` or ``none``. Post-quantum names (ML-DSA,
+    feature-gated in jose-rs) are NOT included even if the build parses them.
+    This is a parser probe, not a recommended allowlist; it is not a list an
+    OP advertises and not what suits your deployment. Pass an explicit
+    allowlist to :func:`verify_id_token`. It includes ``EdDSA``, for which
+    :func:`pygrindvakt.jwt.supports_oidc_token_hash` is ``False``, so
+    ``allowed_algorithms=rp.asymmetric_algorithms()`` with
+    ``strict_hashes=True`` on a flow that needs ``at_hash`` / ``c_hash`` is
+    unsatisfiable for EdDSA tokens: filter with
+    ``jwt.supports_oidc_token_hash`` or pass an explicit allowlist.
+
+    .. versionadded:: 0.3.0
+    """

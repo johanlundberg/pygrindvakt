@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import warnings
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -1698,12 +1699,17 @@ def test_end_session_url_unregistered_post_logout_rejected(lprov):
         AFTER.replace("rp.", "RP."),
         "HTTPS://rp.example.com/after",
         AFTER + "?next=1",
-        AFTER + " ",
     ],
 )
 def test_end_session_url_near_miss_rejected(lprov, near):
     with pytest.raises(BadRequestError, match="registered on the client"):
         rp.end_session_url(lprov, client=_logout_client(AFTER), post_logout_redirect_uri=near)
+
+
+def test_end_session_url_trailing_space_rejected_as_syntax(lprov):
+    # Whitespace is rejected by the binding's syntax check before the exact-match step.
+    with pytest.raises(BadRequestError, match="whitespace"):
+        rp.end_session_url(lprov, client=_logout_client(AFTER), post_logout_redirect_uri=AFTER + " ")
 
 
 def test_end_session_url_hint_only_post_logout_rejected(lprov):
@@ -1974,3 +1980,230 @@ def test_verify_trusted_additional_audience_keyword(op_key):
     with pytest.raises(AuthnError, match="untrusted audience"):
         _vo(op_key, multi)
     assert _vo(op_key, multi, trusted_additional_audiences=["https://api.example"])["sub"] == "alice"
+
+
+# ---- validators and limits ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "issuer", ["https://op.example.com", "https://op.example.com/tenant", "http://localhost:8080", "http://127.0.0.1"]
+)
+def test_validate_issuer_accepts(issuer):
+    assert rp.validate_issuer(issuer) is None
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "http://op.example.com",
+        "https://op.example.com/?a=b",
+        "https://op.example.com/#frag",
+        "https://user@op.example.com",
+        "op.example.com",
+        "https://op.example.com/\u200b",
+        "https://evil.example\\@op.example.com",
+        "https://op.example.com\\path",
+    ],
+)
+def test_validate_issuer_rejects(issuer):
+    with pytest.raises(ConfigError):
+        rp.validate_issuer(issuer)
+
+
+def test_validate_redirect_uri_syntax_is_syntax_only():
+    assert rp.validate_redirect_uri_syntax("https://rp.example.com/cb") is None
+    assert rp.validate_redirect_uri_syntax("com.example.app:/cb") is None
+    # Documented: the scheme is not checked, so this is NOT a safety check.
+    assert rp.validate_redirect_uri_syntax("javascript:alert(1)") is None
+    assert rp.validate_redirect_uri_syntax("http://attacker.example/cb") is None
+    for bad in ("/relative", "https://rp.example.com/cb#frag", ""):
+        with pytest.raises(BadRequestError):
+            rp.validate_redirect_uri_syntax(bad)
+
+
+BAD_REDIRECT_URIS = [
+    "https://rp.example.com/cb\r\nX: 1",
+    "https://rp.example.com/a\tb",
+    " https://rp.example.com/cb",
+    "https://rp.example.com/cb\n",
+    "https://rp.example.com/\u200b",
+    "https://rp.ex\u00adample.com/cb",
+    "https://good.example@evil.example/cb",
+    "https://u:p@rp.example.com/cb",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_REDIRECT_URIS)
+def test_validate_redirect_uri_syntax_rejects_hostile(bad):
+    with pytest.raises(BadRequestError) as ei:
+        rp.validate_redirect_uri_syntax(bad)
+    assert "evil.example" not in str(ei.value)
+
+
+@pytest.mark.parametrize("ok", ["com.example.app:/cb", "https://rp.example.com/cb?x=1", "http://127.0.0.1:8080/cb"])
+def test_validate_redirect_uri_syntax_accepts(ok):
+    assert rp.validate_redirect_uri_syntax(ok) is None
+
+
+def test_rpclient_rejects_hostile_redirect_uris():
+    bad = "https://rp.example.com/cb\r\nX: 1"
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", redirect_uris=[bad])
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", post_logout_redirect_uris=[bad])
+
+
+def test_per_request_redirect_uri_override_rejects_hostile(prov):
+    bad = "https://rp.example.com/cb\r\nX: 1"
+    for allow in (False, True):
+        c = rp.RpClient(CLIENT_ID, REDIRECT_URI, allow_unregistered_redirect_uri=allow)
+        with pytest.raises(BadRequestError):
+            rp.authorization_url(prov, c, "st", "n", redirect_uri=bad)
+
+
+def test_validate_service_endpoint_with_and_without_issuer():
+    assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/token") is None
+    for bad in ("http://op.example.com/token", "http://localhost/token", "/token"):
+        with pytest.raises(ConfigError, match="token_endpoint"):
+            rp.validate_service_endpoint("token_endpoint", bad)
+    # Not a same-origin check: another https host passes.
+    assert rp.validate_service_endpoint("token_endpoint", "https://other.example/token", ISSUER) is None
+    assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", issuer=ISSUER) is None
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["http://127.0.0.1:9200/_search", "http://[::1]:6379/", "http://LocalHost:25/smtp"]
+)
+def test_validate_service_endpoint_loopback_http_rejected_by_default(endpoint):
+    # Even with a loopback issuer, no opt-in means strict https only.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ConfigError):
+            rp.validate_service_endpoint("token_endpoint", endpoint, "http://localhost")
+        with pytest.raises(ConfigError):
+            rp.validate_service_endpoint("token_endpoint", endpoint, "http://localhost", allow_loopback_http=False)
+        with pytest.raises(ConfigError):
+            rp.validate_service_endpoint("token_endpoint", endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["http://127.0.0.1:9200/_search", "http://[::1]:6379/", "http://LocalHost:25/smtp"]
+)
+def test_validate_service_endpoint_opt_in_loopback_warns(endpoint):
+    # String validation cannot tell an attacker-supplied http://localhost from
+    # a configured one, hence explicit opt-in and a loud warning.
+    with pytest.warns(UserWarning, match="development-only") as rec:
+        assert (
+            rp.validate_service_endpoint("token_endpoint", endpoint, "http://localhost", allow_loopback_http=True)
+            is None
+        )
+    assert "explicitly" in str(rec[0].message)
+
+
+def test_validate_service_endpoint_opt_in_requires_issuer():
+    with pytest.raises(ConfigError, match="requires issuer"):
+        rp.validate_service_endpoint("token_endpoint", "http://localhost:8080/t", allow_loopback_http=True)
+    with pytest.raises(ConfigError, match="requires issuer"):
+        rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", allow_loopback_http=True)
+
+
+@pytest.mark.parametrize(
+    "bad_issuer", ["", "not a url", "https://op.example.com?x=1", "https://u@op.example.com", "/rel"]
+)
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_validate_service_endpoint_rejects_invalid_issuer(bad_issuer, opt_in):
+    with pytest.raises(ConfigError):
+        rp.validate_service_endpoint(
+            "token_endpoint", "https://op.example.com/token", bad_issuer, allow_loopback_http=opt_in
+        )
+
+
+def test_validate_service_endpoint_https_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", ISSUER) is None
+        assert rp.validate_service_endpoint("token_endpoint", "https://x.example/t", "http://localhost") is None
+        assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t") is None
+        for issuer in (ISSUER, "http://localhost"):
+            assert (
+                rp.validate_service_endpoint("token_endpoint", "https://x.example/t", issuer, allow_loopback_http=True)
+                is None
+            )
+
+
+def test_validate_service_endpoint_non_loopback_issuer_rejects_http():
+    with pytest.raises(ConfigError):
+        rp.validate_service_endpoint("token_endpoint", "http://127.0.0.1:9200/x", ISSUER)
+    with pytest.raises(ConfigError):
+        rp.validate_service_endpoint("token_endpoint", "http://127.0.0.1:9200/x", ISSUER, allow_loopback_http=True)
+
+
+def test_validate_service_endpoint_allow_loopback_http_is_keyword_only():
+    with pytest.raises(TypeError):
+        rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", ISSUER, True)  # type: ignore[call-arg]
+
+
+def test_max_id_token_leeway_matches_verify_cap(op_key):
+    assert rp.MAX_ID_TOKEN_LEEWAY == 300
+    assert _vo(op_key, _co(), leeway=rp.MAX_ID_TOKEN_LEEWAY)["sub"] == "alice"
+    with pytest.raises(ConfigError, match="leeway"):
+        _vo(op_key, _co(), leeway=rp.MAX_ID_TOKEN_LEEWAY + 1)
+
+
+def test_asymmetric_algorithms(op_key):
+    algs = rp.asymmetric_algorithms()
+    assert isinstance(algs, list) and algs
+    assert all(isinstance(a, str) for a in algs)
+    assert len(set(algs)) == len(algs)
+    assert not {"HS256", "HS384", "HS512", "none"} & set(algs)
+    assert not any(a.startswith("HS") or a.lower() == "none" for a in algs)
+    assert {"RS256", "PS256", "ES256", "EdDSA"} <= set(algs)
+    for alg in algs:
+        assert isinstance(jwt.supports_oidc_token_hash(alg), bool)
+    # Every name passes the allowed_algorithms parser (a bad name is a ConfigError before the token is read).
+    for alg in algs:
+        with pytest.raises(GrindvaktError) as exc:
+            rp.verify_id_token(op_key.to_public_jwks(), "not.a.jwt", ISSUER, CLIENT_ID, "n", [alg])
+        assert not isinstance(exc.value, ConfigError), alg
+    with pytest.raises(ConfigError):
+        rp.verify_id_token(op_key.to_public_jwks(), "not.a.jwt", ISSUER, CLIENT_ID, "n", ["bogus"])
+
+
+BACKSLASH_URLS = ["https://evil.example\\@op.example.com", "https://op.example.com\\path"]
+
+
+@pytest.mark.parametrize("bad", BACKSLASH_URLS)
+def test_backslash_urls_rejected_everywhere(bad):
+    with pytest.raises(ConfigError) as ei:
+        rp.validate_issuer(bad)
+    assert "backslash" in str(ei.value) and "evil.example" not in str(ei.value)
+    for loopback in (False, True):
+        with pytest.raises(ConfigError) as ei:
+            rp.validate_service_endpoint("token_endpoint", bad, "http://localhost", allow_loopback_http=loopback)
+        assert "backslash" in str(ei.value) and "evil.example" not in str(ei.value)
+    with pytest.raises(BadRequestError) as ei:
+        rp.validate_redirect_uri_syntax(bad)
+    assert "backslash" in str(ei.value) and "evil.example" not in str(ei.value)
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", redirect_uris=[bad])
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", post_logout_redirect_uris=[bad])
+    e = OAuthError("invalid_request")
+    for mode in ("query", "fragment"):
+        with pytest.raises(BadRequestError) as ei:
+            e.to_redirect(bad, mode)
+        assert "evil.example" not in str(ei.value)
+
+
+@pytest.mark.parametrize("loopback", [False, True])
+def test_validate_service_endpoint_rejects_backslash_in_issuer_arg(loopback):
+    with pytest.raises(ConfigError, match="backslash"):
+        rp.validate_service_endpoint(
+            "token_endpoint", "https://op.example.com/t", "https://op.example.com\\x", allow_loopback_http=loopback
+        )
+
+
+def test_backslash_gate_leaves_accepted_forms_unchanged():
+    assert rp.validate_issuer("https://op.example.com/path") is None
+    assert rp.validate_service_endpoint("t", "https://op.example.com/path") is None
+    assert rp.validate_redirect_uri_syntax("com.example.app:/cb") is None

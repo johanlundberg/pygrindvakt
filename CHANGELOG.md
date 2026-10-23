@@ -9,8 +9,55 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## Unreleased
 
+### Added
+
+- `rp.validate_issuer`, `rp.validate_redirect_uri_syntax` and
+  `rp.validate_service_endpoint(name, endpoint, issuer=None, *, allow_loopback_http=False)`: the core
+  syntax validators. `validate_issuer` and `validate_service_endpoint` raise
+  `ConfigError` (integrator config / provider metadata);
+  `validate_redirect_uri_syntax` raises `BadRequestError` (it can validate
+  request input). They check shape only and establish no trust;
+  `validate_redirect_uri_syntax` additionally rejects whitespace, control,
+  bidi and invisible formatting characters and userinfo (binding-side
+  hardening, stricter than core 0.9, also applied to `RpClient`
+  `redirect_uris` / `post_logout_redirect_uris` and per-request overrides);
+  `validate_redirect_uri_syntax` does not check the scheme (`javascript:` may
+  pass). It is the syntax step of `RpClient`'s registration, exact-match and
+  transport checks (ADR 0004), not a registration policy: it is not for
+  vetting client registrations on an OP, which needs a scheme allow-list and
+  exact-match comparison of its own.
+  All three also reject backslashes (the URL parser would reinterpret them
+  as `/`, so the parsed authority differs from the raw string, for example
+  `https://evil.example\@op.example.com`); the same gate covers
+  `RpClient` / `JwksCache` / metadata issuer and endpoint URLs and
+  `OAuthError.to_redirect`. Compare issuers byte-for-byte (exact string
+  match); never suffix/substring checks.
+  `validate_service_endpoint` is strict by default (`https` only). The
+  loopback-`http` development exception is opt-in via the keyword-only
+  `allow_loopback_http=True`, which requires `issuer`: the authenticated,
+  locally configured issuer, never taken from the document being validated.
+  A loopback-`http` issuer then permits loopback endpoints on any port, and
+  accepting a plain `http` endpoint emits a `UserWarning`. Without the opt-in,
+  a given `issuer` is still validated (invalid raises `ConfigError`) but never
+  enables `http`.
+- `rp.MAX_ID_TOKEN_LEEWAY` (300), the cap `verify_id_token` enforces on
+  `leeway`, and `rp.asymmetric_algorithms()`, a fixed list of the
+  classical asymmetric JWS algorithm names the library parses (no `HS*`,
+  `none` or post-quantum names). It is a parser probe, not a recommended
+  allowlist, and includes `EdDSA`, which has no OIDC token hash.
+- `jwt.oidc_token_hash(alg, value)` and `jwt.supports_oidc_token_hash(alg)`
+  for computing `at_hash` / `c_hash`. Computing is not verifying.
+  `oidc_token_hash` raises `CryptoError` for an unknown or unparseable `alg`
+  (like the other `jwt.*` primitives) and for `EdDSA`;
+  `supports_oidc_token_hash` returns `False` for both and never raises.
+
 ### Changed
 
+- `OAuthError.to_redirect` now raises `BadRequestError` when the base redirect
+  URI contains whitespace/control/bidi/invisible characters or userinfo, is
+  unparsable, or has a fragment (header-injection guard); it still does NOT
+  check that the URI is registered or that the scheme is acceptable — the
+  caller must have exact-matched it against the client's registered URIs first.
 - The Flask RP example and the RP/security guides map a failed login to 503
   (`retryable`), 401 (`auth_failure`) or 400 instead of a fixed 502.
 - `BadRequestError` and `ConfigError` now also derive from `ValueError` (MRO:

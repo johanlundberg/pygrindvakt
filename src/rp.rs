@@ -30,7 +30,8 @@ use grindvakt::rp::ClientAuth;
 
 use crate::convert::{from_py, new_submodule, to_py, warn};
 use crate::errors::{
-    config_err, config_from, err, with_code, AuthnError, InternalError, UnknownKeyError,
+    config_err, config_from, err, is_invisible_format, with_code, AuthnError, InternalError,
+    UnknownKeyError,
 };
 use crate::http::extract_http_client;
 use crate::jwt::jwks_from_py;
@@ -100,6 +101,10 @@ fn check_end_session_endpoint(
     issuer: &str,
     allow_cross_origin: bool,
 ) -> Result<(), EndSessionReject> {
+    for raw in [endpoint, issuer] {
+        reject_reinterpreted_url_chars("end_session_endpoint", raw)
+            .map_err(EndSessionReject::Unsafe)?;
+    }
     grp::validate_service_endpoint_for_issuer("end_session_endpoint", endpoint, issuer)
         .map_err(EndSessionReject::Unsafe)?;
     if !allow_cross_origin && !same_origin(endpoint, issuer) {
@@ -359,6 +364,48 @@ pub struct RpClient {
     pub allow_unregistered_redirect_uri: bool,
 }
 
+/// Reject a backslash anywhere in a raw URL string. The `url` crate treats `\`
+/// as `/` for special schemes, so `https://evil.example\@op.example.com`
+/// parses with host `evil.example` and an empty username while the raw string
+/// still ends in the trusted host. The message is fixed: the input is never
+/// echoed.
+pub(crate) fn reject_reinterpreted_url_chars(name: &str, raw: &str) -> Result<(), RsError> {
+    if raw.contains('\\') {
+        return Err(RsError::BadRequest(format!(
+            "{name} must not contain a backslash"
+        )));
+    }
+    Ok(())
+}
+
+/// Binding-side redirect URI syntax check; every redirect URI in this module
+/// goes through it. Stricter than core's `validate_redirect_uri_syntax`, which
+/// parses with the `url` crate (that strips tab/CR/LF) while the raw string is
+/// what gets stored and echoed (for example into a `Location` header).
+/// Rejects whitespace, control, bidi and invisible formatting characters,
+/// then userinfo, then applies core's parse + no-fragment rule. The offending
+/// value is never echoed. Custom-scheme URIs without an authority pass.
+pub(crate) fn check_redirect_uri(uri: &str) -> Result<(), RsError> {
+    reject_reinterpreted_url_chars("redirect_uri", uri)?;
+    if uri
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || is_invisible_format(c))
+    {
+        return Err(RsError::BadRequest(
+            "redirect_uri must not contain whitespace, control, bidi or invisible formatting characters"
+                .into(),
+        ));
+    }
+    if let Ok(u) = url::Url::parse(uri) {
+        if !u.username().is_empty() || u.password().is_some() {
+            return Err(RsError::BadRequest(
+                "redirect_uri must not contain userinfo".into(),
+            ));
+        }
+    }
+    grp::validate_redirect_uri_syntax(uri)
+}
+
 /// Reject plain `http` to a non-loopback host. `https`, loopback `http` and
 /// custom / private-use schemes (native apps) pass.
 fn check_redirect_uri_transport(uri: &str) -> Result<(), RsError> {
@@ -409,12 +456,12 @@ impl RpClient {
     ) -> PyResult<Self> {
         let redirect_uris = redirect_uris.unwrap_or_default();
         for uri in &redirect_uris {
-            grp::validate_redirect_uri_syntax(uri).map_err(config_from)?;
+            check_redirect_uri(uri).map_err(config_from)?;
             check_redirect_uri_transport(uri).map_err(config_from)?;
         }
         let post_logout_redirect_uris = post_logout_redirect_uris.unwrap_or_default();
         for uri in &post_logout_redirect_uris {
-            grp::validate_redirect_uri_syntax(uri).map_err(config_from)?;
+            check_redirect_uri(uri).map_err(config_from)?;
         }
         let auth = resolve_client_auth(auth_method, client_secret, signing_key)?;
         Ok(Self {
@@ -569,7 +616,7 @@ fn effective_client(client: &RpClient, redirect_uri: Option<String>) -> PyResult
                             .into(),
                     )));
                 }
-                grp::validate_redirect_uri_syntax(&r).map_err(err)?;
+                check_redirect_uri(&r).map_err(err)?;
                 check_redirect_uri_transport(&r).map_err(err)?;
             }
             inner.redirect_uri = r;
@@ -872,7 +919,7 @@ fn end_session_url(
         non_empty(name, v)?;
     }
     if let Some(uri) = post_logout_redirect_uri {
-        grp::validate_redirect_uri_syntax(uri).map_err(err)?;
+        check_redirect_uri(uri).map_err(err)?;
         // Exact match against the client's registration, never the caller's
         // say-so: otherwise a request-supplied value makes logout an open
         // redirect that also carries `id_token_hint`.
@@ -1604,6 +1651,8 @@ impl JwksCache {
     ) -> PyResult<Self> {
         // Validate the client and the URLs now rather than on first use.
         extract_http_client(http)?;
+        reject_reinterpreted_url_chars("issuer", &issuer).map_err(config_from)?;
+        reject_reinterpreted_url_chars("jwks_uri", &jwks_uri).map_err(config_from)?;
         grp::validate_issuer(&issuer).map_err(config_from)?;
         grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer)
             .map_err(config_from)?;
@@ -1917,6 +1966,142 @@ fn claims_to_attributes(claims: &Bound<'_, PyAny>) -> PyResult<BTreeMap<String, 
     Ok(grp::claims_to_attributes(&v))
 }
 
+/// Largest `leeway` (seconds) `verify_id_token` accepts; a larger value raises
+/// `ConfigError`. A cap on skew tolerance, not a recommended value.
+const MAX_ID_TOKEN_LEEWAY: u64 = grp::MAX_ID_TOKEN_LEEWAY;
+
+/// Check the syntax of an issuer identifier.
+///
+/// Requires an absolute `https` URL (`http` only for loopback hosts) with no
+/// userinfo, query, fragment, whitespace, control or invisible characters.
+/// Raises `ConfigError` (a `ValueError`, `status_hint` 500) otherwise: the
+/// issuer is integrator configuration or provider metadata, not request
+/// input. It checks syntax only: it does NOT establish that the issuer is
+/// trusted, nor that it matches any discovery metadata. Backslashes are
+/// rejected: the URL parser would reinterpret them as `/`, so the parsed
+/// authority would differ from the raw string. Compare issuers byte-for-byte
+/// (exact string match); never suffix/substring checks.
+#[pyfunction]
+fn validate_issuer(issuer: &str) -> PyResult<()> {
+    reject_reinterpreted_url_chars("issuer", issuer).map_err(config_from)?;
+    grp::validate_issuer(issuer).map_err(config_from)
+}
+
+/// Check the syntax of a redirect URI.
+///
+/// Requires an absolute URL without a fragment (upstream's rule) and, as
+/// binding-side hardening stricter than core 0.9, rejects whitespace,
+/// control, bidi and invisible formatting characters and userinfo
+/// (`https://good.example@evil.example/cb`). Raises `BadRequestError`
+/// otherwise (not `ConfigError`: a redirect URI can come from a request).
+/// This checks syntax only. The scheme is NOT checked, so custom/native-app
+/// schemes such as `com.example.app:/cb` pass, and so do `javascript:`,
+/// `file:` and `http://attacker.example/cb`.
+///
+/// It is the syntax step of `RpClient`'s redirect URI handling, which also
+/// requires registration, exact-string comparison and a transport check
+/// (ADR 0004). It is NOT a registration policy and does NOT make a URI safe
+/// to register or redirect to. Do not use it to vet client registrations on
+/// an OP: this library provides no OP-side registration policy, so apply an
+/// https or scheme allow-list and compare by EXACT match yourself.
+///
+/// Backslashes are rejected: the URL parser would reinterpret them as `/`,
+/// making the parsed authority differ from the raw string.
+#[pyfunction]
+fn validate_redirect_uri_syntax(redirect_uri: &str) -> PyResult<()> {
+    check_redirect_uri(redirect_uri).map_err(err)
+}
+
+/// The loopback `http` development exception is opt-in: pass
+/// `allow_loopback_http=True` AND `issuer`, which must be the authenticated,
+/// locally configured issuer, never a value taken from the document being
+/// validated. A loopback `http` issuer then permits loopback `http` endpoints
+/// on ANY port.
+///
+/// Checks that a metadata endpoint is an absolute `https` URL. `name` appears
+/// in the error message. By default (`allow_loopback_http=False`) only `https`
+/// passes; if `issuer` is given it is still validated first (as
+/// `validate_issuer`, so an invalid issuer fails closed) but never enables
+/// loopback `http`. With `allow_loopback_http=True`, `issuer` is required
+/// (`ConfigError` otherwise), and loopback `http` is also allowed when the
+/// issuer is itself a loopback `http` origin; a `UserWarning` is emitted
+/// whenever a plain `http` endpoint is accepted that way. Raises
+/// `ConfigError` (a `ValueError`, `status_hint` 500) otherwise: endpoints come
+/// from integrator configuration or provider metadata, not request input. It
+/// does NOT check same-origin with the issuer (it never compares hosts) or
+/// establish trust. Backslashes in `endpoint` or `issuer` are rejected: the
+/// URL parser would reinterpret them as `/`, making the parsed authority
+/// differ from the raw string. Compare issuers byte-for-byte (exact string
+/// match); never suffix/substring checks.
+#[pyfunction]
+#[pyo3(signature = (name, endpoint, issuer = None, *, allow_loopback_http = false))]
+fn validate_service_endpoint(
+    py: Python<'_>,
+    name: &str,
+    endpoint: &str,
+    issuer: Option<&str>,
+    allow_loopback_http: bool,
+) -> PyResult<()> {
+    reject_reinterpreted_url_chars(name, endpoint).map_err(config_from)?;
+    if let Some(issuer) = issuer {
+        reject_reinterpreted_url_chars("issuer", issuer).map_err(config_from)?;
+        grp::validate_issuer(issuer).map_err(config_from)?;
+    }
+    if !allow_loopback_http {
+        return grp::validate_service_endpoint(name, endpoint).map_err(config_from);
+    }
+    let Some(issuer) = issuer else {
+        return Err(config_err(
+            "validate_service_endpoint: allow_loopback_http=True requires issuer",
+        ));
+    };
+    grp::validate_service_endpoint_for_issuer(name, endpoint, issuer).map_err(config_from)?;
+    let is_http = endpoint
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http:"));
+    if is_http {
+        warn(
+            py,
+            &format!(
+                "validate_service_endpoint: plain http {name} accepted only because \
+                 allow_loopback_http=True was requested explicitly and the issuer is a \
+                 loopback http origin; this is a development-only exception that allows \
+                 loopback endpoints on any port. The issuer must be the one you configured \
+                 and authenticated, never the `issuer` field of an unauthenticated document"
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// A FIXED list of the classical asymmetric JWS algorithm names the library
+/// parses: `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `ES256K` and
+/// `EdDSA`. `HS*` and `none` are never included. Post-quantum names (ML-DSA,
+/// feature-gated in jose-rs) are NOT included even if this build parses them.
+///
+/// It is a parser probe, not a recommended allowlist, not a list an OP
+/// advertises, and not what is appropriate for your deployment; pass an
+/// explicit allowlist to `verify_id_token`. It includes `EdDSA`, for which
+/// `jwt.supports_oidc_token_hash` is False, so
+/// `allowed_algorithms=rp.asymmetric_algorithms()` with `strict_hashes=True`
+/// on a flow that needs `at_hash` / `c_hash` is unsatisfiable for EdDSA
+/// tokens: filter with `jwt.supports_oidc_token_hash` or pass an explicit
+/// allowlist.
+#[pyfunction]
+fn asymmetric_algorithms() -> Vec<&'static str> {
+    // Fixed candidate list (RFC 7518 / RFC 8037 / RFC 8812 names). No `HS*` or
+    // `none` name is in it. Each candidate is probed through the library's own
+    // parser, so a name this build cannot parse is dropped.
+    const CANDIDATES: [&str; 11] = [
+        "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "ES256K",
+        "EdDSA",
+    ];
+    CANDIDATES
+        .into_iter()
+        .filter(|name| JwsAlgorithm::from_str(name).is_ok())
+        .collect()
+}
+
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = new_submodule(py, parent, "rp")?;
     m.add_class::<ProviderInfo>()?;
@@ -1934,5 +2119,10 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fetch_userinfo, &m)?)?;
     m.add_function(wrap_pyfunction!(build_client_assertion, &m)?)?;
     m.add_function(wrap_pyfunction!(claims_to_attributes, &m)?)?;
+    m.add_function(wrap_pyfunction!(validate_issuer, &m)?)?;
+    m.add_function(wrap_pyfunction!(validate_redirect_uri_syntax, &m)?)?;
+    m.add_function(wrap_pyfunction!(validate_service_endpoint, &m)?)?;
+    m.add_function(wrap_pyfunction!(asymmetric_algorithms, &m)?)?;
+    m.add("MAX_ID_TOKEN_LEEWAY", MAX_ID_TOKEN_LEEWAY)?;
     Ok(())
 }

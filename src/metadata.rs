@@ -96,12 +96,17 @@ fn is_url_member(key: &str) -> bool {
 /// Validate an endpoint URL against the metadata's issuer (absolute, https or
 /// loopback http, no fragment, no userinfo). Raises `ConfigError`.
 fn validate_url_member(key: &str, url: &str, issuer: &str) -> PyResult<()> {
+    crate::rp::reject_reinterpreted_url_chars(key, url)
+        .and_then(|()| crate::rp::reject_reinterpreted_url_chars("issuer", issuer))
+        .map_err(|e| config_err(format!("metadata field {key:?}: {e}")))?;
     grindvakt::rp::validate_service_endpoint_for_issuer(key, url, issuer)
         .map_err(|e| config_err(format!("metadata field {key:?}: {e}")))
 }
 
 /// Validate the issuer itself (it decides whether loopback http is allowed).
 fn validate_issuer_value(issuer: &str) -> PyResult<()> {
+    crate::rp::reject_reinterpreted_url_chars("issuer", issuer)
+        .map_err(|e| config_err(format!("metadata field \"issuer\": {e}")))?;
     grindvakt::rp::validate_issuer(issuer)
         .map_err(|e| config_err(format!("metadata field \"issuer\": {e}")))
 }

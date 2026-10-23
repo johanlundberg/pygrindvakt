@@ -493,6 +493,17 @@ OAuthError
       succeeded for that request. Redirecting to an unvalidated URI turns
       your OP into an open redirector.
 
+      As a header-injection guard the base ``redirect_uri`` is syntax-checked
+      before the response is built. :class:`BadRequestError` is raised if it
+      contains whitespace, control, bidi or invisible formatting characters or
+      userinfo, is unparsable, or has a fragment; the message never echoes the
+      value. This does **not** check that the URI is registered or that its
+      scheme is acceptable: exact-match it against the client's registered
+      URIs first.
+
+      .. versionchanged:: 0.3.0
+         Raises :class:`BadRequestError` for an invalid base ``redirect_uri``.
+
 DPoP errors
 -----------
 

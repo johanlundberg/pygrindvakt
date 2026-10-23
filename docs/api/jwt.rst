@@ -105,6 +105,49 @@ Inspection without verification
       Inspection only, for example reading ``iss`` to decide which JWKS to
       fetch. Never make a decision on these values; verify first.
 
+OIDC token hashes
+-----------------
+
+.. py:function:: oidc_token_hash(alg: str, value: str) -> str
+
+   Compute the OIDC Core ``at_hash`` / ``c_hash`` value for ``value``: the
+   left half of the SHA-2 digest matching the JWS ``alg`` (SHA-256 for
+   ``RS256`` / ``PS256`` / ``ES256`` / ``ES256K``, SHA-384 for the ``*384``
+   algorithms, SHA-512 for the ``*512`` ones), base64url-encoded without
+   padding. ``HS256`` / ``HS384`` / ``HS512`` work too (same SHA family). An
+   unknown or unparseable ``alg``, and an algorithm with no defined hash,
+   such as ``EdDSA``, both raise :class:`pygrindvakt.CryptoError` (use
+   :func:`supports_oidc_token_hash` to check first).
+
+   .. warning::
+
+      This only **computes** the value; it is **not** verification. Compare
+      the result in constant time (for example with
+      :func:`pygrindvakt.mac.constant_time_eq`) with the claim yourself, or
+      use the ``at_hash`` / ``c_hash`` checks of
+      :func:`pygrindvakt.rp.verify_id_token`.
+
+   .. versionadded:: 0.3.0
+
+.. py:function:: supports_oidc_token_hash(alg: str) -> bool
+
+   Whether OIDC Core defines a token-hash function for the JWS ``alg``, that
+   is, whether :func:`oidc_token_hash` succeeds for it. ``False`` for
+   ``EdDSA`` and for an unrecognised ``alg`` name; it is a predicate and never
+   raises.
+
+   .. versionadded:: 0.3.0
+
+Which error class? Configuration values (issuer, service endpoints,
+``auth_method``, TTLs, and the algorithm allow-lists passed to ``rp.*``) raise
+:class:`pygrindvakt.ConfigError`. Per-request inputs (a redirect URI override,
+``rp.validate_redirect_uri_syntax``, the OAuth error redirect base) raise
+:class:`pygrindvakt.BadRequestError`. Algorithm names handed to the ``jwt.*``
+primitives (``sign``, ``verify_*``, ``oidc_token_hash``) raise
+:class:`pygrindvakt.CryptoError`. ``ConfigError`` and ``BadRequestError`` are
+both ``ValueError``, so ``except ValueError`` catches either and hides the
+distinction; branch on the class instead.
+
 Example
 -------
 

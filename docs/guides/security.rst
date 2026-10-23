@@ -253,6 +253,11 @@ open redirector and a phishing tool.
 Matching is exact, with no prefix or wildcard support, and there is no
 ``localhost`` exception.
 
+As a last guard, ``to_redirect()`` raises ``BadRequestError`` if the base
+contains whitespace, control, bidi or invisible characters or userinfo, is
+unparsable, or has a fragment (``Location`` header injection). It does not
+check registration; the exact match above remains your job.
+
 **Outbound (HTTP client).** The built-in client refuses to follow redirects,
 because a 307 / 308 from a token endpoint would re-send the form body
 (``client_secret``, the authorization code, a ``client_assertion``) to
