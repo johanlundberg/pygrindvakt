@@ -79,6 +79,16 @@ Inbound request
    lower-cased. ``form`` is the parsed ``application/x-www-form-urlencoded``
    body; ``body`` is the raw bytes. Every attribute is readable and writable.
 
+   ``query`` and ``form`` accept a ``dict`` (or any mapping) or a list of
+   ``(str, str)`` pairs, in the constructor and the setters. For
+   authorization-response parameters build them from pairs
+   (``request.args.items(multi=True)``): a mapping, for example
+   ``request.args.to_dict()``, keeps one value per name. The instance
+   remembers whether each channel was last set from a mapping, and
+   :func:`pygrindvakt.rp.parse_authorization_response` raises
+   :class:`TypeError` when the channel it reads is non-empty and was set from a
+   mapping. The ``query`` / ``form`` getters and :meth:`param` are unchanged.
+
    .. py:attribute:: path
       :type: str
    .. py:attribute:: method

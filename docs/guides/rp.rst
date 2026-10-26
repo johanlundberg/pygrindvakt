@@ -145,14 +145,17 @@ a signed request object:
 The callback: exchange and verify
 ---------------------------------
 
-On the callback, check ``state`` first and pop the session entry so it can be
-used only once. Then exchange the code with the stored verifier and verify the
+On the callback, parse the response with
+:func:`~pygrindvakt.rp.parse_authorization_response`, then check ``state``
+against the session entry (popped so it can be used only once) with
+:meth:`~pygrindvakt.rp.AuthorizationResponse.matches_state` and ``iss``
+with :meth:`~pygrindvakt.rp.AuthorizationResponse.matches_iss`. Then exchange the code with the stored verifier and verify the
 id_token against the issuer, your ``client_id`` and the stored nonce, using the
 process-wide :class:`~pygrindvakt.rp.JwksCache`.
 
 .. code-block:: python
 
-   from pygrindvakt import AuthnError, ConfigError, GrindvaktError
+   from pygrindvakt import AuthnError, BadRequestError, ConfigError, GrindvaktError
 
    # Created once at startup, next to `info`; thread-safe, shared by all requests.
    jwks_cache = rp.JwksCache(http_client, info.jwks_uri, info.issuer)
@@ -160,13 +163,22 @@ process-wide :class:`~pygrindvakt.rp.JwksCache`.
    @app.get("/callback")
    def callback():
        pending = session.pop("oidc", None)
-       if pending is None or request.args.get("state") != pending["state"]:
+       try:
+           # items(multi=True) keeps duplicates; a plain dict would hide them.
+           resp = rp.parse_authorization_response(list(request.args.items(multi=True)))
+       except BadRequestError as e:
+           log.warning("bad callback: %s", e.log_summary)
+           abort(400)
+       # The parse proves nothing: state and iss are still ours to check.
+       if pending is None or not resp.matches_state(pending["state"]):
            abort(400)                                        # not our flow
-       if "error" in request.args:
-           log.warning("OP returned %s", request.args["error"])
+       if not resp.matches_iss(info.issuer):
+           abort(400)                                        # wrong OP or missing iss (RFC 9207)
+       if resp.is_error:
+           log.warning("OP returned %s: %s", resp.error, resp.error_description_safe)
            return render_template("login_failed.html")
        try:
-           ts = rp.exchange_code(http_client, info, me, request.args["code"], code_verifier=pending["verifier"])
+           ts = rp.exchange_code(http_client, info, me, resp.code, code_verifier=pending["verifier"])
            claims = rp.verify_id_token(
                jwks_cache, ts.id_token, info.issuer, me.client_id,
                pending["nonce"], ["ES256"],
@@ -181,6 +193,40 @@ process-wide :class:`~pygrindvakt.rp.JwksCache`.
            return render_template("login_failed.html"), 401 if e.auth_failure else 400
        session["user"] = {"sub": claims["sub"], "email": claims.get("email")}
        return redirect("/")
+
+:func:`~pygrindvakt.rp.parse_authorization_response` replaces hand-written
+``request.args`` handling. It refuses repeated parameters, a response with
+both or neither of ``code`` and ``error``, control, bidi or invisible
+characters and values over 2048 characters in ``code`` / ``state`` / ``iss``,
+a malformed ``error`` and a JARM ``response`` (see
+`ADR 0007 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0007-authorization-response-parsing.md>`_).
+It proves nothing by itself: you still call ``matches_state`` (constant
+time) and ``matches_iss``, always before exchanging the code. Both fail
+closed. ``matches_state`` keeps ``required=True`` because ``rp.authorization_url``
+and ``rp.begin`` always send ``state`` (RFC 6749 section 10.12); pass
+``required=False`` only for a request you deliberately built without it. A
+response without ``iss`` does not match. Only if the OP metadata does **not** advertise
+``authorization_response_iss_parameter_supported`` (RFC 9207 section 2.4) may you
+pass ``required=False`` so that a missing ``iss`` is tolerated; a present
+``iss`` is always compared exactly. Log
+``error_description_safe``, never the raw ``error_description`` (the binding
+does not expose it: it is provider-controlled text). Treat ``error_uri`` as
+untrusted: do not follow it or render it as a link (it is kept only as an
+https URL, or plain http for loopback). Unknown error codes are
+kept (``error_known`` is false) so they can be logged and shown as a generic
+failure. ``error_known`` is wider than what
+:class:`~pygrindvakt.OAuthError` accepts, so do not rebuild an ``OAuthError``
+from ``resp.error``: ``OAuthError("consent_required")`` raises
+``ValueError``. Branch on the string instead, for example
+``if resp.error == "access_denied": ...`` (and ``login_required`` /
+``interaction_required`` for a silent ``prompt=none`` attempt). For a ``response_mode=form_post`` callback pass the
+:class:`~pygrindvakt.http.HttpRequestData` of the ``POST`` instead (with its
+form already parsed). A werkzeug ``request.args`` can also be passed directly;
+a plain ``dict`` is refused. When building an
+:class:`~pygrindvakt.http.HttpRequestData` for the parser, pass ``query`` /
+``form`` as a list of pairs (``request.args.items(multi=True)``), not a
+``dict`` such as ``request.args.to_dict()``: a mapping-built channel raises
+``TypeError`` because it has already dropped duplicate parameters.
 
 :class:`~pygrindvakt.ConfigError` is handled before the generic branch, so a
 broken deployment never looks like a failed login. In the generic branch the
@@ -532,8 +578,9 @@ origin-checked.
 Security notes
 --------------
 
-* Check ``state`` before touching anything else on the callback, and pop the
-  session entry so it cannot be reused.
+* Parse the callback with :func:`~pygrindvakt.rp.parse_authorization_response`,
+  check ``state`` (constant time) before touching anything else, and pop the
+  session entry so it cannot be reused. Compare ``iss`` with ``matches_iss``.
 * Always pass the stored nonce; never ``unsafe_skip_nonce_check`` in a code
   flow.
 * Prefer ``private_key_jwt``; load the key from a file or HSM, not source.

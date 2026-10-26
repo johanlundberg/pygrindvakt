@@ -18,9 +18,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use grindvakt::http::{HttpClient, HttpFetchResponse};
 use grindvakt::Error as RsError;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule, PyTuple};
+use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyTuple};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::jose_rs::jwk::JwkSet;
@@ -28,10 +28,10 @@ use grindvakt::jwt as gj;
 use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
-use crate::convert::{from_py, new_submodule, to_py, warn};
+use crate::convert::{from_py, new_submodule, protocol_parameter_pairs, to_py, warn};
 use crate::errors::{
-    config_err, config_from, err, is_invisible_format, with_code, AuthnError, InternalError,
-    UnknownKeyError,
+    config_err, config_from, err, escape_untrusted_quoted, escape_untrusted_text,
+    is_invisible_format, with_code, AuthnError, InternalError, UnknownKeyError,
 };
 use crate::http::extract_http_client;
 use crate::jwt::{drop_oct_keys, is_mac, jwks_from_py, prepare_mac_keys, KeySelection};
@@ -2176,11 +2176,530 @@ fn asymmetric_algorithms() -> Vec<&'static str> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Authorization response (callback) parsing
+// ---------------------------------------------------------------------------
+
+/// Parameters this parser owns; each may appear at most once, and none may
+/// ride in the query string of a `form_post` callback.
+const RESPONSE_PARAMS: [&str; 7] = [
+    "code",
+    "state",
+    "error",
+    "error_description",
+    "error_uri",
+    "iss",
+    "response",
+];
+
+/// Every `error` code `AuthorizationResponse.error_known` treats as known: the
+/// union of RFC 6749 sections 4.1.2.1 and 5.2, OIDC Core 1.0 section 3.1.2.6,
+/// the JAR / registration codes an authorization endpoint may return, and
+/// every code `parse_oauth_code` (errors.rs) recognises (`login_required`,
+/// `invalid_dpop_proof`). Keep it a SUPERSET of `parse_oauth_code`.
+///
+/// "Known" here is WIDER than what `OAuthError(...)` accepts: `parse_oauth_code`
+/// knows only 12 codes, so e.g. `consent_required` is known but
+/// `OAuthError("consent_required")` raises `ValueError`. Never build an
+/// `OAuthError` from a callback value without catching `ValueError`.
+const KNOWN_ERROR_CODES: [&str; 20] = [
+    // RFC 6749 sections 4.1.2.1 and 5.2.
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "unsupported_response_type",
+    "invalid_scope",
+    "access_denied",
+    "server_error",
+    "temporarily_unavailable",
+    // OIDC Core section 3.1.2.6 and JAR / registration.
+    "login_required",
+    "interaction_required",
+    "account_selection_required",
+    "consent_required",
+    "invalid_request_uri",
+    "invalid_request_object",
+    "request_not_supported",
+    "request_uri_not_supported",
+    "registration_not_supported",
+    // RFC 9449 (DPoP).
+    "invalid_dpop_proof",
+];
+
+/// Cap (characters) of `code`, `state` and `iss`, and the raw `error_uri`.
+const RESPONSE_VALUE_MAX: usize = 2048;
+
+/// Cap (characters) of the JARM `response` JWT.
+const RESPONSE_JARM_MAX: usize = 32768;
+
+/// Cap (characters) of `AuthorizationResponse.error_description_safe`.
+const ERROR_DESCRIPTION_SAFE_MAX: usize = 256;
+
+fn bad_response(msg: impl Into<String>) -> PyErr {
+    err(RsError::BadRequest(msg.into()))
+}
+
+/// The callback of an authorization request, parsed and shape-checked.
+///
+/// Built by `parse_authorization_response`; there is no public constructor.
+/// Nothing in it is trusted: the response proves nothing until the caller has
+/// checked `state` with `matches_state` (constant time), compared `iss`
+/// with `matches_iss` (RFC 9207) and exchanged the code. The raw
+/// `error_description` is not available by design (it is provider-controlled
+/// text); only `error_description_safe` is. `error_uri` is exposed only when
+/// it is a safe absolute https URL (http only for loopback) and must never be followed or rendered as
+/// a link without your own validation. `repr()` never prints `code` or
+/// `state`.
+#[pyclass(
+    module = "pygrindvakt.rp",
+    name = "AuthorizationResponse",
+    frozen,
+    from_py_object
+)]
+#[derive(Clone)]
+pub struct AuthorizationResponse {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description_safe: Option<String>,
+    error_uri: Option<String>,
+    iss: Option<String>,
+    response: Option<String>,
+    response_mode: &'static str,
+    error_known: bool,
+}
+
+#[pymethods]
+impl AuthorizationResponse {
+    /// The authorization code, verbatim, or `None` for an error response.
+    #[getter]
+    fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+    /// The `state` echoed by the OP, verbatim. Check it with `matches_state`
+    /// (constant time) before anything else.
+    #[getter]
+    fn state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+    /// The OAuth error code (RFC 6749 charset, at most 64 characters), or
+    /// `None`. Unknown codes are kept; see `error_known`.
+    #[getter]
+    fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    /// `error_description` escaped (control, bidi and invisible characters)
+    /// and capped at 256 characters. The raw value is not exposed.
+    #[getter]
+    fn error_description_safe(&self) -> Option<&str> {
+        self.error_description_safe.as_deref()
+    }
+    /// `error_uri` if it is an absolute https URL (plain http only for
+    /// loopback hosts) with a host and no whitespace, control characters,
+    /// backslash or userinfo, at most 2048 characters; returned in its normalised form (what was validated).
+    /// Otherwise `None`. Untrusted.
+    #[getter]
+    fn error_uri(&self) -> Option<&str> {
+        self.error_uri.as_deref()
+    }
+    /// The RFC 9207 `iss` parameter, verbatim, or `None`. Compare it with
+    /// `matches_iss`.
+    #[getter]
+    fn iss(&self) -> Option<&str> {
+        self.iss.as_deref()
+    }
+    /// The raw JARM `response` JWT, at most 32768 characters. UNVERIFIED and
+    /// untrusted: the binding has no JARM support. Only set when
+    /// `accept_jarm=True` was passed.
+    #[getter]
+    fn response(&self) -> Option<&str> {
+        self.response.as_deref()
+    }
+    /// How the response arrived: `"query"`, `"fragment"` or `"form_post"`.
+    #[getter]
+    fn response_mode(&self) -> &str {
+        self.response_mode
+    }
+    /// True when the response carries an OAuth `error`.
+    #[getter]
+    fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+    /// True when `error` is a code the binding knows (RFC 6749, OIDC Core,
+    /// DPoP). Unknown codes are kept, never rejected. "Known" is WIDER than
+    /// what `OAuthError` accepts (8 response-only codes such as
+    /// `consent_required` are known but `OAuthError(...)` raises
+    /// `ValueError` for them): never construct `OAuthError(resp.error)` from a
+    /// callback value without catching `ValueError`; branch on the `error`
+    /// string instead.
+    #[getter]
+    fn error_known(&self) -> bool {
+        self.error_known
+    }
+
+    /// RFC 9207 issuer check, fail closed: exact, byte-for-byte comparison of
+    /// `iss` with `expected`. When the response has no `iss` the result is
+    /// `not required`, so False by default. Pass `required=False` ONLY when
+    /// the OP does not advertise `authorization_response_iss_parameter_supported`
+    /// (RFC 9207 section 2.4). An empty `expected` is a configuration fault
+    /// and always returns False, regardless of `required`. Never raises. The
+    /// caller MUST call it; parsing does not.
+    #[pyo3(signature = (expected, *, required = true))]
+    fn matches_iss(&self, expected: &str, required: bool) -> bool {
+        if expected.is_empty() {
+            return false;
+        }
+        match self.iss.as_deref() {
+            Some(iss) => iss == expected,
+            None => !required,
+        }
+    }
+
+    /// `state` check, fail closed: constant-time comparison of the UTF-8
+    /// bytes of the response `state` with `expected` (the value stored in the
+    /// session; RFC 6749 sections 4.1.2.3 and 10.12). When the response has
+    /// no `state` the result is `not required`, so False by default.
+    /// `rp.authorization_url` and `rp.begin` always send `state`, so keep
+    /// `required=True`; pass `required=False` only for a request deliberately
+    /// built without `state`. Never raises for a mismatch. The caller MUST
+    /// call it before exchanging the code; parsing does not. An empty
+    /// `expected` (no state stored in the session) always returns False,
+    /// regardless of `required`.
+    #[pyo3(signature = (expected, *, required = true))]
+    fn matches_state(&self, expected: &str, required: bool) -> bool {
+        if expected.is_empty() {
+            return false;
+        }
+        match self.state.as_deref() {
+            Some(state) => grindvakt::mac::constant_time_eq(state.as_bytes(), expected.as_bytes()),
+            None => !required,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        let quoted = |v: &Option<String>| match v {
+            Some(s) => format!("'{}'", escape_untrusted_quoted(s, 128)),
+            None => "None".to_string(),
+        };
+        let set = |v: &Option<String>| if v.is_some() { "<set>" } else { "None" };
+        format!(
+            "AuthorizationResponse(is_error={}, error={}, code={}, state={}, iss={}, response={}, response_mode='{}')",
+            if self.error.is_some() { "True" } else { "False" },
+            quoted(&self.error),
+            set(&self.code),
+            set(&self.state),
+            quoted(&self.iss),
+            set(&self.response),
+            self.response_mode,
+        )
+    }
+}
+
+fn response_mode_name(mode: &str) -> PyResult<&'static str> {
+    match mode {
+        "query" => Ok("query"),
+        "fragment" => Ok("fragment"),
+        "form_post" => Ok("form_post"),
+        other => Err(config_err(format!(
+            "response_mode must be \"query\", \"fragment\" or \"form_post\", got {:?}",
+            escape_untrusted_text(other, 32)
+        ))),
+    }
+}
+
+const SHAPES: &str = "an http.HttpRequestData, a list of (str, str) pairs, a \
+multi-dict mapping of str to list[str] (the urllib.parse.parse_qs shape), or an \
+object with a .lists() method such as a werkzeug MultiDict";
+
+/// Flatten `(name, [values])` items, keeping duplicates. A non-list value
+/// names its key in the `TypeError`.
+fn flatten_multi<'py>(
+    items: impl Iterator<Item = PyResult<Bound<'py, PyAny>>>,
+    owner: &Bound<'py, PyAny>,
+) -> PyResult<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for item in items {
+        let item = item?;
+        let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+        let key: String = k.extract().map_err(|_| {
+            PyTypeError::new_err("authorization response parameter names must be str")
+        })?;
+        if !(v.is_instance_of::<PyList>() || v.is_instance_of::<PyTuple>()) {
+            let subclass = !owner.is_exact_instance_of::<PyDict>();
+            let hint = if subclass {
+                format!(
+                    " ({} is a dict subclass whose items() yields one value per key; pass \
+                     request.args.items(multi=True) (a list of pairs) or request.args.lists())",
+                    owner.get_type().name()?
+                )
+            } else {
+                " (a plain dict discards duplicate parameters)".to_string()
+            };
+            return Err(PyTypeError::new_err(format!(
+                "params is a mapping with a non-list value for key '{}'{hint}; params must be {SHAPES}",
+                escape_untrusted_text(&key, 64)
+            )));
+        }
+        for value in v.try_iter()? {
+            let value: String = value?.extract().map_err(|_| {
+                PyTypeError::new_err("authorization response parameter values must be str")
+            })?;
+            pairs.push((key.clone(), value));
+        }
+    }
+    Ok(pairs)
+}
+
+/// Collect the ordered parameter pairs and the response mode of `params`.
+fn response_pairs(
+    params: &Bound<'_, PyAny>,
+    response_mode: Option<&str>,
+) -> PyResult<(Vec<(String, String)>, &'static str)> {
+    let requested = response_mode.map(response_mode_name).transpose()?;
+    if params.is_instance_of::<crate::http::HttpRequestData>() {
+        let request = params.extract::<PyRef<'_, crate::http::HttpRequestData>>()?;
+        let lossy = |name: &str| {
+            PyTypeError::new_err(format!(
+                "HttpRequestData.{name} was built from a mapping, which discards duplicate \
+                 authorization-response parameters; build it from a list of (str, str) pairs \
+                 (request.args.items(multi=True), request.GET.lists() flattened)"
+            ))
+        };
+        let method: String = params.getattr("method")?.extract()?;
+        let query: Vec<(String, String)> = params.getattr("query_pairs")?.extract()?;
+        let form: Vec<(String, String)> = params.getattr("form_pairs")?.extract()?;
+        let has_protocol =
+            |v: &[(String, String)]| v.iter().any(|(k, _)| RESPONSE_PARAMS.contains(&k.as_str()));
+        let (pairs, mode) = if method.eq_ignore_ascii_case("GET") {
+            if request.query_is_lossy() {
+                return Err(lossy("query"));
+            }
+            if has_protocol(&form) {
+                return Err(bad_response(
+                    "authorization response parameters must not appear in the body of a query callback",
+                ));
+            }
+            (query, "query")
+        } else if method.eq_ignore_ascii_case("POST") {
+            if request.form_is_lossy() {
+                return Err(lossy("form"));
+            }
+            if has_protocol(&query) {
+                return Err(bad_response(
+                    "authorization response parameters must not appear in the query string of a form_post callback",
+                ));
+            }
+            if form.is_empty() {
+                return Err(bad_response(
+                    "a form_post callback needs a form body: parse the form before building \
+                     the HttpRequestData (no form parameters were found)",
+                ));
+            }
+            (form, "form_post")
+        } else {
+            return Err(bad_response(
+                "an authorization response arrives by GET or POST",
+            ));
+        };
+        if let Some(r) = requested {
+            if r != mode {
+                return Err(config_err(format!(
+                    "response_mode {r:?} does not match the request ({method} is {mode:?}); \
+                     omit response_mode for an HttpRequestData"
+                )));
+            }
+        }
+        return Ok((pairs, mode));
+    }
+    let mode = requested.unwrap_or("query");
+    // Duck-typed multi-dict (werkzeug MultiDict): lists() yields (key, [values]).
+    if let Ok(lists) = params.getattr("lists") {
+        if lists.is_callable() {
+            let pairs = flatten_multi(lists.call0()?.try_iter()?, params)?;
+            return Ok((pairs, mode));
+        }
+    }
+    if let Ok(mapping) = params.cast::<PyMapping>() {
+        let pairs = flatten_multi(mapping.items()?.try_iter()?, params)?;
+        return Ok((pairs, mode));
+    }
+    let pairs = protocol_parameter_pairs(params, "params").map_err(|e| {
+        if e.is_instance_of::<PyTypeError>(params.py()) {
+            PyTypeError::new_err(format!("params must be {SHAPES}"))
+        } else {
+            e
+        }
+    })?;
+    Ok((pairs, mode))
+}
+
+/// Cap the length and reject control, backslash and bidi / invisible
+/// formatting characters in a value kept verbatim. The message never echoes
+/// the value.
+fn check_response_value(name: &str, v: &str) -> PyResult<()> {
+    if v.chars().count() > RESPONSE_VALUE_MAX {
+        return Err(bad_response(format!(
+            "{name} must be at most {RESPONSE_VALUE_MAX} characters"
+        )));
+    }
+    if v.chars()
+        .any(|c| c.is_control() || c == '\\' || is_invisible_format(c))
+    {
+        return Err(bad_response(format!(
+            "{name} must not contain control, bidi or invisible formatting characters or backslashes"
+        )));
+    }
+    Ok(())
+}
+
+/// RFC 6749 section 5.2: `error` is %x20-21 / %x23-5B / %x5D-7E.
+fn check_error_code(v: &str) -> PyResult<()> {
+    if v.chars().count() > 64
+        || !v
+            .bytes()
+            .all(|b| matches!(b, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+    {
+        return Err(bad_response(
+            "error must be at most 64 characters from the RFC 6749 section 5.2 set",
+        ));
+    }
+    Ok(())
+}
+
+/// `error_uri` survives only as a safe absolute http(s) URL.
+/// Returns the NORMALISED URL (`Url::as_str`), so what the caller sees is
+/// what was validated (`https:evil.example/x` becomes `https://evil.example/x`).
+fn safe_error_uri(uri: &str) -> Option<String> {
+    if uri.chars().count() > RESPONSE_VALUE_MAX {
+        return None;
+    }
+    check_redirect_uri(uri).ok()?;
+    let u = url::Url::parse(uri).ok()?;
+    let ok = matches!(u.scheme(), "http" | "https")
+        && check_redirect_uri_transport(u.as_str()).is_ok()
+        && u.host().is_some()
+        && u.username().is_empty()
+        && u.password().is_none();
+    ok.then(|| u.as_str().to_string())
+}
+
+/// Parse the authorization response (the callback) of an authorization
+/// request, fail closed.
+///
+/// `params` is an `http.HttpRequestData` (GET uses `query_pairs`, POST uses
+/// `form_pairs` with mode `form_post`; a protocol parameter in the other
+/// channel, the query string of a POST or the body of a GET, raises), an
+/// ordered list of `(str, str)` pairs, a multi-dict `{name: [values]}` like
+/// `urllib.parse.parse_qs` returns, or an object with a `.lists()` method
+/// (werkzeug `MultiDict`). A plain `dict[str, str]` raises `TypeError`
+/// because a mapping discards duplicate parameters. `response_mode` (`"query"`, `"fragment"` or
+/// `"form_post"`) labels list and multi-dict input; default `"query"`.
+///
+/// Raises `BadRequestError` for a repeated parameter, both or neither of
+/// `code` and `error`, an empty `code` / `state` / `error` / `iss`, control, bidi or
+/// invisible characters or backslashes in `code` / `state` / `iss`, a `code` /
+/// `state` / `iss` over 2048 characters (a JARM `response` over 32768), an `error` outside RFC 6749 section
+/// 5.2, and a JARM `response` unless `accept_jarm=True` (then it is exposed
+/// raw and UNVERIFIED, and must be the only protocol parameter; this binding
+/// has no JARM support, so verify the JWT yourself). Unknown error codes are
+/// kept.
+///
+/// The result proves nothing by itself: compare `state` with the session,
+/// check `iss` with `matches_iss`, then exchange the code.
+#[pyfunction]
+#[pyo3(signature = (params, *, response_mode = None, accept_jarm = false))]
+fn parse_authorization_response(
+    params: &Bound<'_, PyAny>,
+    response_mode: Option<&str>,
+    accept_jarm: bool,
+) -> PyResult<AuthorizationResponse> {
+    let (pairs, mode) = response_pairs(params, response_mode)?;
+    let mut found: BTreeMap<&str, String> = BTreeMap::new();
+    for (k, v) in pairs {
+        if let Some(name) = RESPONSE_PARAMS.iter().find(|n| **n == k) {
+            if found.insert(name, v).is_some() {
+                return Err(bad_response(format!("{name} must not be repeated")));
+            }
+        }
+    }
+    let mut take = |n: &str| found.remove(n);
+    let (code, state, error) = (take("code"), take("state"), take("error"));
+    let (description, uri) = (take("error_description"), take("error_uri"));
+    let (iss, response) = (take("iss"), take("response"));
+
+    if response.is_some() && !accept_jarm {
+        return Err(bad_response(
+            "JARM response parameter is not supported; pass accept_jarm=True only if you \
+             verify the JWT yourself",
+        ));
+    }
+    if response.is_some()
+        && [&code, &state, &error, &description, &uri, &iss]
+            .iter()
+            .any(|v| v.is_some())
+    {
+        return Err(bad_response(
+            "a JARM response carries every parameter inside the JWT: code, state, error, \
+             error_description, error_uri and iss must not appear alongside response",
+        ));
+    }
+    if code.is_some() && error.is_some() {
+        return Err(bad_response("code and error must not both be present"));
+    }
+    if code.is_none() && error.is_none() && response.is_none() {
+        return Err(bad_response("response has neither code nor error"));
+    }
+    for (name, v) in [
+        ("code", &code),
+        ("state", &state),
+        ("error", &error),
+        ("iss", &iss),
+    ] {
+        if v.as_deref() == Some("") {
+            return Err(bad_response(format!("{name} must not be empty")));
+        }
+    }
+    for (name, v) in [("code", &code), ("state", &state), ("iss", &iss)] {
+        if let Some(v) = v {
+            check_response_value(name, v)?;
+        }
+    }
+    if response
+        .as_deref()
+        .is_some_and(|r| r.chars().count() > RESPONSE_JARM_MAX)
+    {
+        return Err(bad_response(format!(
+            "response must be at most {RESPONSE_JARM_MAX} characters"
+        )));
+    }
+    if let Some(e) = &error {
+        check_error_code(e)?;
+    }
+    let error_known = error
+        .as_deref()
+        .is_some_and(|e| KNOWN_ERROR_CODES.contains(&e));
+    Ok(AuthorizationResponse {
+        code,
+        state,
+        error,
+        error_description_safe: description
+            .map(|d| escape_untrusted_text(&d, ERROR_DESCRIPTION_SAFE_MAX)),
+        error_uri: uri.and_then(|u| safe_error_uri(&u)),
+        iss,
+        response,
+        response_mode: mode,
+        error_known,
+    })
+}
+
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = new_submodule(py, parent, "rp")?;
     m.add_class::<ProviderInfo>()?;
     m.add_class::<RpClient>()?;
     m.add_class::<TokenSet>()?;
+    m.add_class::<AuthorizationResponse>()?;
     m.add_class::<JwksCache>()?;
     m.add_function(wrap_pyfunction!(authorization_url, &m)?)?;
     m.add_function(wrap_pyfunction!(signed_request_object, &m)?)?;
@@ -2197,6 +2716,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_redirect_uri_syntax, &m)?)?;
     m.add_function(wrap_pyfunction!(validate_service_endpoint, &m)?)?;
     m.add_function(wrap_pyfunction!(asymmetric_algorithms, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_authorization_response, &m)?)?;
     m.add("MAX_ID_TOKEN_LEEWAY", MAX_ID_TOKEN_LEEWAY)?;
     Ok(())
 }

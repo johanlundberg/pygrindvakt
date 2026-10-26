@@ -17,7 +17,7 @@ import os
 import threading
 import time
 import warnings
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import pytest
 from pygrindvakt import (
@@ -40,6 +40,7 @@ from pygrindvakt import (
     tokens,
     util,
 )
+from pygrindvakt import http as pyhttp
 
 ISSUER = "https://op.example.com"
 CLIENT_ID = "demo"
@@ -2631,3 +2632,545 @@ def test_fetch_jwks_drops_uppercase_oct_kty(op, op_key):
     with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored"):
         jwks = rp.fetch_jwks(UpperOct(op), f"{ISSUER}/jwks", ISSUER)
     assert all(k["kty"] != "OCT" for k in jwks["keys"])
+
+
+# --- authorization response (callback) parsing ---------------------------------
+
+
+def _parse(pairs, **kw):
+    return rp.parse_authorization_response(pairs, **kw)
+
+
+def test_authorization_response_round_trip_with_provider(op, prov, rpc):
+    """A real OP redirect parses; state round-trips and the code is exchangeable."""
+    state, verifier = "st-123", "v" * 48
+    url = rp.authorization_url(prov, rpc, state, "n-1", pkce.s256_challenge(verifier))
+    req = request.AuthorizationRequest.from_params(parse_qsl(urlsplit(url).query))
+    op.validate_authorization_request(req)
+    resp = op.authorization_redirect(req, "alice", {"email": ["a@b"]})
+    pairs = parse_qsl(urlsplit(resp.header("location")).query, keep_blank_values=True)
+    parsed = rp.parse_authorization_response(pairs)
+    assert not parsed.is_error
+    assert parsed.state == state and parsed.matches_state(state)
+    assert not parsed.matches_state("st-124")
+    assert parsed.code and parsed.error is None
+    assert parsed.response_mode == "query"
+    # This in-process Provider does not emit RFC 9207 `iss`; absent fails
+    # closed unless the caller opts out (OP does not advertise the parameter).
+    assert parsed.iss is None
+    assert not parsed.matches_iss(ISSUER)
+    assert parsed.matches_iss(ISSUER, required=False)
+    with_iss = rp.parse_authorization_response([*pairs, ("iss", ISSUER)])
+    assert with_iss.matches_iss(ISSUER)
+    # The code is usable.
+    ts = rp.exchange_code(FakeHttpClient(op), prov, rpc, parsed.code, code_verifier=verifier)
+    assert ts.id_token
+
+
+def test_matches_state_equal_and_different():
+    r = _parse([("code", "c"), ("state", "abc123")])
+    assert r.matches_state("abc123") is True
+    assert r.matches_state("abc124") is False
+    assert r.matches_state("ABC123") is False
+    assert r.matches_state("") is False
+
+
+def test_matches_state_different_length():
+    r = _parse([("code", "c"), ("state", "abc123")])
+    assert r.matches_state("abc12") is False
+    assert r.matches_state("abc1234") is False
+    assert r.matches_state("abc123" * 100) is False
+
+
+def test_matches_state_absent_fails_closed():
+    r = _parse([("code", "c")])
+    assert r.state is None
+    assert r.matches_state("abc") is False
+    assert r.matches_state("abc", required=True) is False
+    assert r.matches_state("abc", required=False) is True
+
+
+def test_matches_state_present_ignores_required():
+    r = _parse([("code", "c"), ("state", "abc")])
+    assert r.matches_state("abc", required=False) is True
+    assert r.matches_state("xyz", required=False) is False
+
+
+def test_matches_state_unicode():
+    r = _parse([("code", "c"), ("state", "t\u00e4st-\u2603-\U0001f600")])
+    assert r.matches_state("t\u00e4st-\u2603-\U0001f600")
+    assert not r.matches_state("tast-\u2603-\U0001f600")
+    # NFC vs NFD are different byte strings: no normalisation.
+    assert not r.matches_state("ta\u0308st-\u2603-\U0001f600")
+
+
+def test_matches_state_requires_str():
+    r = _parse([("code", "c"), ("state", "abc")])
+    with pytest.raises(TypeError):
+        r.matches_state(b"abc")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        r.matches_state(None)  # type: ignore[arg-type]
+
+
+def test_matches_state_repr_never_prints_state():
+    r = _parse([("code", "c"), ("state", "sekrit-state")])
+    assert "sekrit-state" not in repr(r)
+    assert "state=<set>" in repr(r)
+
+
+def test_authorization_response_op_error_redirect():
+    e = OAuthError("access_denied", "user said no", "st-1")
+    loc = e.to_redirect(REDIRECT_URI, "query").header("location")
+    parsed = rp.parse_authorization_response(parse_qsl(urlsplit(loc).query))
+    assert parsed.is_error and parsed.error == "access_denied" and parsed.error_known
+    assert parsed.state == "st-1" and parsed.code is None
+    assert parsed.error_description_safe == "user said no"
+
+
+def test_authorization_response_http_request_get():
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "c1"), ("state", "s1"), ("iss", ISSUER)])
+    r = rp.parse_authorization_response(req)
+    assert (r.code, r.state, r.iss, r.response_mode) == ("c1", "s1", ISSUER, "query")
+
+
+def test_authorization_response_http_request_post_form_post():
+    req = pyhttp.HttpRequestData(method="POST", form=[("code", "c1"), ("state", "s1")])
+    r = rp.parse_authorization_response(req)
+    assert r.response_mode == "form_post" and r.code == "c1"
+    # unrelated query parameters are fine
+    req = pyhttp.HttpRequestData(method="POST", query=[("utm", "x")], form=[("code", "c1")])
+    assert rp.parse_authorization_response(req).code == "c1"
+
+
+@pytest.mark.parametrize("name", ["code", "state", "error", "error_description", "error_uri", "iss", "response"])
+def test_authorization_response_post_query_smuggle_rejected(name):
+    req = pyhttp.HttpRequestData(method="POST", query=[(name, "x")], form=[("code", "c1")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req, accept_jarm=True)
+
+
+def test_authorization_response_http_request_mapping_query_refused():
+    # PoC: a dict has already dropped any duplicate `code`.
+    req = pyhttp.HttpRequestData(method="GET", query={"code": "ATTACKER", "state": "S"})
+    with pytest.raises(TypeError, match=r"HttpRequestData\.query was built from a mapping"):
+        rp.parse_authorization_response(req)
+
+
+def test_authorization_response_http_request_mapping_form_refused():
+    req = pyhttp.HttpRequestData(method="POST", form={"code": "c1", "state": "s1"})
+    with pytest.raises(TypeError, match=r"HttpRequestData\.form was built from a mapping"):
+        rp.parse_authorization_response(req)
+
+
+def test_authorization_response_http_request_empty_mapping_not_refused():
+    req = pyhttp.HttpRequestData(method="GET", query={}, form={"utm": "x"})
+    with pytest.raises(BadRequestError) as exc:
+        rp.parse_authorization_response(req)  # neither code nor error
+    assert not isinstance(exc.value, TypeError)
+    post = pyhttp.HttpRequestData(method="POST", query={}, form=[("code", "c1")])
+    assert rp.parse_authorization_response(post).code == "c1"
+    # a non-protocol mapping in the channel that is not read is harmless
+    other = pyhttp.HttpRequestData(method="POST", query={"utm": "x"}, form=[("code", "c1")])
+    assert rp.parse_authorization_response(other).code == "c1"
+
+
+def test_authorization_response_http_request_pairs_duplicates_still_bad_request():
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "a"), ("code", "b")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req)
+    post = pyhttp.HttpRequestData(method="POST", form=[("code", "a"), ("code", "b")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(post)
+
+
+def test_authorization_response_http_request_setter_tracks_mapping():
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "a"), ("code", "b")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req)
+    req.query = {"code": "a"}  # the old bypass: now refused, not accepted
+    with pytest.raises(TypeError):
+        rp.parse_authorization_response(req)
+    req.query = [("code", "a"), ("state", "s")]
+    assert rp.parse_authorization_response(req).code == "a"
+    assert req.query_pairs == [("code", "a"), ("state", "s")]
+    req.query = [("code", "a"), ("code", "b")]
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req)
+    post = pyhttp.HttpRequestData(method="POST", form=[("code", "c")])
+    post.form = {"code": "c"}
+    with pytest.raises(TypeError, match=r"HttpRequestData\.form"):
+        rp.parse_authorization_response(post)
+    post.form = [("code", "c")]
+    assert rp.parse_authorization_response(post).code == "c"
+
+
+def test_authorization_response_http_request_other_method_and_mode_mismatch():
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(pyhttp.HttpRequestData(method="PUT", form=[("code", "c")]))
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "c")])
+    with pytest.raises(ConfigError):
+        rp.parse_authorization_response(req, response_mode="form_post")
+    assert rp.parse_authorization_response(req, response_mode="query").response_mode == "query"
+
+
+def test_authorization_response_multi_dict_input():
+    r = rp.parse_authorization_response({"code": ["c1"], "state": ["s1"]}, response_mode="fragment")
+    assert (r.code, r.state, r.response_mode) == ("c1", "s1", "fragment")
+    parsed = rp.parse_authorization_response(dict(parse_qs("code=c1&state=s1&iss=https%3A%2F%2Fop.example.com")))
+    assert parsed.iss == ISSUER
+    # duplicates survive flattening and are then rejected
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response({"code": ["a", "b"]})
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response({"code": ["a"], "state": ["x", "y"]})
+
+
+def test_authorization_response_plain_dict_is_type_error():
+    with pytest.raises(TypeError, match=r"non-list value for key 'code'.*plain dict"):
+        rp.parse_authorization_response({"code": "c1", "state": "s1"})
+    with pytest.raises(TypeError):
+        rp.parse_authorization_response("code=c1")
+    with pytest.raises(TypeError):
+        rp.parse_authorization_response({"code": [1]})
+
+
+def test_authorization_response_response_mode_validated():
+    with pytest.raises(ConfigError):
+        _parse([("code", "c")], response_mode="web_message")
+    for m in ("query", "fragment", "form_post"):
+        assert _parse([("code", "c")], response_mode=m).response_mode == m
+
+
+@pytest.mark.parametrize("name", ["code", "state", "error", "error_description", "error_uri", "iss"])
+def test_authorization_response_duplicate_parameter_rejected(name):
+    base = [("code", "c")] if name != "code" else []
+    with pytest.raises(BadRequestError):
+        _parse([*base, (name, "a"), (name, "b")])
+    with pytest.raises(BadRequestError):
+        _parse([*base, (name, "a"), (name, "a")])
+
+
+def test_authorization_response_code_and_error_rules():
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("error", "access_denied")])
+    with pytest.raises(BadRequestError):
+        _parse([("state", "s")])
+    with pytest.raises(BadRequestError):
+        _parse([])
+    for name in ("code", "state", "error"):
+        pairs = [("code", "c"), ("state", "s")] if name != "error" else [("error", "x")]
+        pairs = [(k, v) for k, v in pairs if k != name] + [(name, "")]
+        if name == "state":
+            pairs.append(("code", "c"))
+        with pytest.raises(BadRequestError):
+            _parse(pairs)
+
+
+def test_authorization_response_error_charset_and_length():
+    for bad in ('say "hi"', "a\\b", "caf\u00e9", "a\nb", "x" * 65, "\u202e"):
+        with pytest.raises(BadRequestError):
+            _parse([("error", bad)])
+    assert _parse([("error", "x" * 64)]).error == "x" * 64
+    assert _parse([("error", "weird code!")]).error == "weird code!"
+
+
+def test_authorization_response_error_known_and_unknown_kept():
+    for code in (
+        "access_denied",
+        "invalid_request",
+        "server_error",
+        "login_required",
+        "interaction_required",
+        "invalid_dpop_proof",
+    ):
+        assert _parse([("error", code)]).error_known, code
+    unk = _parse([("error", "totally_new_error"), ("state", "s")])
+    assert unk.error == "totally_new_error" and unk.error_known is False and unk.is_error
+
+
+def test_authorization_response_error_description_escaped_and_capped():
+    desc = "evil\u202e\x1b[31m\ninjected\u200b\u2066"
+    r = _parse([("error", "access_denied"), ("error_description", desc)])
+    safe = r.error_description_safe
+    assert "\u202e" not in safe and "\x1b" not in safe and "\n" not in safe
+    assert "\u200b" not in safe and "\u2066" not in safe
+    assert "\\u{202e}" in safe and "\\n" in safe
+    long = _parse([("error", "x"), ("error_description", "a" * 5000)]).error_description_safe
+    assert len(long) <= 256 and long.endswith("...")
+    assert _parse([("error", "x")]).error_description_safe is None
+    with pytest.raises(AttributeError):
+        _parse([("error", "x"), ("error_description", "d")]).error_description  # noqa: B018
+
+
+def test_authorization_response_error_uri_handling():
+    ok = "https://op.example.com/docs/err?x=1"
+    assert _parse([("error", "x"), ("error_uri", ok)]).error_uri == ok
+    # the NORMALISED form is returned, not the raw string
+    norm = {
+        "https:evil.example/x": "https://evil.example/x",
+        "HTTPS://OP.Example.COM:443/a/../b": "https://op.example.com/b",
+        "http://127.0.0.1:8080/x": "http://127.0.0.1:8080/x",
+        "http://localhost/x": "http://localhost/x",
+    }
+    for raw, expected in norm.items():
+        assert _parse([("error", "x"), ("error_uri", raw)]).error_uri == expected, raw
+    long_ok = "https://op.example.com/" + "a" * (2048 - len("https://op.example.com/"))
+    assert _parse([("error", "x"), ("error_uri", long_ok)]).error_uri == long_ok
+    for bad in (
+        # plain http only for loopback (transport rule); no issuer-origin binding
+        "http://attacker.example/x",
+        "http://op.example.com",
+        "http://op.example.com/e",
+        "https://op.example.com/" + "a" * 2048,
+        long_ok + "a",
+        "http:/\\evil",
+        "http:\\\\evil.example",
+        "https://user:pw@op.example.com/x",
+        "not a url",
+        "/relative",
+        "https://good.example@evil.example/x",
+        "https://op.example.com/a\\b",
+        "https://op.example.com/a\r\nb",
+        "https://op.example.com/a b",
+        "javascript:alert(1)",
+        "https://op.example.com/x#frag",
+        "https://op.example.com/\u202e",
+        "",
+    ):
+        assert _parse([("error", "x"), ("error_uri", bad)]).error_uri is None, bad
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["a\r\nb", "a\nb", "a\x00b", "a\\b", "a\tb", "a\x7fb", "a\u202eb", "a\u200bb", "a\u2066b", "a\ufeffb", "a\u2028b"],
+)
+def test_authorization_response_code_state_iss_control_chars_rejected(bad):
+    with pytest.raises(BadRequestError):
+        _parse([("code", bad)])
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("state", bad)])
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("iss", bad)])
+
+
+@pytest.mark.parametrize("name", ["code", "state", "iss"])
+def test_authorization_response_value_length_caps(name):
+    base = [] if name == "code" else [("code", "c")]
+    ok = "a" * 2048
+    assert getattr(_parse([*base, (name, ok)]), name) == ok
+    secret = "SECRETVALUE" + "a" * 2048
+    with pytest.raises(BadRequestError) as ei:
+        _parse([*base, (name, secret)])
+    assert "SECRETVALUE" not in str(ei.value)
+
+
+class _ListsOnly:
+    """Stand-in for werkzeug's MultiDict: lists() yields (key, [values])."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def lists(self):
+        return iter(self._data.items())
+
+
+class _FirstValueDict(dict):
+    """Stand-in for a dict subclass whose items() yields first values only."""
+
+
+def test_authorization_response_lists_duck_typing():
+    r = rp.parse_authorization_response(_ListsOnly({"code": ["c1"], "state": ["s1"]}))
+    assert (r.code, r.state) == ("c1", "s1")
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(_ListsOnly({"code": ["a", "b"]}))
+    md = _FirstValueDict({"code": "c1"})
+    md.lists = lambda: iter([("code", ["a", "b"])])  # type: ignore[attr-defined]
+    # a dict subclass with lists() is read through lists(), duplicates visible
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(md)
+
+
+def test_authorization_response_mapping_type_error_names_key_and_hint():
+    with pytest.raises(TypeError) as ei:
+        rp.parse_authorization_response(_FirstValueDict({"state": ["s"], "code": "c1"}))
+    msg = str(ei.value)
+    assert "non-list value for key 'code'" in msg
+    assert "_FirstValueDict" in msg and "items(multi=True)" in msg and ".lists()" in msg
+    assert "plain dict" not in msg
+    with pytest.raises(TypeError, match="non-list value for key 'code'") as ei2:
+        rp.parse_authorization_response({"code": "c1"})
+    assert "plain dict" in str(ei2.value)
+
+
+def test_authorization_response_get_with_form_body_params_rejected():
+    for name in ("code", "state", "error", "iss", "response"):
+        req = pyhttp.HttpRequestData(method="GET", query=[("code", "c1")], form=[(name, "x")])
+        with pytest.raises(BadRequestError):
+            rp.parse_authorization_response(req, accept_jarm=True)
+    ok = pyhttp.HttpRequestData(method="GET", query=[("code", "c1")], form=[("utm", "x")])
+    assert rp.parse_authorization_response(ok).code == "c1"
+
+
+def test_authorization_response_post_without_form_body_message():
+    req = pyhttp.HttpRequestData(method="POST", query=[("utm", "x")])
+    with pytest.raises(BadRequestError, match="needs a form body"):
+        rp.parse_authorization_response(req)
+
+
+def test_authorization_response_values_kept_verbatim():
+    r = _parse([("code", " c d "), ("state", "S=/+ ")])
+    assert r.code == " c d " and r.state == "S=/+ "
+
+
+def test_authorization_response_matches_iss():
+    r = _parse([("code", "c"), ("iss", ISSUER)])
+    assert r.matches_iss(ISSUER)
+    assert not r.matches_iss(ISSUER + "/")
+    assert not r.matches_iss(ISSUER.upper())
+    assert not r.matches_iss("https://evil.example")
+    assert not r.matches_iss("")
+    assert not r.matches_iss("", required=False)
+    assert r.matches_iss(ISSUER, required=True) and r.matches_iss(ISSUER, required=False)
+    assert not r.matches_iss("https://evil.example", required=False)
+    absent = _parse([("code", "c")])
+    assert absent.iss is None
+    # fail closed by default (RFC 9207 section 2.4)
+    assert absent.matches_iss(ISSUER) is False
+    assert absent.matches_iss(ISSUER, required=True) is False
+    assert absent.matches_iss(ISSUER, required=False) is True
+    with pytest.raises(TypeError):
+        r.matches_iss(ISSUER, True)  # type: ignore[misc]
+
+
+def test_authorization_response_repr_redacts_secrets():
+    r = _parse([("code", "SECRETCODE"), ("state", "SECRETSTATE"), ("iss", ISSUER)])
+    text = repr(r)
+    assert "SECRETCODE" not in text and "SECRETSTATE" not in text
+    assert text == (
+        "AuthorizationResponse(is_error=False, error=None, code=<set>, state=<set>, "
+        "iss='https://op.example.com', response=None, response_mode='query')"
+    )
+    e = _parse([("error", "access_denied"), ("iss", ISSUER)])
+    assert "state=None" in repr(e) and "error='access_denied'" in repr(e)
+
+
+def test_authorization_response_repr_escapes_quote_in_quoted_fields():
+    import ast
+
+    r = _parse([("error", "it's"), ("iss", "https://op.example.com/it's")])
+    text = repr(r)
+    assert "error='it\\'s'" in text and "it\\'s'" in text
+    assert "error='it's'" not in text
+    token = text.split(", error=", 1)[1].split(", code=", 1)[0]
+    assert ast.literal_eval(token) == "it's"
+    iss_token = text.split("iss=", 1)[1].split(", response=", 1)[0]
+    assert ast.literal_eval(iss_token) == "https://op.example.com/it's"
+
+
+def test_authorization_response_repr_shows_response_set_not_value():
+    jwt = "eyJhbGciOiJub25lIn0.SECRETJARM.sig"
+    r = _parse([("response", jwt)], accept_jarm=True)
+    assert "response=<set>" in repr(r) and "SECRETJARM" not in repr(r)
+    assert r.response == jwt
+    assert "response=None" in repr(_parse([("code", "c")]))
+
+
+def test_authorization_response_jarm_response_cap():
+    ok = "a" * 32768
+    assert _parse([("response", ok)], accept_jarm=True).response == ok
+    with pytest.raises(BadRequestError) as exc:
+        _parse([("response", ok + "a")], accept_jarm=True)
+    assert "aaaa" not in str(exc.value)
+
+
+def test_authorization_response_empty_iss_rejected():
+    with pytest.raises(BadRequestError) as exc:
+        _parse([("code", "c"), ("iss", "")])
+    assert "iss" in str(exc.value)
+
+
+def test_authorization_response_empty_expected_never_matches():
+    both = _parse([("code", "c"), ("state", "s"), ("iss", ISSUER)])
+    absent = _parse([("code", "c")])
+    for r in (both, absent):
+        for required in (True, False):
+            assert r.matches_iss("", required=required) is False
+            assert r.matches_state("", required=required) is False
+
+
+# The 12 codes OAuthError accepts (errors.rs parse_oauth_code).
+_OAUTH_ERROR_CODES = [
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "unsupported_response_type",
+    "invalid_scope",
+    "access_denied",
+    "login_required",
+    "server_error",
+    "temporarily_unavailable",
+    "invalid_dpop_proof",
+]
+_RESPONSE_ONLY_CODES = [
+    "interaction_required",
+    "account_selection_required",
+    "consent_required",
+    "invalid_request_uri",
+    "invalid_request_object",
+    "request_not_supported",
+    "request_uri_not_supported",
+    "registration_not_supported",
+]
+
+
+@pytest.mark.parametrize("code", _OAUTH_ERROR_CODES)
+def test_error_known_is_superset_of_oauth_error_codes(code):
+    assert OAuthError(code).code == code
+    assert _parse([("error", code)]).error_known is True
+
+
+@pytest.mark.parametrize("code", _RESPONSE_ONLY_CODES)
+def test_error_known_wider_than_oauth_error(code):
+    assert _parse([("error", code)]).error_known is True
+    with pytest.raises(ValueError):
+        OAuthError(code)
+
+
+def test_authorization_response_frozen_no_constructor():
+    r = _parse([("code", "c")])
+    with pytest.raises(AttributeError):
+        r.code = "other"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        rp.AuthorizationResponse()  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("code", "c"),
+        ("state", "s"),
+        ("error", "access_denied"),
+        ("error_description", "d"),
+        ("error_uri", "https://op.example.com/e"),
+        ("iss", ISSUER),
+    ],
+)
+def test_authorization_response_jarm_rejects_plaintext_params_alongside(extra):
+    with pytest.raises(BadRequestError, match="alongside"):
+        _parse([("response", "a.b.c"), extra], accept_jarm=True)
+
+
+def test_authorization_response_jarm_refused_by_default_accepted_raw():
+    with pytest.raises(BadRequestError, match="JARM"):
+        _parse([("response", "a.b.c")])
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("response", "a.b.c")])
+    r = _parse([("response", "a.b.c")], accept_jarm=True)
+    assert r.response == "a.b.c" and r.code is None and not r.is_error
+    # without response the usual rules still apply
+    with pytest.raises(BadRequestError):
+        _parse([("state", "s")], accept_jarm=True)
+    with pytest.raises(BadRequestError):
+        _parse([("response", "a"), ("response", "b")], accept_jarm=True)

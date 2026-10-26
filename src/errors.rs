@@ -436,6 +436,9 @@ pub fn oauth_err(py: Python<'_>, e: &RsOAuthError) -> PyErr {
 }
 
 /// Inverse of `OAuthErrorCode::as_str` (grindvakt has no `from_str`).
+// NOTE: `AuthorizationResponse.error_known` (rp.rs `KNOWN_ERROR_CODES`) is a
+// SUPERSET of the codes accepted here; tests/test_rp.py locks that in. Do not
+// widen this match without core support.
 pub fn parse_oauth_code(s: &str) -> PyResult<OAuthErrorCode> {
     use OAuthErrorCode as C;
     Ok(match s {
@@ -579,7 +582,7 @@ pub(crate) fn escape_untrusted_text(s: &str, max: usize) -> String {
 /// Like `escape_untrusted_text`, but a single quote also becomes `\'` before
 /// the cap is applied, so a value rendered inside single quotes stays within
 /// `max` characters.
-fn escape_untrusted_quoted(s: &str, max: usize) -> String {
+pub(crate) fn escape_untrusted_quoted(s: &str, max: usize) -> String {
     escape_untrusted(s, max, true)
 }
 

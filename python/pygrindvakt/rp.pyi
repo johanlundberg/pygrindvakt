@@ -1,8 +1,9 @@
 """Type stubs for ``pygrindvakt.rp`` - the relying-party (client) side of OIDC."""
 
-from typing import Any, Literal, overload
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Literal, Protocol, overload
 
-from .http import _HttpArg, _HttpHeadersArg
+from .http import HttpRequestData, _HttpArg, _HttpHeadersArg
 from .keys import SigningKey
 from .metadata import ProviderMetadata
 
@@ -480,6 +481,105 @@ def asymmetric_algorithms() -> list[str]:
     ``strict_hashes=True`` on a flow that needs ``at_hash`` / ``c_hash`` is
     unsatisfiable for EdDSA tokens: filter with
     ``jwt.supports_oidc_token_hash`` or pass an explicit allowlist.
+
+    .. versionadded:: 0.3.0
+    """
+
+class MultiDictProtocol(Protocol):
+    """A multi-dict exposing ``lists()`` -> ``(name, [values])`` (werkzeug ``MultiDict``)."""
+
+    def lists(self) -> Iterable[tuple[str, list[str]]]: ...
+
+class AuthorizationResponse:
+    """A parsed, shape-checked authorization response (callback). Nothing in it is trusted.
+
+    Built by :func:`parse_authorization_response`; there is no public
+    constructor. The response proves nothing by itself: compare ``state``
+    with the session (``mac.constant_time_eq`` on the UTF-8 bytes), compare
+    ``iss`` with :meth:`matches_iss` (RFC 9207) and exchange the code. The raw
+    ``error_description`` is not available by design; use
+    ``error_description_safe``. ``repr()`` never prints ``code``, ``state`` or ``response``.
+
+    .. versionadded:: 0.3.0
+    """
+
+    @property
+    def code(self) -> str | None: ...
+    @property
+    def state(self) -> str | None: ...
+    @property
+    def error(self) -> str | None: ...
+    @property
+    def error_description_safe(self) -> str | None: ...
+    @property
+    def error_uri(self) -> str | None: ...
+    @property
+    def iss(self) -> str | None: ...
+    @property
+    def response(self) -> str | None: ...
+    @property
+    def response_mode(self) -> Literal["query", "fragment", "form_post"]: ...
+    @property
+    def is_error(self) -> bool: ...
+    @property
+    def error_known(self) -> bool:
+        """True when ``error`` is a code the binding knows (RFC 6749, OIDC Core, DPoP).
+
+        "Known" is WIDER than what ``OAuthError`` accepts: 8 response-only
+        codes (for example ``consent_required``) are known but
+        ``OAuthError("consent_required")`` raises ``ValueError``. Never build
+        ``OAuthError(resp.error)`` from a callback value without catching
+        ``ValueError``; branch on the ``error`` string instead.
+        """
+    def matches_iss(self, expected: str, *, required: bool = True) -> bool:
+        """Exact, byte-for-byte comparison of ``iss`` with ``expected`` (RFC 9207).
+
+        Fails closed: an absent ``iss`` gives ``not required``, so ``False`` by
+        default. Pass ``required=False`` ONLY when the OP does not advertise
+        ``authorization_response_iss_parameter_supported`` (RFC 9207 section
+        2.4). An empty ``expected`` is a configuration fault and always gives
+        ``False``, regardless of ``required``. Never raises.
+        """
+    def matches_state(self, expected: str, *, required: bool = True) -> bool:
+        """Constant-time comparison of ``state`` with ``expected`` (RFC 6749 4.1.2.3, 10.12).
+
+        Compares the UTF-8 bytes. Fails closed: an absent ``state`` gives
+        ``not required``, so ``False`` by default. ``rp.authorization_url`` and
+        ``rp.begin`` always send ``state``, so keep ``required=True``; pass
+        ``required=False`` only for a request deliberately built without
+        ``state``. An empty ``expected`` always gives ``False``, regardless of
+        ``required``. Never raises for a mismatch. ALWAYS call it before
+        exchanging the code.
+        """
+    def __repr__(self) -> str: ...
+
+def parse_authorization_response(
+    params: HttpRequestData | Sequence[tuple[str, str]] | Mapping[str, list[str] | tuple[str, ...]] | MultiDictProtocol,
+    *,
+    response_mode: Literal["query", "fragment", "form_post"] | None = ...,
+    accept_jarm: bool = ...,
+) -> AuthorizationResponse:
+    """Parse the authorization response (callback), failing closed.
+
+    ``params`` is an ``http.HttpRequestData`` (GET uses ``query_pairs``, POST
+    uses ``form_pairs`` with mode ``form_post``; a response parameter in the
+    other channel, the query string of a POST or the body of a GET, raises),
+    an ordered list of ``(str, str)`` pairs, a multi-dict
+    ``{name: [values]}`` (``urllib.parse.parse_qs`` shape) or an object with a
+    ``lists()`` method (werkzeug ``MultiDict``). A plain ``dict[str, str]`` raises ``TypeError`` because mappings
+    discard duplicate parameters. ``response_mode`` labels list and multi-dict
+    input (default ``"query"``).
+
+    Raises ``BadRequestError`` for a repeated parameter, both or neither of
+    ``code`` and ``error``, an empty ``code`` / ``state`` / ``error`` / ``iss``, control,
+    bidi or invisible characters or backslashes in ``code`` / ``state`` /
+    ``iss``, a ``code`` / ``state`` / ``iss`` over 2048 characters, a JARM
+    ``response`` over 32768 characters, an
+    ``error`` outside RFC 6749 section 5.2 or over 64 characters, and a JARM
+    ``response`` unless ``accept_jarm=True`` (then exposed raw and UNVERIFIED,
+    and it must be the only protocol parameter; verify the JWT yourself). Unknown error codes are kept (``error_known`` is False).
+    ``error_uri`` is kept only as a safe absolute https URL (plain http only for loopback hosts) with a host (at
+    most 2048 characters, returned normalised), else ``None``.
 
     .. versionadded:: 0.3.0
     """

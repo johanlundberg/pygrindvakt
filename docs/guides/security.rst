@@ -168,6 +168,29 @@ framework integrations cannot accidentally omit deployment-critical choices.
      - RFC 7518 3.2 requires a key at least as long as the hash output; a short
        client secret is brute-forceable offline from one captured token.
      - None; use a longer ``client_secret``.
+   * - :func:`pygrindvakt.rp.parse_authorization_response` raises
+       :class:`~pygrindvakt.BadRequestError` for repeated parameters, both or
+       neither of ``code`` and ``error``, a ``form_post`` response whose
+       protocol parameters also appear in the query string (or a query
+       response whose form body carries them), control, bidi or invisible
+       characters, backslashes or more than 2048 characters in ``code`` /
+       ``state`` / ``iss``, a malformed ``error``, a JARM ``response``, and
+       plaintext parameters next to a JARM ``response``; a mapping with
+       non-list values (a plain ``dict``) raises ``TypeError``. ``error_description`` is exposed only escaped and capped
+       (``error_description_safe``); ``error_uri`` only when it is a safe
+       absolute https URL (http only for loopback), normalised.
+     - Callback parameters are attacker-influenced. A mapping or a repeated
+       parameter lets a second value hide behind the first, and a provider
+       description with ANSI, bidi or newline characters can forge log
+       lines. The response proves nothing until ``state`` is compared and
+       ``iss`` is checked (RFC 9207 mix-up defence).
+     - ``accept_jarm=True`` exposes the raw, UNVERIFIED ``response`` JWT; you
+       must verify it yourself. ``matches_state`` and ``matches_iss``
+       are the caller's job and cannot be forced; both fail closed
+       (``matches_state`` on a missing ``state``, ``matches_iss`` on a missing
+       ``iss`` unless you pass ``required=False`` for an
+       OP that does not advertise
+       ``authorization_response_iss_parameter_supported``).
 
 If grindvakt later adopts these guards upstream, the binding's checks become
 redundant but harmless.

@@ -287,3 +287,26 @@ def use_validators() -> None:
     digest: str = jwt.oidc_token_hash("RS256", "token")
     supported: bool = jwt.supports_oidc_token_hash("RS256")
     del cap, algs, digest, supported
+
+
+def use_authorization_response(req: pygrindvakt.http.HttpRequestData) -> None:
+    r: rp.AuthorizationResponse = rp.parse_authorization_response(req)
+    rp.parse_authorization_response([("code", "c"), ("state", "s")], response_mode="fragment")
+    rp.parse_authorization_response({"code": ["c"]}, response_mode="form_post", accept_jarm=True)
+    rp.parse_authorization_response({"code": ("c",)})
+    # A plain dict[str, str] must not type-check (a str is a Sequence[str]).
+    plain: dict[str, str] = {"code": "c"}
+    rp.parse_authorization_response(plain)  # type: ignore[arg-type]
+    code: str | None = r.code
+    state: str | None = r.state
+    error: str | None = r.error
+    desc: str | None = r.error_description_safe
+    uri: str | None = r.error_uri
+    iss: str | None = r.iss
+    jarm: str | None = r.response
+    mode: str = r.response_mode
+    flags: tuple[bool, bool] = (r.is_error, r.error_known)
+    ok: bool = r.matches_iss("https://op.example", required=False)
+    st_ok: bool = r.matches_state("expected-state")
+    st_opt: bool = r.matches_state("expected-state", required=False)
+    del code, state, error, desc, uri, iss, jarm, mode, flags, ok, st_ok, st_opt

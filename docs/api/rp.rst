@@ -413,6 +413,211 @@ Discovery and keys
 
    .. versionadded:: 0.2.0
 
+The authorization response
+--------------------------
+
+.. py:function:: parse_authorization_response(params: HttpRequestData | Sequence[tuple[str, str]] | Mapping[str, Sequence[str]], *, response_mode: Literal["query", "fragment", "form_post"] | None = None, accept_jarm: bool = False) -> AuthorizationResponse
+
+   Parse the authorization response (the callback) of an authorization
+   request, failing closed. This is the RP-side counterpart of
+   :class:`pygrindvakt.request.AuthorizationRequest`
+   (`ADR 0007 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0007-authorization-response-parsing.md>`_).
+
+   ``params`` takes one of three shapes:
+
+   * a :class:`pygrindvakt.http.HttpRequestData`: a ``GET`` is read from
+     ``query_pairs`` (mode ``query``), a ``POST`` from ``form_pairs`` (mode
+     ``form_post``). A response parameter (``code``, ``state``, ``error``,
+     ``error_description``, ``error_uri``, ``iss``, ``response``) in the
+     channel that is not read raises :class:`pygrindvakt.BadRequestError`
+     for both methods (the query string of a ``POST``, the form body of a
+     ``GET``), so a request cannot smuggle a second value past the one that
+     is parsed. A ``POST`` without any form parameters raises too, saying
+     that a ``form_post`` callback needs a form body: parse the form before
+     building the ``HttpRequestData``. Any other method raises
+     ``BadRequestError``. If the channel that is read (``query`` for a
+     ``GET``, ``form`` for a ``POST``) is non-empty and was built from, or
+     last assigned, a mapping (``query={...}``, ``req.query = {...}``), a
+     :class:`TypeError` is raised: a mapping discards duplicate parameters.
+     Build it from a list of pairs (``request.args.items(multi=True)``). An
+     empty mapping is accepted.
+   * an ordered list of ``(str, str)`` pairs, for example
+     ``urllib.parse.parse_qsl(...)``;
+   * a multi-dict ``{name: [values]}``, the shape ``urllib.parse.parse_qs``
+     returns, which is flattened into pairs with duplicates preserved;
+   * an object with a ``lists()`` method yielding ``(name, [values])``, such
+     as a werkzeug ``MultiDict`` (``request.args``), read by duck typing so
+     duplicates are kept.
+
+   A mapping with a non-list value, such as a plain ``dict[str, str]``,
+   raises ``TypeError`` naming the offending key: a mapping discards
+   duplicate parameters before this function can see them. For a dict
+   subclass the message suggests ``request.args.items(multi=True)`` (a list
+   of pairs) or ``request.args.lists()``.
+
+   ``response_mode`` labels list and multi-dict input as ``"query"``
+   (the default), ``"fragment"`` (the caller parsed ``location.hash``
+   client-side and posted it) or ``"form_post"``; any other value raises
+   :class:`pygrindvakt.ConfigError`. For an ``HttpRequestData`` it must be
+   omitted or equal the mode implied by the method.
+
+   Raises :class:`pygrindvakt.BadRequestError` (per-request input) when:
+
+   * ``code``, ``state``, ``error``, ``error_description``, ``error_uri``,
+     ``iss`` or ``response`` appears more than once;
+   * ``code`` and ``error`` are both present, or neither is (unless
+     ``response`` is present and ``accept_jarm=True``);
+   * ``code``, ``state``, ``error`` or ``iss`` is the empty string;
+   * ``code``, ``state`` or ``iss`` contains a control character (newline,
+     NUL, tab, DEL, ...), a bidi or invisible formatting character, or a
+     backslash. Otherwise they are kept verbatim, without trimming;
+   * ``code``, ``state`` or ``iss`` is longer than 2048 characters (the
+     message does not echo the value);
+   * ``response`` (JARM) is longer than 32768 characters (the message does
+     not echo the value);
+   * ``error`` is longer than 64 characters or outside the RFC 6749
+     section 5.2 character set (``%x20-21 / %x23-5B / %x5D-7E``);
+   * ``response`` (JARM) is present and ``accept_jarm`` is false;
+   * ``response`` (JARM) is present together with ``code``, ``state``,
+     ``error``, ``error_description``, ``error_uri`` or ``iss``: a JARM
+     response carries everything inside the JWT, and plaintext parameters
+     next to it are a downgrade / confusion vector.
+
+   Unknown ``error`` values are **kept**, never rejected, so a new or
+   proprietary code does not break the login page; check
+   :attr:`AuthorizationResponse.error_known`.
+
+   .. warning::
+
+      The result proves nothing by itself. Before using the code the caller
+      MUST compare ``state`` with the value stored in the session (in
+      constant time, for example ``mac.constant_time_eq`` on the UTF-8
+      bytes), compare ``iss`` with
+      :meth:`AuthorizationResponse.matches_iss`, and only then exchange the
+      code with :func:`exchange_code`. Parsing does none of these.
+
+   .. warning::
+
+      JARM (JWT Secured Authorization Response Mode) is not supported by the
+      core library. With ``accept_jarm=True`` the raw ``response`` JWT is
+      exposed as :attr:`AuthorizationResponse.response` and is
+      **UNVERIFIED and untrusted**; verify its signature, ``iss``, ``aud``
+      and ``exp`` yourself before reading anything from it.
+
+   .. versionadded:: 0.3.0
+
+.. py:class:: AuthorizationResponse
+
+   A parsed authorization response. Immutable, with no public constructor;
+   build it with :func:`parse_authorization_response`. Every value comes from
+   the OP (or from whoever crafted the callback URL) and is untrusted.
+   ``repr()`` shows ``is_error``, ``error``, ``iss`` and ``response_mode``
+   but only ``<set>`` / ``None`` for ``code`` and ``state``, never their
+   values.
+
+   .. py:property:: code
+      :type: str | None
+
+      The authorization code, verbatim, or ``None`` for an error response.
+   .. py:property:: state
+      :type: str | None
+
+      The ``state`` echoed by the OP, verbatim.
+   .. py:property:: error
+      :type: str | None
+
+      The OAuth error code, or ``None``.
+   .. py:property:: error_description_safe
+      :type: str | None
+
+      ``error_description`` with control, bidi and invisible characters
+      escaped (``\n``, ``\u{202e}``, ...) and capped at 256 characters
+      (the escaper behind ``OAuthError.__str__``). The raw ``error_description`` is
+      provider-controlled text and is **not available by design**: there is no
+      ``error_description`` attribute. Even the safe form is for logs and
+      plain-text display, not for HTML without escaping.
+   .. py:property:: error_uri
+      :type: str | None
+
+      ``error_uri`` only if it is an absolute ``https`` URL (plain ``http``
+      only for loopback hosts, the same transport rule as redirect URIs)
+      with a host, at most 2048 characters, without whitespace, control
+      characters, backslash, userinfo or fragment; otherwise ``None`` (no
+      exception). The **normalised** URL is returned, so what you see is
+      what was validated (``https:evil.example/x`` becomes
+      ``https://evil.example/x``). It is untrusted: never
+      follow it automatically and never render it as a link without your own
+      validation. It is not bound to the issuer's origin (that would need an
+      expected-issuer input and is out of scope).
+   .. py:property:: iss
+      :type: str | None
+
+      The RFC 9207 ``iss`` parameter, verbatim. Compare it with
+      :meth:`matches_iss`.
+   .. py:property:: response
+      :type: str | None
+
+      The raw JARM ``response`` JWT, at most 32768 characters; only set with
+      ``accept_jarm=True``. UNVERIFIED and untrusted.
+   .. py:property:: response_mode
+      :type: str
+
+      ``"query"``, ``"fragment"`` or ``"form_post"``.
+   .. py:property:: is_error
+      :type: bool
+
+      ``True`` when ``error`` is present.
+   .. py:property:: error_known
+      :type: bool
+
+      ``True`` when ``error`` is a code the binding knows: RFC 6749
+      sections 4.1.2.1 and 5.2, OIDC Core section 3.1.2.6, and the
+      DPoP ``invalid_dpop_proof``. ``False`` for any other value
+      (and when there is no error).
+
+      .. warning::
+
+         "Known" is **wider** than what :class:`pygrindvakt.OAuthError`
+         accepts. ``OAuthError`` knows 12 codes; the other 8 known codes
+         (``interaction_required``, ``account_selection_required``,
+         ``consent_required``, ``invalid_request_uri``,
+         ``invalid_request_object``, ``request_not_supported``,
+         ``request_uri_not_supported``, ``registration_not_supported``) make
+         ``OAuthError(resp.error)`` raise :class:`ValueError`. Never build an
+         ``OAuthError`` from a callback value without catching
+         ``ValueError``; branch on the ``resp.error`` string instead.
+
+   .. py:method:: matches_iss(expected: str, *, required: bool = True) -> bool
+
+      RFC 9207 issuer check, fail closed: ``True`` when ``iss`` equals
+      ``expected`` exactly (byte for byte; no case folding, no trailing-slash
+      normalisation). When the response has no ``iss`` the result is
+      ``not required``, so ``False`` by default. An empty ``expected`` is a
+      configuration fault and always gives ``False``, regardless of
+      ``required``. Never raises. The caller
+      MUST call it. Pass ``required=False`` **only** when the OP does not
+      advertise ``authorization_response_iss_parameter_supported`` in its
+      metadata (RFC 9207 section 2.4); otherwise a mix-up attacker's response
+      without ``iss`` would be accepted.
+
+   .. versionadded:: 0.3.0
+
+   .. py:method:: matches_state(expected: str, *, required: bool = True) -> bool
+
+      ``state`` check, fail closed: ``True`` when ``state`` equals ``expected``
+      (the value stored in the session), compared in constant time over the
+      UTF-8 bytes (RFC 6749 sections 4.1.2.3 and 10.12). When the response has
+      no ``state`` the result is ``not required``, so ``False`` by default.
+      An empty ``expected`` always gives ``False``, regardless of
+      ``required``. Never raises for a mismatch; ``expected`` must be a ``str`` (``TypeError``
+      otherwise). ``state`` in the response is conditional on the request
+      carrying one; :func:`authorization_url` and :func:`begin` always send it,
+      so keep ``required=True``. Pass ``required=False`` only for a request you
+      deliberately built without ``state``. ALWAYS call it before exchanging
+      the code: the parse result alone proves nothing.
+
+   .. versionadded:: 0.3.0
+
 Finishing the flow
 ------------------
 

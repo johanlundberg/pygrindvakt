@@ -11,6 +11,38 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Added
 
+- `rp.parse_authorization_response(params, *, response_mode=None, accept_jarm=False)`
+  and the frozen `rp.AuthorizationResponse` (`code`, `state`, `error`,
+  `error_description_safe`, `error_uri`, `iss`, `response`, `response_mode`,
+  `is_error`, `error_known`, `matches_iss(expected, *, required=True)`,
+  `matches_state(expected, *, required=True)`): the
+  RP-side counterpart of `request.AuthorizationRequest`, parsing the callback
+  fail closed. Accepts an `http.HttpRequestData` (GET query or POST form, with
+  a guard against response parameters present in the channel that is not read,
+  both for GET and POST), a list of pairs, a `parse_qs`-shaped multi-dict or an
+  object with `.lists()` (werkzeug `MultiDict`); a mapping with non-list values
+  (a plain `dict[str, str]`) raises `TypeError` naming the key because it
+  hides duplicates, and so does an `HttpRequestData` whose read channel
+  (`query` for GET, `form` for POST) is non-empty and was built from or
+  assigned a mapping (additive tracking; `HttpRequestData` behaviour is
+  otherwise unchanged, and its `query` / `form` setters now also accept pairs).
+  Raises `BadRequestError` for
+  repeated parameters, both or neither of `code` / `error`, empty
+  `code` / `state` / `error` / `iss`,
+  control, bidi / invisible-character or over-2048-character `code` / `state`
+  / `iss`, a malformed `error` and (unless `accept_jarm=True`, which exposes
+  the raw unverified JWT, and then only as the sole protocol parameter, capped at
+  32768 characters) a JARM `response`.
+  The raw `error_description` is never exposed, only an escaped, capped
+  `error_description_safe`; `error_uri` survives only as a safe, normalised https URL (http only for loopback) with a host;
+  unknown error codes are kept (`error_known` is false; "known" is wider than
+  what `OAuthError` accepts, so never build `OAuthError(resp.error)`
+  unguarded). An empty `expected` makes `matches_iss` / `matches_state` return
+  False. `repr()` shows `response=<set>` and escapes quotes. The response proves
+  nothing: call `matches_state` (constant-time, fails closed on a missing
+  `state`) and `matches_iss` (RFC 9207, fails closed on a missing `iss` unless
+  `required=False` because the OP does not advertise
+  `authorization_response_iss_parameter_supported`) before exchanging the code. See ADR 0007.
 - `rp.validate_issuer`, `rp.validate_redirect_uri_syntax` and
   `rp.validate_service_endpoint(name, endpoint, issuer=None, *, allow_loopback_http=False)`: the core
   syntax validators. `validate_issuer` and `validate_service_endpoint` raise
@@ -119,6 +151,10 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Changed
 
+- The `examples/flask-rp` callback uses `rp.parse_authorization_response`
+  (duplicate-safe parsing, constant-time `state` compare, `matches_iss` via the
+  explicit `OP_SENDS_ISS` constant, no provider-supplied text on the page) and
+  is now covered by end-to-end tests in `tests/test_frameworks.py`.
 - **Warning (0.3.0):** `federation.build_entity_configuration` emits a
   `UserWarning` when `public_jwks` contains an `oct` key (OPs and federation
   entities must not publish symmetric keys, OIDC Core section 10.1). The key

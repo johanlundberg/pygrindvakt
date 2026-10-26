@@ -82,6 +82,13 @@ class HttpRequestData:
     Build one from your framework's request object. ``headers`` keys are
     lower-cased; ``form`` is the parsed ``application/x-www-form-urlencoded``
     body.
+
+    For authorization-response (protocol) parameters build ``query`` / ``form``
+    from a list of ``(str, str)`` pairs (``request.args.items(multi=True)``): a
+    mapping discards duplicate names, and ``rp.parse_authorization_response``
+    raises ``TypeError`` for a non-empty channel built from, or last assigned,
+    a mapping. Assigning pairs to the ``query`` / ``form`` setters is accepted
+    and keeps duplicates in ``query_pairs`` / ``form_pairs``.
     """
 
     def __init__(
