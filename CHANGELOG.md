@@ -11,6 +11,28 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Added
 
+- `rp.DiscoveryCache(http, issuer, *, default_ttl=3600, min_ttl=60, max_ttl=86400,
+  failure_backoff=10, stale_on_error=True, max_stale=86400, fetch_timeout=45.0,
+  allow_cross_origin_end_session=False)`: a thread-safe, frozen cache of one
+  issuer's discovery document with `metadata()`, `info()`
+  (`ProviderInfo.from_metadata`, built once per fetch), `jwks()` (a
+  `JwksCache` bound to the advertised `jwks_uri`, the same object across
+  refreshes and replaced only when `jwks_uri` or issuer change), `refresh()`
+  and the read-only `issuer`, `failure_backoff` and `fetch_timeout`. Lifetime
+  from `Cache-Control: max-age` minus `Age` (else `default_ttl`, clamped; the
+  same one-time warning for clients that report no headers); single flight
+  with waiters bounded by `fetch_timeout` (`InternalError`,
+  `code == "discovery_fetch_timeout"`, retryable); no request for
+  `failure_backoff` seconds after a failed fetch (`InternalError`,
+  `code == "discovery_backoff"`; its `retryable` follows the original error,
+  chained as a traceback-free `__cause__`); a waiter that times out is served
+  stale metadata under the same policy;
+  expired metadata is served after a failed refetch only with
+  `stale_on_error=True` and at most `max_stale` seconds past expiry, with a
+  one-time `UserWarning` (unlike `JwksCache`, whose keys are never stale; the
+  `JwksCache` from `jwks()` keeps that policy). A discovery document whose
+  `issuer` differs from the configured one is never cached or served.
+  `rp.discover` and `ProviderInfo.from_metadata` are unchanged. See ADR 0008.
 - `rp.parse_authorization_response(params, *, response_mode=None, accept_jarm=False)`
   and the frozen `rp.AuthorizationResponse` (`code`, `state`, `error`,
   `error_description_safe`, `error_uri`, `iss`, `response`, `response_mode`,

@@ -419,6 +419,69 @@ for signed UserInfo responses. Extra checks are keyword options on both:
        access_token=ts.access_token, require_at_hash=True,
    )
 
+Long-lived RPs: discovery cache
+-------------------------------
+
+:func:`~pygrindvakt.rp.discover` is a one-shot primitive: one round trip, no
+memory. A long-running RP wants the document refreshed on the OP's schedule,
+without a refetch per login and without every login failing while the
+well-known endpoint is briefly down. :class:`~pygrindvakt.rp.DiscoveryCache`
+does that and hands out the objects the rest of the flow needs.
+
+.. code-block:: python
+
+   from pygrindvakt import http, rp
+
+   # Created once per process, next to the RpClient; thread-safe.
+   discovery = rp.DiscoveryCache(http.ReqwestClient(), "https://op.example.com")
+
+   info = discovery.info()          # rp.ProviderInfo, rebuilt when the document is refetched
+   jwks_cache = discovery.jwks()    # rp.JwksCache for info.jwks_uri; same object across refreshes
+   claims = jwks_cache.verify_id_token(id_token, me.client_id, nonce, ["ES256"])
+
+Call ``discovery.info()`` and ``discovery.jwks()`` per request instead of
+keeping the results: the first is cheap while the document is fresh, and the
+second hands you the right :class:`~pygrindvakt.rp.JwksCache` if the OP ever
+moves its ``jwks_uri``. The ``JwksCache`` keeps its keys across metadata
+refreshes as long as ``jwks_uri`` and issuer are unchanged, and is replaced
+(never reused) when they change, so keys of one location cannot verify tokens
+on behalf of another.
+
+*Refresh.* The document lives for ``Cache-Control: max-age`` minus ``Age``,
+else ``default_ttl``, clamped to ``[min_ttl, max_ttl]`` (same rules and the
+same one-time warning for HTTP clients that report no headers as
+:class:`~pygrindvakt.rp.JwksCache`). ``discovery.refresh()`` forces a refetch.
+Concurrent callers share one fetch, and waiters give up after ``fetch_timeout``
+with ``InternalError(code="discovery_fetch_timeout")``; the fetch finishes and
+is cached.
+
+*Failure and back-off.* After a failed fetch the cache makes no request for
+``failure_backoff`` seconds (default 10), so a dead well-known endpoint is not
+hammered by every login. In that window and when refetching an expired
+document fails, the cache serves the previous document **if**
+``stale_on_error`` is true (the default) and the document expired less than
+``max_stale`` seconds ago (default one day); the first time this happens a
+``UserWarning`` is emitted. Otherwise the failing call raises the original
+error and calls inside the window raise
+``InternalError(code="discovery_backoff")`` with the original as
+``__cause__``; the latter is ``retryable`` exactly when the original was
+(transient failures yes, an issuer mismatch or malformed document no). A
+thread that times out waiting for another thread's fetch (``fetch_timeout``)
+is served the stale document under the same rules instead of raising. Pass ``stale_on_error=False`` if you
+would rather fail than log users in against metadata the OP has not
+confirmed. This is deliberately more lenient than ``JwksCache``, which never
+serves expired keys; the keys obtained through ``discovery.jwks()`` keep that
+strict policy (ADR 0008).
+
+*Fork.* The cache is plain in-process memory: a forked child keeps the cached
+document and expiry. Fork only while no other thread is inside a call.
+
+``rp.discover`` and ``ProviderInfo.from_metadata`` remain the primitives
+underneath and are unchanged; use them directly for a short-lived script or
+when you want to manage refresh yourself. Issuer binding is the same either
+way: a document whose ``issuer`` differs from the configured one is rejected
+and never cached.
+
 Userinfo
 --------
 

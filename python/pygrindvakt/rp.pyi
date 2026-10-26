@@ -474,6 +474,85 @@ class JwksCache:
         """
     def __repr__(self) -> str: ...
 
+class DiscoveryCache:
+    """Caching OpenID Provider discovery client for one issuer.
+
+    :meth:`metadata` returns the discovery document, :meth:`info` the matching
+    :class:`ProviderInfo` (built once per fetch, so the ``UserWarning`` of
+    :meth:`ProviderInfo.from_metadata` fires once per fetch) and :meth:`jwks` a
+    :class:`JwksCache` bound to the advertised ``jwks_uri``. The document is
+    refetched on expiry: ``Cache-Control: max-age`` minus ``Age`` when present,
+    else ``default_ttl``, clamped to ``[min_ttl, max_ttl]`` (``no-store`` /
+    ``no-cache`` / ``max-age=0`` are floored to ``min_ttl``).
+    ``Cache-Control`` is honoured only when the ``HttpClient`` reports response
+    headers (see :class:`JwksCache`); otherwise ``default_ttl`` applies and a
+    ``UserWarning`` is emitted on the first fetch. The ``issuer`` check of
+    :func:`discover` applies on every fetch: a mismatching document raises and
+    is neither cached nor served. Concurrent callers share one fetch.
+
+    ``fetch_timeout`` (seconds, finite, at least 1e-9, default 45) bounds how
+    long a thread WAITS for another thread's in-flight fetch; on expiry the
+    waiter raises ``InternalError`` with ``code == "discovery_fetch_timeout"``.
+    The fetch carries on and its result is cached when it ends.
+
+    After a failed fetch no new network call is made for ``failure_backoff``
+    seconds. In that window, and when the refetch of an expired entry fails,
+    the previous document is served only if ``stale_on_error`` is true and the
+    entry expired less than ``max_stale`` seconds ago (a one-time
+    ``UserWarning`` is emitted when stale metadata is first served after a
+    failure). Otherwise the original error is raised or, inside the window,
+    ``InternalError`` with ``code == "discovery_backoff"`` and the original as
+    ``__cause__`` (a traceback-free copy); its ``retryable`` is the cause's.
+    A waiter that times out (``discovery_fetch_timeout``) is served the stale
+    document under the same rules first. This differs from :class:`JwksCache`, which never serves an
+    expired key set: keys stay never-stale through the :class:`JwksCache` that
+    :meth:`jwks` returns.
+
+    The cache is in-process memory; it stays valid after ``fork``, but fork
+    only while no other thread is inside a cache call.
+
+    .. versionadded:: 0.3.0
+    """
+
+    def __init__(
+        self,
+        http: _HttpArg,
+        issuer: str,
+        *,
+        default_ttl: int = 3600,
+        min_ttl: int = 60,
+        max_ttl: int = 86400,
+        failure_backoff: int = 10,
+        stale_on_error: bool = True,
+        max_stale: int = 86400,
+        fetch_timeout: float = 45.0,
+        allow_cross_origin_end_session: bool = False,
+    ) -> None: ...
+    @property
+    def issuer(self) -> str: ...
+    @property
+    def failure_backoff(self) -> int: ...
+    @property
+    def fetch_timeout(self) -> float: ...
+    def metadata(self) -> ProviderMetadata:
+        """The discovery document, fetched first if absent or expired."""
+    def info(self) -> ProviderInfo:
+        """``ProviderInfo.from_metadata(metadata())``, built once per fetch."""
+    def jwks(self) -> JwksCache:
+        """A :class:`JwksCache` for the advertised ``jwks_uri`` and issuer.
+
+        The same object is returned across metadata refreshes, so its keys
+        survive; it is replaced (and the old object never returned again) only
+        when the ``jwks_uri`` or issuer changes. The cache is built with the
+        :class:`JwksCache` constructor defaults for the TTL parameters; a
+        caller holding an older document is given the newer installed cache.
+        Raises ``ConfigError`` if the provider advertises no ``jwks_uri``.
+        """
+    def refresh(self) -> None:
+        """Force a refetch; a no-op within ``failure_backoff`` seconds of a
+        failed fetch. A failed fetch raises and keeps the cached document."""
+    def __repr__(self) -> str: ...
+
 @overload
 def fetch_userinfo(
     http: _HttpArg,

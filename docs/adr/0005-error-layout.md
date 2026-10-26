@@ -38,8 +38,9 @@ was an authentication step, and whether a retry is sensible.
    branch on the class for those.
 3. **`GrindvaktError.retryable`** is defined by the binding, not by grindvakt:
    upstream status >= 500 or 429, or code `transport`, `jwks_fetch_timeout`,
-   `discovery_backoff`. The code rule applies only to codes the binding itself
-   sets; a `code` adopted from upstream OAuth text never makes a failure
+   `discovery_backoff`, `discovery_fetch_timeout`. Amended by ADR 0008:
+   `retryable` of `discovery_backoff` follows its cause. The code rule applies
+   only to codes the binding itself sets; a `code` adopted from upstream OAuth text never makes a failure
    retryable (a hostile IdP returning `error=transport` stays non-retryable).
    Attributes are applied best-effort and the typed error is never replaced: if a
    `setattr` ever failed, a note is attached and the class-level defaults apply

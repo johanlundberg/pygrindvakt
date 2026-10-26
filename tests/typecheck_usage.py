@@ -143,6 +143,27 @@ def use_all() -> None:
         fetch_timeout=5.0,
     )
     rp.JwksCache(None, "https://op.example.com/jwks", "https://op.example.com")
+    dcache = rp.DiscoveryCache(
+        reqwest,
+        "https://op.example.com",
+        default_ttl=600,
+        min_ttl=30,
+        max_ttl=3600,
+        failure_backoff=5,
+        stale_on_error=False,
+        max_stale=120,
+        fetch_timeout=5.0,
+        allow_cross_origin_end_session=True,
+    )
+    rp.DiscoveryCache(None, "https://op.example.com")
+    dmeta: metadata.ProviderMetadata = dcache.metadata()
+    dinfo: rp.ProviderInfo = dcache.info()
+    dkeys: rp.JwksCache = dcache.jwks()
+    dcache.refresh()
+    dissuer: str = dcache.issuer
+    dbackoff: int = dcache.failure_backoff
+    dtimeout: float = dcache.fetch_timeout
+    del dmeta, dinfo, dkeys, dissuer, dbackoff, dtimeout
     keyset: dict[str, object] = cache.jwks()
     cache.refresh()
     cached_claims: dict[str, object] = cache.verify_id_token(

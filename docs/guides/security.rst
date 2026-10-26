@@ -191,6 +191,22 @@ framework integrations cannot accidentally omit deployment-critical choices.
        ``iss`` unless you pass ``required=False`` for an
        OP that does not advertise
        ``authorization_response_iss_parameter_supported``).
+   * - :class:`~pygrindvakt.rp.DiscoveryCache` serves an expired discovery
+       document only after a failed refetch, only with ``stale_on_error=True``
+       and only up to ``max_stale`` seconds past its expiry, and only for the
+       configured issuer: a document whose ``issuer`` differs is never cached
+       or served. Its ``jwks()`` returns a :class:`~pygrindvakt.rp.JwksCache`
+       that is rebuilt (the old one never returned again) when ``jwks_uri`` or
+       issuer change, and that never serves expired keys.
+     - Unbounded stale metadata would be fail-open: an OP that moved its
+       endpoints or retired a key location would be trusted indefinitely. The
+       bound, the opt-out and the surfaced failure (a one-time
+       ``UserWarning``, ``discovery_backoff`` with the original as
+       ``__cause__``) keep it visible. Keys, the actual trust anchor of
+       ID-token verification, stay never-stale, and keys cached for one
+       ``jwks_uri`` cannot verify tokens after the OP moves it (ADR 0008).
+     - ``stale_on_error=False`` to never serve expired metadata;
+       ``max_stale`` to shorten the window. Raising ``max_stale`` widens it.
 
 If grindvakt later adopts these guards upstream, the binding's checks become
 redundant but harmless.
@@ -426,6 +442,17 @@ Python protocol adapters
    you write yourself is inside the trust boundary. The binding guarantees
    that an *exception* fails closed; it cannot guarantee that a ``consume``
    that always returns ``True`` is a bug. Test them.
+
+``DiscoveryCache(stale_on_error=True, max_stale=...)``
+   During an outage of the well-known endpoint the cache keeps serving the
+   last discovery document, up to ``max_stale`` seconds (default 24 hours)
+   past its expiry, with a one-time ``UserWarning``. The worst case is the
+   document's lifetime plus ``max_stale``: with the defaults (``max_ttl`` 24
+   hours, ``max_stale`` 24 hours) an endpoint change can go unnoticed for up
+   to about two days of an outage. That keeps login working but means
+   endpoint changes made by the OP are not seen meanwhile. Pass
+   ``stale_on_error=False`` to fail instead, or lower ``max_stale``. Keys are
+   unaffected: ``cache.jwks()`` never serves an expired key set. See ADR 0008.
 
 In-memory stores
    :class:`~pygrindvakt.provider.InMemoryTokenUseStore`,

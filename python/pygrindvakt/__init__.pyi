@@ -75,7 +75,7 @@ class GrindvaktError(Exception):
     auth_failure: bool
     """True for an authentication-step failure (``AuthnError``, rejected token/UserInfo request). False for ``UnknownKeyError``, the DPoP errors and metadata fetches: not a general "authentication failed" flag."""
     retryable: bool
-    """True for upstream status >= 500 or 429, or code ``transport``, ``jwks_fetch_timeout``, ``discovery_backoff``."""
+    """True for upstream status >= 500 or 429, or code ``transport``, ``jwks_fetch_timeout``, ``discovery_backoff`` (which takes the ``retryable`` of the failure it is chained to), ``discovery_fetch_timeout``."""
 
     @property
     def log_summary(self) -> str:

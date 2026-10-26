@@ -505,6 +505,106 @@ Discovery and keys
 
    .. versionadded:: 0.2.0
 
+.. py:class:: DiscoveryCache(http: HttpClientProtocol | None, issuer: str, *, default_ttl: int = 3600, min_ttl: int = 60, max_ttl: int = 86400, failure_backoff: int = 10, stale_on_error: bool = True, max_stale: int = 86400, fetch_timeout: float = 45.0, allow_cross_origin_end_session: bool = False)
+
+   A thread-safe cache of one issuer's discovery document (frozen; read-only
+   ``issuer``, ``failure_backoff`` and ``fetch_timeout`` properties). ``issuer``
+   is validated at construction exactly as :func:`discover` does (and a
+   backslash is refused), and so is ``http``; negative ``default_ttl``,
+   ``min_ttl``, ``max_ttl``, ``failure_backoff`` or ``max_stale``, a
+   ``min_ttl`` above ``max_ttl`` and a ``fetch_timeout`` that is not finite or
+   below 1e-9 raise :class:`~pygrindvakt.ConfigError`. A ``default_ttl``
+   outside ``[min_ttl, max_ttl]`` is clamped, not rejected. No request is made
+   until first use. The cache is the long-lived counterpart of
+   :func:`discover`, which stays a one-shot primitive and is unchanged.
+
+   .. versionadded:: 0.3.0
+
+   **Lifetime.** The document lives for the response's
+   ``Cache-Control: max-age`` minus its ``Age`` header when present, otherwise
+   ``default_ttl`` seconds, clamped to ``[min_ttl, max_ttl]``. ``no-store``,
+   ``no-cache`` and ``max-age=0`` give 0, which ``min_ttl`` raises (``min_ttl=0``
+   leaves them uncached). As for :class:`JwksCache`, headers are honoured only
+   when the HTTP client reports them; otherwise ``default_ttl`` applies and a
+   ``UserWarning`` is emitted on the first fetch.
+
+   **Issuer binding.** Every fetch goes through :func:`discover`, so a
+   document whose ``issuer`` differs from the configured one raises
+   (:class:`pygrindvakt.AuthnError`, the same error as :func:`discover`) and is
+   never cached or served; the previous good document, if any, stays the only
+   candidate for stale serving.
+
+   **Failure policy.** After a failed fetch no network call is made for
+   ``failure_backoff`` seconds. Inside that window, and when the refetch of an
+   expired entry fails:
+
+   * the previous document is served if ``stale_on_error`` is true **and** the
+     entry expired less than ``max_stale`` seconds ago; a one-time
+     ``UserWarning`` is emitted when stale metadata is first served after a
+     failure (again after the next outage);
+   * otherwise the call that hit the network raises the original error, and
+     calls inside the window raise :class:`pygrindvakt.InternalError` with
+     ``code == "discovery_backoff"`` and the original error as ``__cause__``
+     (a copy without traceback). Its ``retryable`` is that of the cause:
+     ``True`` for a transient failure (transport, upstream 5xx or 429),
+     ``False`` for a permanent one (issuer mismatch, malformed document).
+
+   With ``stale_on_error=False`` an expired document is never served. A
+   document older than ``max_stale`` past its expiry is never served. An
+   unexpired document is served regardless. This differs from
+   :class:`JwksCache`, which never serves an expired key set: metadata changes
+   rarely, and an outage of the well-known endpoint should not break login
+   for a day. Keys stay never-stale because :meth:`jwks` returns a real
+   :class:`JwksCache` with its own policy. See ADR 0008.
+
+   **Concurrency.** Callers share one in-flight fetch. ``fetch_timeout``
+   (seconds) bounds how long a thread *waits* for another thread's fetch; on
+   expiry the waiter first applies the stale policy above: with
+   ``stale_on_error`` true and a previous document that expired less than
+   ``max_stale`` seconds ago it is served (with the one-time ``UserWarning``);
+   otherwise the waiter raises :class:`pygrindvakt.InternalError` with
+   ``code == "discovery_fetch_timeout"`` (``retryable`` is ``True``). The
+   fetching thread is not interrupted (your HTTP client must set its own
+   network timeouts) and its result is cached when it finishes.
+
+   **Fork.** The cache is plain in-process memory, so a forked child keeps the
+   cached document and its expiry (the clock is monotonic). As with the rest
+   of the library, fork only while no other thread is inside a call.
+
+   .. py:method:: metadata() -> ProviderMetadata
+
+      The discovery document, fetched first if none is cached or it expired,
+      subject to the failure policy above.
+
+   .. py:method:: info() -> ProviderInfo
+
+      ``ProviderInfo.from_metadata(metadata())``, built once per fetch, so the
+      ``UserWarning`` of ``from_metadata`` (a dropped ``end_session_endpoint``)
+      is emitted once per fetch and not on every call.
+      ``allow_cross_origin_end_session`` is passed through.
+
+   .. py:method:: jwks() -> JwksCache
+
+      A :class:`JwksCache` bound to ``info().jwks_uri`` and ``info().issuer``,
+      sharing this cache's HTTP client, clock and ``fetch_timeout`` and using
+      the :class:`JwksCache` constructor defaults for the TTL parameters
+      (``default_ttl=3600``, ``min_ttl=60``, ``max_ttl=86400``,
+      ``min_refresh_interval=30``). The SAME object is
+      returned across metadata refreshes, so the keys cached in it survive;
+      it is replaced only when a new document advertises a different
+      ``jwks_uri`` or issuer, and the old object is then never returned again
+      (call ``jwks()`` each time instead of holding on to the result, since
+      an old object keeps verifying against the old ``jwks_uri``). Under
+      concurrency a caller that still holds an older metadata document than
+      the one the installed cache was built for is given the installed
+      (newer) cache; an older document never replaces a newer cache.
+
+   .. py:method:: refresh() -> None
+
+      Force a refetch of the document. A call within ``failure_backoff``
+      seconds of a failed fetch returns without fetching. A failing fetch
+      raises the original error and leaves the cached document in place.
+
 The authorization response
 --------------------------
 

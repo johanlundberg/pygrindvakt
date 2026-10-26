@@ -173,7 +173,9 @@ Base class
 
       ``True`` when retrying the same call later may succeed: the upstream
       answered with HTTP status 500 or above or 429, or ``code`` is
-      ``transport``, ``jwks_fetch_timeout`` or ``discovery_backoff``. This is
+      ``transport``, ``jwks_fetch_timeout``, ``discovery_backoff`` or
+      ``discovery_fetch_timeout`` (except that ``discovery_backoff`` takes the
+      ``retryable`` of the failure it is chained to, see below). This is
       defined by pygrindvakt, not by grindvakt. ``False`` otherwise,
       including for a 4xx answer from the upstream and for every error
       raised for invalid arguments. It says nothing about idempotency or
@@ -286,9 +288,20 @@ Instance-level overrides:
   call waited longer than ``fetch_timeout`` seconds for another thread's
   in-flight JWKS fetch. The fetching thread is not interrupted and the cache
   stays usable. ``retryable`` is ``True``.
-* ``discovery_backoff``: reserved for a discovery fetch refused while a
-  previous failure is still backing off. ``retryable`` is ``True``. The
-  binding does not raise it yet.
+* ``discovery_fetch_timeout`` (``InternalError``): a
+  :class:`pygrindvakt.rp.DiscoveryCache` call waited longer than
+  ``fetch_timeout`` seconds for another thread's in-flight discovery fetch.
+  The fetching thread is not interrupted and its result is cached.
+  ``retryable`` is ``True``.
+* ``discovery_backoff`` (``InternalError``): a
+  :class:`pygrindvakt.rp.DiscoveryCache` call made no request because the
+  last discovery fetch failed less than ``failure_backoff`` seconds ago and no
+  stale document may be served (``stale_on_error=False``, none cached, or it
+  is older than ``max_stale``). The original failure is chained as
+  ``__cause__`` (a copy without traceback, so it holds no frames).
+  ``retryable`` is the ``retryable`` of that cause: ``True`` after a
+  transport error, an upstream 5xx or 429, ``False`` after a permanent
+  failure such as an issuer mismatch or a malformed document.
 * ``shared_secret_algorithm`` (``ConfigError``): ``HS256``, ``HS384`` or
   ``HS512`` in ``allowed_algorithms`` together with a
   :class:`pygrindvakt.rp.JwksCache`. A published JWK Set never carries the
@@ -327,6 +340,9 @@ Instance-level overrides:
 .. versionchanged:: 0.3.0
    The stable codes ``jwks_fetch_timeout`` and ``discovery_backoff`` are
    listed above together with the ``retryable`` attribute.
+.. versionadded:: 0.3.0
+   The codes ``discovery_fetch_timeout`` (and, raised by
+   :class:`pygrindvakt.rp.DiscoveryCache`, ``discovery_backoff``).
 .. versionadded:: 0.3.0
    The codes ``shared_secret_algorithm``, ``weak_shared_secret`` and
    ``symmetric_algorithm``.

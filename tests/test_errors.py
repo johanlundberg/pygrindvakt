@@ -548,7 +548,7 @@ def test_transport_error_is_typed_with_chained_cause():
     assert not getattr(ei.value, "__notes__", None)
 
 
-@pytest.mark.parametrize("spoof", ["transport", "jwks_fetch_timeout", "discovery_backoff"])
+@pytest.mark.parametrize("spoof", ["transport", "jwks_fetch_timeout", "discovery_backoff", "discovery_fetch_timeout"])
 def test_upstream_error_string_cannot_spoof_retryable(spoof):
     body = f'{{"error":"{spoof}"}}'.encode()
     for status in (400, 401):
@@ -559,7 +559,7 @@ def test_upstream_error_string_cannot_spoof_retryable(spoof):
         assert ei.value.retryable is False
 
 
-@pytest.mark.parametrize("spoof", ["transport", "jwks_fetch_timeout", "discovery_backoff"])
+@pytest.mark.parametrize("spoof", ["transport", "jwks_fetch_timeout", "discovery_backoff", "discovery_fetch_timeout"])
 def test_upstream_error_string_with_5xx_is_retryable_by_status(spoof):
     body = f'{{"error":"{spoof}"}}'.encode()
     with pytest.raises(AuthnError) as ei:

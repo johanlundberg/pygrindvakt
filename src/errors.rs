@@ -250,9 +250,11 @@ pub fn config_from(e: RsError) -> PyErr {
 
 /// Codes of failures worth retrying (transient by nature).
 ///
-/// `discovery_backoff` is not raised by the binding yet; it is listed so the
-/// discovery back-off error (G1) is retryable from the day it appears.
-const RETRYABLE_CODES: [&str; 3] = ["transport", "jwks_fetch_timeout", "discovery_backoff"];
+/// `discovery_fetch_timeout` is raised by `rp.DiscoveryCache`.
+/// `discovery_backoff` is deliberately NOT listed: its `retryable` follows the
+/// stored cause (`with_code_retryable`), so a `with_code` call for it must not
+/// be able to claim unconditional retryability.
+const RETRYABLE_CODES: [&str; 3] = ["transport", "jwks_fetch_timeout", "discovery_fetch_timeout"];
 
 /// Single source of truth for `retryable`. The status rule (upstream 5xx or
 /// 429) is not spoofable and applies to any upstream failure. The code rule
@@ -322,6 +324,18 @@ pub fn with_code(py: Python<'_>, e: PyErr, code: &str) -> PyErr {
     if is_retryable(Some(code), None) {
         attrs.set("retryable", true);
     }
+    attrs.finish();
+    e
+}
+
+/// Like `with_code`, but `retryable` is set explicitly instead of derived
+/// from the code. For `discovery_backoff`, which inherits the `retryable` of
+/// the stored failure it is chained to (that value was itself derived by
+/// `is_retryable`, so upstream text never reaches it).
+pub fn with_code_retryable(py: Python<'_>, e: PyErr, code: &str, retryable: bool) -> PyErr {
+    let mut attrs = Attrs::new(py, &e);
+    attrs.set("code", code);
+    attrs.set("retryable", retryable);
     attrs.finish();
     e
 }

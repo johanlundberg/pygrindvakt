@@ -181,6 +181,8 @@ repository rather than in this manual:
   `HS*` ID tokens use a key set built from the `client_secret`; published JWKS never supply shared secrets (0.3.0).
 * `ADR 0007 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0007-authorization-response-parsing.md>`_:
   authorization response parsing: fail-closed callback parse, no raw `error_description`, `iss` compared by the caller (0.3.0).
+* `ADR 0008 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0008-discovery-cache.md>`_:
+  discovery cache: `rp.DiscoveryCache` with single flight, failure back-off and bounded stale metadata; keys never stale (0.3.0).
 
 The full list lives in the `docs/adr
 <https://github.com/kushaldas/pygrindvakt/tree/main/docs/adr>`_ directory.

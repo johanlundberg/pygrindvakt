@@ -33,7 +33,8 @@ use grindvakt::rp::ClientAuth;
 use crate::convert::{from_py, new_submodule, protocol_parameter_pairs, to_py, warn};
 use crate::errors::{
     config_err, config_from, err, escape_untrusted_quoted, escape_untrusted_text,
-    is_invisible_format, with_code, AuthnError, InternalError, UnknownKeyError,
+    is_invisible_format, with_code, with_code_retryable, AuthnError, InternalError,
+    UnknownKeyError,
 };
 use crate::http::extract_http_client;
 use crate::jwt::{drop_oct_keys, is_mac, jwks_from_py, prepare_mac_keys, KeySelection};
@@ -1024,26 +1025,52 @@ fn discover(
     issuer: String,
 ) -> PyResult<ProviderMetadata> {
     let (http, failures) = extract_http_client(http)?;
-    // `grp::discover` returns only the parsed struct. Wrap the client so the
-    // body it fetched can be kept as `raw`; all validation stays upstream.
-    let recorder = Arc::new(BodyRecorder {
+    discover_recorded(py, http, &failures, issuer).map(|d| d.metadata)
+}
+
+/// A discovery document together with what the fetch reported about itself.
+struct Discovered {
+    metadata: ProviderMetadata,
+    /// Headers of the 200 response the document came from (empty when the
+    /// client reports none).
+    headers: Vec<(String, String)>,
+    /// A response arrived and carried no header at all.
+    headerless: bool,
+}
+
+/// Run `grp::discover` through a [`RecordingClient`]. `grp::discover` returns
+/// only the parsed struct, so the client is wrapped to keep the fetched body
+/// as `raw` (and the response headers for the caller); all validation stays
+/// upstream.
+fn discover_recorded(
+    py: Python<'_>,
+    http: Arc<dyn HttpClient>,
+    failures: &crate::http::Failures,
+    issuer: String,
+) -> PyResult<Discovered> {
+    let probe = Arc::new(HeaderProbe {
         inner: http,
-        last_ok_body: Mutex::new(None),
+        saw_response: Default::default(),
+        saw_headers: Default::default(),
+    });
+    let recorder = Arc::new(RecordingClient {
+        inner: probe.clone(),
+        last_ok: Mutex::new(None),
     });
     let client: Arc<dyn HttpClient> = recorder.clone();
     let r = crate::runtime::block_on(py, async move { grp::discover(&client, &issuer).await })?;
     let metadata = r.map_err(|e| failures.err(py, e))?;
-    let raw = recorder
-        .last_ok_body
-        .lock()
-        .ok()
-        .and_then(|mut g| g.take())
+    let (body, headers) = match recorder.last_ok.lock().ok().and_then(|mut g| g.take()) {
+        Some((b, h)) => (Some(b), h),
+        None => (None, Vec::new()),
+    };
+    let raw = body
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| match v {
             serde_json::Value::Object(m) => Some(m),
             _ => None,
         });
-    Ok(match raw {
+    let metadata = match raw {
         Some(raw) => ProviderMetadata::wrap_with_raw(metadata, raw),
         // Unreachable in practice (upstream parsed the same body); fall back
         // to the re-serialized document.
@@ -1057,22 +1084,31 @@ fn discover(
                 None => ProviderMetadata::wrap(metadata),
             }
         }
+    };
+    Ok(Discovered {
+        metadata,
+        headers,
+        headerless: probe.headerless(),
     })
 }
 
-/// `HttpClient` decorator remembering the body of the last 200 GET response.
-struct BodyRecorder {
+/// Body and headers of one response.
+type RecordedResponse = (Vec<u8>, Vec<(String, String)>);
+
+/// `HttpClient` decorator remembering the body and headers of the last 200 GET
+/// response.
+struct RecordingClient {
     inner: Arc<dyn HttpClient>,
-    last_ok_body: Mutex<Option<Vec<u8>>>,
+    last_ok: Mutex<Option<RecordedResponse>>,
 }
 
 #[async_trait]
-impl HttpClient for BodyRecorder {
+impl HttpClient for RecordingClient {
     async fn get(&self, url: &str) -> grindvakt::Result<HttpFetchResponse> {
         let resp = self.inner.get(url).await?;
         if resp.status == 200 {
-            if let Ok(mut g) = self.last_ok_body.lock() {
-                *g = Some(resp.body.clone());
+            if let Ok(mut g) = self.last_ok.lock() {
+                *g = Some((resp.body.clone(), resp.headers.clone()));
             }
         }
         Ok(resp)
@@ -1729,18 +1765,101 @@ impl HttpClient for HeaderProbe {
     }
 }
 
-/// RAII token for the single in-flight fetch; see `JwksCache::begin_flight`.
+/// RAII token for the single in-flight fetch; see `begin_flight`. Shared by
+/// `JwksCache` and `DiscoveryCache`.
 struct Flight<'a> {
-    cache: &'a JwksCache,
+    busy: &'a Mutex<bool>,
+    done: &'a Condvar,
 }
 
 impl Drop for Flight<'_> {
     fn drop(&mut self) {
-        let mut busy = self.cache.flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         *busy = false;
-        self.cache.flight_done.notify_one();
+        self.done.notify_one();
     }
 }
+
+/// Clock reading: the injected `_now` hook, else the monotonic clock. A hook
+/// that raises or returns a non-float falls back to the monotonic clock.
+fn clock_now(clock: &Option<Py<PyAny>>) -> f64 {
+    match clock {
+        Some(clock) => Python::attach(|py| clock.call0(py).and_then(|v| v.extract::<f64>(py)))
+            .unwrap_or_else(|_| monotonic_now()),
+        None => monotonic_now(),
+    }
+}
+
+/// Wait (with the GIL released, because the holder needs the GIL to run a
+/// Python HTTP adapter) until no other thread is fetching, then become the
+/// fetching thread. The wait is bounded by `timeout` (real time, not the
+/// injected test clock); on expiry it raises `InternalError(code=timeout_code)`
+/// whose message names `what`. The holder is never interrupted and still clears
+/// the flight when it finishes.
+fn begin_flight<'a>(
+    py: Python<'_>,
+    busy: &'a Mutex<bool>,
+    done: &'a Condvar,
+    timeout: std::time::Duration,
+    what: &str,
+    timeout_code: &str,
+) -> PyResult<Flight<'a>> {
+    let acquired = py.detach(|| {
+        // `None`: the timeout is too large to represent; wait unbounded.
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let mut guard = busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *guard {
+            let wait = match deadline {
+                None => std::time::Duration::from_secs(3600),
+                Some(d) => {
+                    let left = d.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    left
+                }
+            };
+            guard = done
+                .wait_timeout(guard, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *guard = true;
+        true
+    });
+    if !acquired {
+        let msg = format!(
+            "timed out after {}s waiting for another thread's {what}",
+            timeout.as_secs_f64()
+        );
+        return Err(with_code(py, InternalError::new_err(msg), timeout_code));
+    }
+    Ok(Flight { busy, done })
+}
+
+/// Validate and convert a `fetch_timeout` argument (seconds).
+fn parse_fetch_timeout(fetch_timeout: f64) -> PyResult<std::time::Duration> {
+    const MSG: &str = "fetch_timeout must be a finite number of seconds, at least 1e-9";
+    if !(fetch_timeout.is_finite() && fetch_timeout > 0.0) {
+        return Err(config_err(MSG));
+    }
+    // Absurdly large values saturate instead of panicking.
+    let d =
+        std::time::Duration::try_from_secs_f64(fetch_timeout).unwrap_or(std::time::Duration::MAX);
+    if d.is_zero() {
+        return Err(config_err(MSG));
+    }
+    Ok(d)
+}
+
+/// Defaults of the `JwksCache` constructor, defined once: the pyo3 signature
+/// and `DiscoveryCache::jwks` (which builds its `JwksCache` with them) both use
+/// these, so they cannot drift.
+const JWKS_DEFAULT_TTL: i64 = 3600;
+const JWKS_MIN_TTL: i64 = 60;
+const JWKS_MAX_TTL: i64 = 86400;
+const JWKS_MIN_REFRESH_INTERVAL: i64 = 30;
+const JWKS_FETCH_TIMEOUT: f64 = 45.0;
 
 /// A caching JWK Set fetcher for one issuer.
 ///
@@ -1799,12 +1918,56 @@ pub struct JwksCache {
 }
 
 impl JwksCache {
-    fn now(&self) -> f64 {
-        match &self.clock {
-            Some(clock) => Python::attach(|py| clock.call0(py).and_then(|v| v.extract::<f64>(py)))
-                .unwrap_or_else(|_| monotonic_now()),
-            None => monotonic_now(),
+    /// Validate the arguments and build a cache. Shared by the Python
+    /// constructor and `DiscoveryCache::jwks`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        http: Option<&Bound<'_, PyAny>>,
+        jwks_uri: String,
+        issuer: String,
+        default_ttl: i64,
+        min_ttl: i64,
+        max_ttl: i64,
+        min_refresh_interval: i64,
+        fetch_timeout: f64,
+        clock: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        // Validate the client and the URLs now rather than on first use.
+        extract_http_client(http)?;
+        reject_reinterpreted_url_chars("issuer", &issuer).map_err(config_from)?;
+        reject_reinterpreted_url_chars("jwks_uri", &jwks_uri).map_err(config_from)?;
+        grp::validate_issuer(&issuer).map_err(config_from)?;
+        grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer)
+            .map_err(config_from)?;
+        let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
+        let (default_ttl, min_ttl, max_ttl) = (
+            get("default_ttl", default_ttl)?,
+            get("min_ttl", min_ttl)?,
+            get("max_ttl", max_ttl)?,
+        );
+        if min_ttl > max_ttl {
+            return Err(config_err("min_ttl must not exceed max_ttl"));
         }
+        let fetch_timeout = parse_fetch_timeout(fetch_timeout)?;
+        Ok(Self {
+            http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
+            jwks_uri,
+            issuer,
+            default_ttl,
+            min_ttl,
+            max_ttl,
+            min_refresh_interval: get("min_refresh_interval", min_refresh_interval)?,
+            fetch_timeout,
+            clock,
+            state: RwLock::default(),
+            flight: Mutex::new(false),
+            flight_done: Condvar::new(),
+            warned_no_headers: Default::default(),
+        })
+    }
+
+    fn now(&self) -> f64 {
+        clock_now(&self.clock)
     }
 
     fn snapshot(&self) -> Option<Arc<CacheEntry>> {
@@ -1819,49 +1982,17 @@ impl JwksCache {
         self.snapshot().filter(|e| now < e.expires_at)
     }
 
-    /// Wait (with the GIL released, because the holder needs the GIL to run a
-    /// Python HTTP adapter) until no other thread is fetching, then become the
-    /// fetching thread. The wait is bounded by `fetch_timeout` (real time,
-    /// not the injected test clock); on expiry it raises
-    /// `InternalError(code="jwks_fetch_timeout")`. The holder is never
-    /// interrupted and still clears the flight when it finishes.
+    /// Become the fetching thread; see the free `begin_flight`. A waiter that
+    /// times out raises `InternalError(code="jwks_fetch_timeout")`.
     fn begin_flight(&self, py: Python<'_>) -> PyResult<Flight<'_>> {
-        let acquired = py.detach(|| {
-            // `None`: the timeout is too large to represent; wait unbounded.
-            let deadline = std::time::Instant::now().checked_add(self.fetch_timeout);
-            let mut busy = self.flight.lock().unwrap_or_else(|e| e.into_inner());
-            while *busy {
-                let wait = match deadline {
-                    None => std::time::Duration::from_secs(3600),
-                    Some(d) => {
-                        let left = d.saturating_duration_since(std::time::Instant::now());
-                        if left.is_zero() {
-                            return false;
-                        }
-                        left
-                    }
-                };
-                busy = self
-                    .flight_done
-                    .wait_timeout(busy, wait)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-            }
-            *busy = true;
-            true
-        });
-        if !acquired {
-            let msg = format!(
-                "timed out after {}s waiting for another thread's JWKS fetch",
-                self.fetch_timeout.as_secs_f64()
-            );
-            return Err(with_code(
-                py,
-                InternalError::new_err(msg),
-                "jwks_fetch_timeout",
-            ));
-        }
-        Ok(Flight { cache: self })
+        begin_flight(
+            py,
+            &self.flight,
+            &self.flight_done,
+            self.fetch_timeout,
+            "JWKS fetch",
+            "jwks_fetch_timeout",
+        )
     }
 
     fn rate_limited(&self, now: f64) -> bool {
@@ -1973,9 +2104,10 @@ fn kid_unknown(jwks: &JwkSet, kid: &str) -> bool {
 #[pymethods]
 impl JwksCache {
     #[new]
-    #[pyo3(signature = (http, jwks_uri, issuer, *, default_ttl = 3600, min_ttl = 60,
-                        max_ttl = 86400, min_refresh_interval = 30, fetch_timeout = 45.0,
-                        _now = None))]
+    #[pyo3(signature = (http, jwks_uri, issuer, *, default_ttl = JWKS_DEFAULT_TTL,
+                        min_ttl = JWKS_MIN_TTL, max_ttl = JWKS_MAX_TTL,
+                        min_refresh_interval = JWKS_MIN_REFRESH_INTERVAL,
+                        fetch_timeout = JWKS_FETCH_TIMEOUT, _now = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         http: Option<&Bound<'_, PyAny>>,
@@ -1988,52 +2120,18 @@ impl JwksCache {
         fetch_timeout: f64,
         _now: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        // Validate the client and the URLs now rather than on first use.
-        extract_http_client(http)?;
-        reject_reinterpreted_url_chars("issuer", &issuer).map_err(config_from)?;
-        reject_reinterpreted_url_chars("jwks_uri", &jwks_uri).map_err(config_from)?;
-        grp::validate_issuer(&issuer).map_err(config_from)?;
-        grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer)
-            .map_err(config_from)?;
-        let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
-        let (default_ttl, min_ttl, max_ttl) = (
-            get("default_ttl", default_ttl)?,
-            get("min_ttl", min_ttl)?,
-            get("max_ttl", max_ttl)?,
-        );
-        if min_ttl > max_ttl {
-            return Err(config_err("min_ttl must not exceed max_ttl"));
-        }
-        if !(fetch_timeout.is_finite() && fetch_timeout > 0.0) {
-            return Err(config_err(
-                "fetch_timeout must be a finite number of seconds, at least 1e-9",
-            ));
-        }
-        // Absurdly large values saturate instead of panicking.
-        let fetch_timeout = std::time::Duration::try_from_secs_f64(fetch_timeout)
-            .unwrap_or(std::time::Duration::MAX);
-        if fetch_timeout.is_zero() {
-            return Err(config_err(
-                "fetch_timeout must be a finite number of seconds, at least 1e-9",
-            ));
-        }
-        Ok(Self {
-            http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
+        Self::build(
+            http,
             jwks_uri,
             issuer,
             default_ttl,
             min_ttl,
             max_ttl,
-            min_refresh_interval: get("min_refresh_interval", min_refresh_interval)?,
+            min_refresh_interval,
             fetch_timeout,
-            clock: _now,
-            state: RwLock::default(),
-            flight: Mutex::new(false),
-            flight_done: Condvar::new(),
-            warned_no_headers: Default::default(),
-        })
+            _now,
+        )
     }
-
     #[getter]
     fn jwks_uri(&self) -> &str {
         &self.jwks_uri
@@ -2128,6 +2226,581 @@ impl JwksCache {
         Ok(policy
             .verify(py, &set, id_token, &self.issuer, client_id, expected_nonce)?
             .into_bound(py))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DiscoveryCache
+// ---------------------------------------------------------------------------
+
+/// One successful discovery fetch.
+struct DiscoveryEntry {
+    metadata: ProviderMetadata,
+    /// `ProviderInfo.from_metadata(metadata)`, built once per fetch so its
+    /// `UserWarning`s fire once per fetch.
+    info: ProviderInfo,
+    expires_at: f64,
+    /// Monotonically increasing, assigned when a fetched entry is installed
+    /// (fetches are serialised by the flight). Orders entries for `jwks()`.
+    generation: u64,
+}
+
+#[derive(Default)]
+struct DiscoveryState {
+    entry: Option<Arc<DiscoveryEntry>>,
+    /// The latest failed fetch (a traceback-free copy of the error and the
+    /// clock reading when it finished); cleared by a successful fetch. Drives
+    /// `failure_backoff`; see `DiscoveryCache::record_failure`.
+    failure: Option<(PyErr, f64)>,
+}
+
+/// A copy of `e` without traceback or implicit context, with its `__cause__`
+/// chain copied the same way (at most `depth` links, then cut). `copy.copy` of
+/// an exception keeps the type, args and instance attributes (`code`,
+/// `retryable`, `upstream_*`, ...) and drops `__traceback__`. If copying fails
+/// the traceback of `e` itself is cleared instead (it is already the caller's
+/// by then; losing it beats pinning frames).
+fn detached_copy(py: Python<'_>, e: &PyErr, depth: usize) -> PyErr {
+    let value = e.value(py);
+    let copied = py
+        .import("copy")
+        .and_then(|m| m.call_method1("copy", (value,)))
+        .ok()
+        .and_then(|c| c.cast_into::<pyo3::exceptions::PyBaseException>().ok());
+    let Some(copy) = copied else {
+        let kept = e.clone_ref(py);
+        kept.set_traceback(py, None);
+        return kept;
+    };
+    let _ = copy.setattr("__traceback__", py.None());
+    let cause = value
+        .getattr("__cause__")
+        .ok()
+        .filter(|c| !c.is_none() && depth > 0)
+        .map(|c| detached_copy(py, &PyErr::from_value(c), depth - 1));
+    let out = PyErr::from_value(copy.into_any());
+    out.set_cause(py, cause);
+    out
+}
+
+/// What `DiscoveryCache::backoff_outcome` decided for a call inside the
+/// back-off window of a failed fetch.
+enum Backoff {
+    Stale(Arc<DiscoveryEntry>),
+    Refused(PyErr),
+}
+
+/// A caching OpenID Provider discovery client for one issuer.
+///
+/// `metadata()` returns the provider's discovery document and `info()` the
+/// matching `ProviderInfo` (built once per fetch, so the `UserWarning`s of
+/// `ProviderInfo.from_metadata` fire once per fetch); `jwks()` returns a
+/// `JwksCache` bound to the advertised `jwks_uri` and issuer. The document is
+/// refetched when it expires. The lifetime is the response's
+/// `Cache-Control: max-age` minus `Age` when present, else `default_ttl`,
+/// clamped to `[min_ttl, max_ttl]` (so `no-store` / `no-cache` / `max-age=0`
+/// are floored to `min_ttl`). Cache-Control is honoured only when the
+/// `HttpClient` reports response headers (the built-in client does; a Python
+/// adapter must return them, see `HttpFetchResponse`); otherwise `default_ttl`
+/// applies and a `UserWarning` is emitted on the first fetch. The discovery
+/// issuer check of `rp.discover` applies on every fetch: a document whose
+/// `issuer` differs from the configured one raises and is neither cached nor
+/// served.
+///
+/// Concurrent callers share a single fetch. `fetch_timeout` (seconds, at least
+/// 1e-9, default 45) bounds how long a thread WAITS for another thread's
+/// in-flight fetch; on expiry the waiter raises
+/// `InternalError(code="discovery_fetch_timeout")`. The fetch carries on and
+/// its result is cached when it finishes; before raising, the waiter applies
+/// the stale policy below and is served the previous document if allowed. The
+/// `JwksCache` built by `jwks()` uses the same `fetch_timeout`, `http` client
+/// and clock, and the `JwksCache` constructor defaults for its TTL parameters.
+///
+/// After a failed fetch no new network call is made for `failure_backoff`
+/// seconds. In that window, and also when a fetch of an expired entry fails,
+/// the previous document is served ONLY if `stale_on_error` is true and the
+/// entry expired less than `max_stale` seconds ago (a one-time `UserWarning`
+/// is emitted when stale metadata is first served after a failure). Otherwise
+/// the original error is raised, or inside the window
+/// `InternalError(code="discovery_backoff")` chained to a traceback-free copy
+/// of it (`__cause__`); its `retryable` is the cause's.
+/// This differs from `JwksCache`, which never serves an expired key set:
+/// metadata changes rarely and an outage of the well-known endpoint should
+/// not break login, while keys stay never-stale through the `JwksCache` that
+/// `jwks()` returns.
+///
+/// The cache is plain in-process memory: it stays valid in a forked child, but
+/// fork only while no other thread is inside a cache call.
+///
+/// `_now` is a private test hook: a zero-argument callable returning the
+/// clock in seconds.
+#[pyclass(module = "pygrindvakt.rp", name = "DiscoveryCache", frozen)]
+pub struct DiscoveryCache {
+    http: Option<Py<PyAny>>,
+    issuer: String,
+    default_ttl: u64,
+    min_ttl: u64,
+    max_ttl: u64,
+    failure_backoff: u64,
+    stale_on_error: bool,
+    max_stale: u64,
+    fetch_timeout: std::time::Duration,
+    allow_cross_origin_end_session: bool,
+    clock: Option<Py<PyAny>>,
+    state: RwLock<DiscoveryState>,
+    /// The `JwksCache` handed out by `jwks()` and the generation of the
+    /// metadata entry it was built for.
+    jwks_slot: Mutex<Option<(u64, Py<JwksCache>)>>,
+    /// Source of `DiscoveryEntry::generation`.
+    generation: std::sync::atomic::AtomicU64,
+    flight: Mutex<bool>,
+    flight_done: Condvar,
+    /// The no-response-headers warning is emitted once per cache.
+    warned_no_headers: std::sync::atomic::AtomicBool,
+    /// The stale-served warning is emitted once per outage (re-armed by a
+    /// successful fetch).
+    warned_stale: std::sync::atomic::AtomicBool,
+}
+
+impl DiscoveryCache {
+    fn now(&self) -> f64 {
+        clock_now(&self.clock)
+    }
+
+    fn snapshot(&self) -> Option<Arc<DiscoveryEntry>> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry
+            .clone()
+    }
+
+    fn valid_entry(&self, now: f64) -> Option<Arc<DiscoveryEntry>> {
+        self.snapshot().filter(|e| now < e.expires_at)
+    }
+
+    /// An expired entry may be served: opted in and not expired for longer
+    /// than `max_stale`.
+    fn stale_entry(&self, now: f64) -> Option<Arc<DiscoveryEntry>> {
+        if !self.stale_on_error {
+            return None;
+        }
+        self.snapshot()
+            .filter(|e| now < e.expires_at + self.max_stale as f64)
+    }
+
+    fn begin_flight(&self, py: Python<'_>) -> PyResult<Flight<'_>> {
+        begin_flight(
+            py,
+            &self.flight,
+            &self.flight_done,
+            self.fetch_timeout,
+            "discovery fetch",
+            "discovery_fetch_timeout",
+        )
+    }
+
+    /// Seconds left of the back-off window of the latest failed fetch, if any.
+    fn backoff_remaining(&self, now: f64) -> Option<f64> {
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let (_, failed_at) = st.failure.as_ref()?;
+        let left = self.failure_backoff as f64 - (now - failed_at);
+        (left > 0.0).then_some(left)
+    }
+
+    fn warn_stale(&self, py: Python<'_>) {
+        if !self
+            .warned_stale
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn(
+                py,
+                "serving stale discovery metadata after a failed or timed-out fetch \
+                 (stale_on_error=True, bounded by max_stale); a failure is the __cause__ of \
+                 discovery_backoff errors and the document is refetched once the provider \
+                 recovers",
+            );
+        }
+    }
+
+    /// Inside the back-off window of a failed fetch: serve the stale entry or
+    /// refuse with `discovery_backoff` chained to the stored error. `None`
+    /// when no window is open.
+    fn backoff_outcome(&self, py: Python<'_>, now: f64) -> Option<Backoff> {
+        let left = self.backoff_remaining(now)?;
+        if let Some(stale) = self.stale_entry(now) {
+            self.warn_stale(py);
+            return Some(Backoff::Stale(stale));
+        }
+        let cause = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .as_ref()
+            .map(|(e, _)| e.clone_ref(py));
+        // `retryable` follows the stored cause (itself derived by
+        // `is_retryable`); no cause readable means not retryable.
+        let retryable = cause.as_ref().is_some_and(|c| {
+            c.value(py)
+                .getattr("retryable")
+                .and_then(|v| v.extract::<bool>())
+                .unwrap_or(false)
+        });
+        let msg = format!(
+            "the last discovery fetch failed; not retrying for another {:.0}s \
+             (failure_backoff={}s, no usable cached metadata)",
+            left.ceil(),
+            self.failure_backoff
+        );
+        let e = with_code_retryable(
+            py,
+            InternalError::new_err(msg),
+            "discovery_backoff",
+            retryable,
+        );
+        e.set_cause(py, cause);
+        Some(Backoff::Refused(e))
+    }
+
+    /// Record a failed fetch for the back-off window. A traceback-free copy is
+    /// stored (the original, with its frames, locals and HTTP requests, goes
+    /// to the caller only), so the failure does not pin that memory for the
+    /// window and `discovery_backoff` errors chained to it add nothing to it.
+    /// Returns the clock reading of the failure.
+    fn record_failure(&self, py: Python<'_>, e: &PyErr) -> f64 {
+        let now = self.now();
+        let stored = detached_copy(py, e, 4);
+        let old = self
+            .state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .replace((stored, now));
+        // Dropping a PyErr may run Python code: not under the lock.
+        drop(old);
+        now
+    }
+
+    /// Record a failed fetch; serve stale metadata if allowed, else give the
+    /// error back.
+    fn on_failure(&self, py: Python<'_>, e: PyErr) -> PyResult<Arc<DiscoveryEntry>> {
+        let now = self.record_failure(py, &e);
+        match self.stale_entry(now) {
+            Some(stale) => {
+                self.warn_stale(py);
+                Ok(stale)
+            }
+            None => Err(e),
+        }
+    }
+
+    /// Fetch, validate and store the document. The caller holds the flight.
+    fn fetch(&self, py: Python<'_>) -> PyResult<Arc<DiscoveryEntry>> {
+        // A fresh client (and `Failures` slot) per fetch, so a transport
+        // error is chained to this call's failure only.
+        let (http, failures) = extract_http_client(self.http.as_ref().map(|h| h.bind(py)))?;
+        let d = discover_recorded(py, http, &failures, self.issuer.clone())?;
+        if d.headerless
+            && !self
+                .warned_no_headers
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn(
+                py,
+                &format!(
+                    "this HttpClient reports no response headers; Cache-Control is ignored and \
+                     default_ttl ({}s) applies to discovery; return headers from your HttpClient \
+                     or lower default_ttl/max_ttl",
+                    self.default_ttl
+                ),
+            );
+        }
+        // `Cache-Control` / `Age` are parsed by the upstream quote-aware
+        // parser: wrap the headers in the response shape it understands.
+        let resp = HttpFetchResponse {
+            headers: d.headers,
+            ..Default::default()
+        };
+        let shim = grp::JwksResponse {
+            jwks: JwkSet { keys: Vec::new() },
+            cache_control: resp.cache_control(),
+            etag: None,
+            age: resp
+                .header("age")
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                // A digits-only value too large for u64 means "very old".
+                .map(|v| v.parse::<u64>().unwrap_or(u64::MAX)),
+        };
+        let ttl = shim
+            .cache_ttl_secs_max(self.max_ttl)
+            .unwrap_or(self.default_ttl)
+            .clamp(self.min_ttl, self.max_ttl);
+        let info =
+            ProviderInfo::from_metadata(py, &d.metadata, self.allow_cross_origin_end_session)?;
+        let entry = Arc::new(DiscoveryEntry {
+            metadata: d.metadata,
+            info,
+            expires_at: self.now() + ttl as f64,
+            generation: self
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
+        });
+        let old = {
+            let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let failure = st.failure.take();
+            st.entry = Some(entry.clone());
+            failure
+        };
+        drop(old);
+        self.warned_stale
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(entry)
+    }
+
+    /// The current entry, fetching first if there is none or it expired.
+    fn current(&self, py: Python<'_>) -> PyResult<Arc<DiscoveryEntry>> {
+        let now = self.now();
+        if let Some(e) = self.valid_entry(now) {
+            return Ok(e);
+        }
+        match self.backoff_outcome(py, now) {
+            Some(Backoff::Stale(e)) => return Ok(e),
+            Some(Backoff::Refused(e)) => return Err(e),
+            None => {}
+        }
+        let _flight = match self.begin_flight(py) {
+            Ok(f) => f,
+            Err(timeout) => {
+                // Timed out waiting for the fetching thread: the stale policy
+                // applies as it does to a failed fetch. The timeout is not
+                // recorded as a failure (the fetch is still running).
+                let now = self.now();
+                if let Some(e) = self.valid_entry(now) {
+                    return Ok(e);
+                }
+                return match self.stale_entry(now) {
+                    Some(stale) => {
+                        self.warn_stale(py);
+                        Ok(stale)
+                    }
+                    None => Err(timeout),
+                };
+            }
+        };
+        // Another thread may have fetched (or failed) while we waited.
+        let now = self.now();
+        if let Some(e) = self.valid_entry(now) {
+            return Ok(e);
+        }
+        match self.backoff_outcome(py, now) {
+            Some(Backoff::Stale(e)) => return Ok(e),
+            Some(Backoff::Refused(e)) => return Err(e),
+            None => {}
+        }
+        match self.fetch(py) {
+            Ok(e) => Ok(e),
+            Err(e) => self.on_failure(py, e),
+        }
+    }
+}
+
+#[pymethods]
+impl DiscoveryCache {
+    #[new]
+    #[pyo3(signature = (http, issuer, *, default_ttl = 3600, min_ttl = 60, max_ttl = 86400,
+                        failure_backoff = 10, stale_on_error = true, max_stale = 86400,
+                        fetch_timeout = 45.0, allow_cross_origin_end_session = false,
+                        _now = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        http: Option<&Bound<'_, PyAny>>,
+        issuer: String,
+        default_ttl: i64,
+        min_ttl: i64,
+        max_ttl: i64,
+        failure_backoff: i64,
+        stale_on_error: bool,
+        max_stale: i64,
+        fetch_timeout: f64,
+        allow_cross_origin_end_session: bool,
+        _now: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        // Validate the client and the issuer now rather than on first use.
+        extract_http_client(http)?;
+        reject_reinterpreted_url_chars("issuer", &issuer).map_err(config_from)?;
+        grp::validate_issuer(&issuer).map_err(config_from)?;
+        let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
+        let (default_ttl, min_ttl, max_ttl) = (
+            get("default_ttl", default_ttl)?,
+            get("min_ttl", min_ttl)?,
+            get("max_ttl", max_ttl)?,
+        );
+        if min_ttl > max_ttl {
+            return Err(config_err("min_ttl must not exceed max_ttl"));
+        }
+        let failure_backoff = get("failure_backoff", failure_backoff)?;
+        let max_stale = get("max_stale", max_stale)?;
+        let fetch_timeout = parse_fetch_timeout(fetch_timeout)?;
+        Ok(Self {
+            http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
+            issuer,
+            default_ttl,
+            min_ttl,
+            max_ttl,
+            failure_backoff,
+            stale_on_error,
+            max_stale,
+            fetch_timeout,
+            allow_cross_origin_end_session,
+            clock: _now,
+            state: RwLock::default(),
+            jwks_slot: Mutex::new(None),
+            generation: Default::default(),
+            flight: Mutex::new(false),
+            flight_done: Condvar::new(),
+            warned_no_headers: Default::default(),
+            warned_stale: Default::default(),
+        })
+    }
+
+    /// The issuer this cache discovers.
+    #[getter]
+    fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Seconds after a failed fetch during which no new fetch is attempted.
+    #[getter]
+    fn failure_backoff(&self) -> u64 {
+        self.failure_backoff
+    }
+
+    /// Seconds a thread waits for another thread's in-flight fetch.
+    #[getter]
+    fn fetch_timeout(&self) -> f64 {
+        self.fetch_timeout.as_secs_f64()
+    }
+
+    fn __repr__(&self) -> String {
+        let (jwks_uri, expires_in) = match self.snapshot() {
+            Some(e) => {
+                let left = (e.expires_at - self.now()).max(0.0) as u64;
+                (e.info.inner.jwks_uri.clone(), Some(left))
+            }
+            None => (None, None),
+        };
+        let quoted = |s: &str| format!("'{}'", escape_untrusted_quoted(s, 256));
+        format!(
+            "DiscoveryCache(issuer={}, jwks_uri={}, expires_in={})",
+            quoted(&self.issuer),
+            jwks_uri.as_deref().map_or("None".to_string(), quoted),
+            expires_in.map_or("None".to_string(), |n| n.to_string()),
+        )
+    }
+
+    /// The provider's discovery document (a `ProviderMetadata`), fetching it
+    /// first if none is cached or it expired. See the class documentation for
+    /// the failure, back-off and stale policy.
+    fn metadata(&self, py: Python<'_>) -> PyResult<ProviderMetadata> {
+        Ok(self.current(py)?.metadata.clone())
+    }
+
+    /// `ProviderInfo.from_metadata(metadata())`, built once per fetch.
+    fn info(&self, py: Python<'_>) -> PyResult<ProviderInfo> {
+        Ok(self.current(py)?.info.clone())
+    }
+
+    /// A `JwksCache` bound to the advertised `jwks_uri` and issuer. The SAME
+    /// object is returned across metadata refreshes (so its cached keys
+    /// survive); it is replaced only when the new document advertises a
+    /// different `jwks_uri` or issuer, and the old object is then never
+    /// returned again. Do not keep the object across calls if the provider may
+    /// move its keys: call `jwks()` each time. Raises `ConfigError` when the
+    /// provider advertises no `jwks_uri`.
+    fn jwks(&self, py: Python<'_>) -> PyResult<Py<JwksCache>> {
+        let entry = self.current(py)?;
+        let Some(uri) = entry.info.inner.jwks_uri.clone() else {
+            return Err(config_err(
+                "the provider's discovery document advertises no jwks_uri",
+            ));
+        };
+        let issuer = entry.info.inner.issuer.clone();
+        let generation = entry.generation;
+        // What the slot says for a caller holding the entry of `generation`:
+        // reuse a matching cache (bumping the slot generation so an older
+        // entry can never replace it), serve the cache of a NEWER entry (the
+        // caller's entry is stale), or nothing: build and install.
+        let decide = |slot: &mut Option<(u64, Py<JwksCache>)>| {
+            let (slot_gen, cache) = slot.as_mut()?;
+            let c = cache.get();
+            if c.jwks_uri == uri && c.issuer == issuer {
+                *slot_gen = (*slot_gen).max(generation);
+                Some(cache.clone_ref(py))
+            } else if *slot_gen > generation {
+                Some(cache.clone_ref(py))
+            } else {
+                None
+            }
+        };
+        // The lock is never held across anything that can run Python code
+        // (which might release the GIL): a thread holding it while another
+        // thread waits for it with the GIL would deadlock.
+        if let Some(c) = decide(&mut self.jwks_slot.lock().unwrap_or_else(|e| e.into_inner())) {
+            return Ok(c);
+        }
+        let http = self.http.as_ref().map(|h| h.bind(py).clone());
+        let built = Py::new(
+            py,
+            JwksCache::build(
+                http.as_ref(),
+                uri.clone(),
+                issuer.clone(),
+                JWKS_DEFAULT_TTL,
+                JWKS_MIN_TTL,
+                JWKS_MAX_TTL,
+                JWKS_MIN_REFRESH_INTERVAL,
+                self.fetch_timeout.as_secs_f64(),
+                self.clock.as_ref().map(|c| c.clone_ref(py)),
+            )?,
+        )?;
+        let (result, old) = {
+            let mut slot = self.jwks_slot.lock().unwrap_or_else(|e| e.into_inner());
+            match decide(&mut slot) {
+                // Another thread installed a matching or newer one meanwhile.
+                Some(c) => (c, None),
+                None => (
+                    built.clone_ref(py),
+                    slot.replace((generation, built)).map(|(_, c)| c),
+                ),
+            }
+        };
+        drop(old);
+        Ok(result)
+    }
+
+    /// Force a refetch. A call within `failure_backoff` seconds of a failed
+    /// fetch is a silent no-op. A failed fetch raises the original error and
+    /// keeps the cached document (it is not served from here; `metadata()`
+    /// applies the stale policy).
+    fn refresh(&self, py: Python<'_>) -> PyResult<()> {
+        if self.backoff_remaining(self.now()).is_some() {
+            return Ok(());
+        }
+        let _flight = self.begin_flight(py)?;
+        // Another thread's fetch may have failed while we waited.
+        if self.backoff_remaining(self.now()).is_some() {
+            return Ok(());
+        }
+        match self.fetch(py) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.record_failure(py, &e);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -3207,6 +3880,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TokenSet>()?;
     m.add_class::<AuthorizationResponse>()?;
     m.add_class::<JwksCache>()?;
+    m.add_class::<DiscoveryCache>()?;
     m.add_function(wrap_pyfunction!(authorization_url, &m)?)?;
     m.add_function(wrap_pyfunction!(signed_request_object, &m)?)?;
     m.add_function(wrap_pyfunction!(begin, &m)?)?;
