@@ -1141,11 +1141,33 @@ pub fn extract_http_client(
     Ok((client, failures))
 }
 
+/// Whether `client` can send request headers on GET, as
+/// `rp.fetch_userinfo(method="GET")` needs, decided with the same test the
+/// networked functions use but WITHOUT performing any request. `None` (the
+/// built-in client) and a `ReqwestClient` are `True`. Any other object is
+/// `True` only if it has callable `get` and `post_form` and either a callable
+/// `get_with_headers` or a `get` taking `headers` by keyword (or `**kwargs`).
+/// Never raises: an object of any other shape gives `False`. Lets an
+/// application fail at startup instead of on the first userinfo call.
+#[pyfunction]
+#[pyo3(signature = (client))]
+fn supports_get_with_headers(client: Option<&Bound<'_, PyAny>>) -> bool {
+    let Some(o) = client.filter(|o| !o.is_none()) else {
+        return true;
+    };
+    if o.cast::<ReqwestClient>().is_ok() {
+        return true;
+    }
+    require_methods(o, &["get", "post_form"], "HttpClient").is_ok()
+        && headers_mode(o.py(), o) != HeadersMode::Unsupported
+}
+
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = new_submodule(py, parent, "http")?;
     m.add_class::<HttpRequestData>()?;
     m.add_class::<Response>()?;
     m.add_class::<HttpFetchResponse>()?;
     m.add_class::<ReqwestClient>()?;
+    m.add_function(wrap_pyfunction!(supports_get_with_headers, &m)?)?;
     Ok(())
 }

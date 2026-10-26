@@ -1476,8 +1476,9 @@ def test_from_metadata_drops_unsafe_end_session_endpoint():
         info = rp.ProviderInfo.from_metadata(md)
         assert info.end_session_endpoint is None
         assert info.token_endpoint == f"{ISSUER}/token"
-        with pytest.raises(ConfigError, match="different origin than the issuer"):
+        with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata") as ei:
             rp.end_session_url(info)
+        assert bad not in str(ei.value)
 
 
 def _pi(endpoint, issuer=ISSUER, **kw):
@@ -1525,7 +1526,7 @@ def test_end_session_cross_origin_rejected_and_dropped(ep):
         _pi(ep)
     info = rp.ProviderInfo.from_metadata(_raw_md(ep))
     assert info.end_session_endpoint is None
-    with pytest.raises(ConfigError, match="different origin than the issuer"):
+    with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata"):
         rp.end_session_url(info, id_token_hint="tok")
 
 
@@ -1635,6 +1636,98 @@ def _raw_md(bad):
             raise AssertionError
 
     return rp.discover(Http(), ISSUER)
+
+
+def _raw_md_value(value):
+    """discover() output whose end_session_endpoint is ``value`` (any JSON)."""
+
+    class Http:
+        def get(self, url):
+            doc = metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": value}
+            return 200, json.dumps(doc).encode(), "application/json"
+
+        def post_form(self, url, form, headers):
+            raise AssertionError
+
+    return rp.discover(Http(), ISSUER)
+
+
+_NOT_ADVERTISED = "does not advertise end_session_endpoint"
+_REJECTED = "advertised value was rejected by ProviderInfo.from_metadata"
+_INVALID_TYPE = "advertised a non-string end_session_endpoint"
+
+
+@pytest.mark.parametrize(
+    ("value", "warn_match", "wording"),
+    [
+        (123, r"non-string value \(number\) and was ignored", _INVALID_TYPE),
+        (True, r"non-string value \(bool\) and was ignored", _INVALID_TYPE),
+        ({"a": 1}, r"non-string value \(object\) and was ignored", _INVALID_TYPE),
+        (["https://op.example.com/l"], r"non-string value \(array\) and was ignored", _INVALID_TYPE),
+        ("", "unsafe", _REJECTED),
+        ("https://evil.example/logout", "different origin", _REJECTED),
+        (None, None, _NOT_ADVERTISED),
+    ],
+)
+def test_end_session_outcome_warning_and_wording(value, warn_match, wording):
+    md = _raw_md_value(value)
+    if warn_match is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            info = rp.ProviderInfo.from_metadata(md)
+    else:
+        with pytest.warns(UserWarning, match=warn_match) as rec:
+            info = rp.ProviderInfo.from_metadata(md)
+        assert len(rec) == 1
+    assert info.end_session_endpoint is None
+    with pytest.raises(ConfigError, match=wording) as ei:
+        rp.end_session_url(info)
+    msg = str(ei.value)
+    # the other two outcome wordings must not leak in
+    for other in {_NOT_ADVERTISED, _REJECTED, _INVALID_TYPE} - {wording}:
+        assert other not in msg
+    if wording != _NOT_ADVERTISED:
+        assert "UNTRUSTED" in msg and "never redirect" in msg
+    assert "evil.example" not in msg and "123" not in msg
+
+
+def test_end_session_absent_is_not_advertised():
+    md = rp.discover(_NoEndSession_with_post(), ISSUER)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        info = rp.ProviderInfo.from_metadata(md)
+    with pytest.raises(ConfigError, match=_NOT_ADVERTISED):
+        rp.end_session_url(info)
+
+
+class _NoEndSession_with_post(_NoEndSession):
+    def post_form(self, url, form, headers):
+        raise AssertionError
+
+
+def test_end_session_invalid_type_warning_is_not_an_error_under_filter():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        info = rp.ProviderInfo.from_metadata(_raw_md_value(123))
+    assert info.end_session_endpoint is None
+
+
+def test_metadata_endpoints_are_unvalidated_but_from_metadata_rejects_unsafe_loudly():
+    """info.metadata.<endpoint> is raw OP data; unsafe userinfo is refused at build time."""
+    for bad in ["http://op.example.com/ui", "https://u:p@op.example.com/ui"]:
+        doc = metadata.ProviderMetadata(ISSUER).to_dict() | {"userinfo_endpoint": bad}
+
+        class Http:
+            def get(self, url, doc=doc):
+                return 200, json.dumps(doc).encode(), "application/json"
+
+            def post_form(self, url, form, headers):
+                raise AssertionError
+
+        with pytest.raises(GrindvaktError):
+            rp.ProviderInfo.from_metadata(rp.discover(Http(), ISSUER))
+    # No way to make info.metadata.userinfo_endpoint differ from
+    # info.userinfo_endpoint: from_metadata raises instead of dropping it.
 
 
 def _logout_client(*uris):
@@ -3174,3 +3267,415 @@ def test_authorization_response_jarm_refused_by_default_accepted_raw():
         _parse([("state", "s")], accept_jarm=True)
     with pytest.raises(BadRequestError):
         _parse([("response", "a"), ("response", "b")], accept_jarm=True)
+
+
+# --- G6 helpers: BeginResult, TokenSet getters, claims_audiences, metadata ----------------
+
+
+def test_begin_result_is_a_real_namedtuple(prov, rpc):
+    res = rp.begin(prov, rpc)
+    assert isinstance(res, rp.BeginResult)
+    assert isinstance(res, tuple)
+    assert res._fields == ("url", "state", "nonce", "code_verifier")
+    url, state, nonce, verifier = res
+    assert (res.url, res.state, res.nonce, res.code_verifier) == (url, state, nonce, verifier)
+    assert res[0] == url and res[3] == verifier and len(res) == 4
+    assert res == (url, state, nonce, verifier)
+    assert rp.BeginResult.__module__ == "pygrindvakt.rp"
+    assert rp.BeginResult is type(res)
+    assert res._replace(state="x").state == "x"
+
+
+def test_begin_result_pickles(prov, rpc):
+    import pickle
+
+    res = rp.begin(prov, rpc)
+    assert pickle.loads(pickle.dumps(res)) == res
+
+
+def test_begin_result_repr_redacts(prov, rpc):
+    res = rp.begin(prov, rpc)
+    text = repr(res)
+    assert text.startswith("BeginResult(url='https://op.example.com/authorization?")
+    assert "state=<redacted>, nonce=<redacted>, code_verifier=<redacted>)" in text
+    for secret in (res.state, res.nonce, res.code_verifier, res.url):
+        assert secret not in text
+    assert "code_challenge" not in text
+    assert str(res) == text
+    no_pkce = repr(rp.begin(prov, rpc, pkce=False))
+    assert "code_verifier=None" in no_pkce
+
+
+class _TokenHttp:
+    """Serves a canned token-endpoint body."""
+
+    def __init__(self, body):
+        self.body = body
+
+    def get(self, url):
+        return 404, b"", "text/plain"
+
+    def post_form(self, url, form, headers):
+        return 200, json.dumps(self.body).encode(), "application/json"
+
+
+def _token_set(prov, rpc, **extra):
+    body = {"access_token": "AT-secret", "id_token": "a.b.c", "token_type": "Bearer", **extra}
+    return rp.exchange_code(_TokenHttp(body), prov, rpc, "code", "v" * 43)
+
+
+def test_token_set_new_getters(prov, rpc):
+    ts = _token_set(prov, rpc, refresh_token="RT-secret", expires_in=3600, scope="openid email")
+    assert ts.refresh_token == "RT-secret"
+    assert ts.expires_in == 3600
+    assert ts.scope == "openid email"
+    assert ts.raw["refresh_token"] == "RT-secret"
+    assert "RT-secret" not in repr(ts) and "AT-secret" not in repr(ts)
+    assert "refresh_token=<set>" in repr(ts)
+
+
+def test_token_set_getters_missing(prov, rpc):
+    ts = _token_set(prov, rpc)
+    assert ts.refresh_token is None and ts.expires_in is None and ts.scope is None
+    assert "refresh_token=None" in repr(ts)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (3600, 3600),
+        (0, 0),
+        ("3600", 3600),
+        (3600.0, 3600),
+        (-1, None),
+        ("-1", None),
+        (1.5, None),
+        ("1.5", None),
+        ("", None),
+        (" 60", None),
+        ("abc", None),
+        ("١٢", None),
+        (None, None),
+        (True, None),
+        ([60], None),
+        ({"a": 1}, None),
+        (10**30, None),
+        (315_360_000, 315_360_000),
+        (315_360_001, None),
+        (2**64 - 1, None),
+        (2**64, None),
+        ("315360000", 315_360_000),
+        ("315360001", None),
+        (str(2**64 - 1), None),
+        (315_360_000.0, 315_360_000),
+        (315_360_001.0, None),
+    ],
+)
+def test_token_set_expires_in(prov, rpc, value, expected):
+    assert _token_set(prov, rpc, expires_in=value).expires_in == expected
+
+
+def test_token_set_wrong_types_are_none(prov, rpc):
+    ts = _token_set(prov, rpc, refresh_token=5, scope=["a"])
+    assert ts.refresh_token is None and ts.scope is None
+
+
+def test_claims_audiences():
+    assert rp.claims_audiences({"aud": "a"}) == ["a"]
+    assert rp.claims_audiences({"aud": ["a", "b"]}) == ["a", "b"]
+    assert rp.claims_audiences({"aud": "x"}) == ["x"]
+    assert rp.claims_audiences({"aud": ["x", "y"]}) == ["x", "y"]
+    assert rp.claims_audiences({"aud": ("x", "y")}) == ["x", "y"]
+
+
+@pytest.mark.parametrize(
+    "claims, msg",
+    [
+        ({}, "no 'aud'"),
+        ({"sub": "x"}, "no 'aud'"),
+        ({"aud": []}, "empty 'aud'"),
+        ({"aud": ()}, "empty 'aud'"),
+        ({"aud": ""}, "empty 'aud'"),
+        ({"aud": ["a", ""]}, "empty 'aud'"),
+        ({"aud": [""]}, "empty 'aud'"),
+    ],
+)
+def test_claims_audiences_fails_closed(claims, msg):
+    with pytest.raises(BadRequestError, match=msg):
+        rp.claims_audiences(claims)
+
+
+def test_claims_audiences_no_vacuous_audience_check(rp_key):
+    """A verified token without aud must not reach a hand-rolled all(...) check."""
+    jws = jwt.sign(rp_key, {"sub": "s", "iss": ISSUER, "exp": int(time.time()) + 300})
+    v = jwt.Validation().with_issuer(ISSUER).require_exp()
+    claims = jwt.verify_with_jwks(rp_key.to_public_jwks(), jws, v)
+    assert "aud" not in claims
+    with pytest.raises(BadRequestError, match="no 'aud'"):
+        rp.claims_audiences(claims)
+    # control: an aud is returned and checked normally
+    jws = jwt.sign(rp_key, {"sub": "s", "iss": ISSUER, "aud": "other-rp", "exp": int(time.time()) + 300})
+    claims = jwt.verify_with_jwks(rp_key.to_public_jwks(), jws, v)
+    auds = rp.claims_audiences(claims)
+    assert auds == ["other-rp"]
+    assert not all(a in {CLIENT_ID} for a in auds)
+
+
+@pytest.mark.parametrize("aud", ["\ud800", ["ok", "\udc00"], ("\ud800",)])
+def test_claims_audiences_lone_surrogate_is_bad_request(aud):
+    with pytest.raises(BadRequestError) as ei:
+        rp.claims_audiences({"aud": aud})
+    assert not isinstance(ei.value, UnicodeError)
+    assert "ud800" not in str(ei.value) and "udc00" not in str(ei.value)
+
+
+def test_claims_audiences_does_not_mutate():
+    claims = {"aud": ["a", "b"], "sub": "s"}
+    snapshot = copy.deepcopy(claims)
+    out = rp.claims_audiences(claims)
+    out.append("z")
+    assert claims == snapshot
+    single = {"aud": "a"}
+    rp.claims_audiences(single)
+    assert single == {"aud": "a"}
+
+
+@pytest.mark.parametrize("aud", [None, 5, ["a", 1], ["a", None], {"a": 1}, b"a", [["a"]]])
+def test_claims_audiences_bad_types(aud):
+    with pytest.raises(BadRequestError):
+        rp.claims_audiences({"aud": aud})
+
+
+def test_claims_audiences_not_a_mapping():
+    with pytest.raises(TypeError):
+        rp.claims_audiences(["aud"])  # type: ignore[arg-type]
+
+
+def test_provider_info_metadata(prov, op):
+    assert prov.metadata is not None
+    assert prov.metadata.issuer == ISSUER
+    assert prov.metadata.code_challenge_methods_supported == ["S256"]
+    assert "metadata" not in repr(prov)
+    hand = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    assert hand.metadata is None
+
+
+def test_provider_info_metadata_is_a_copy(prov):
+    first = prov.metadata
+    first.scopes_supported = ["changed"]
+    assert prov.metadata.scopes_supported != ["changed"]
+
+
+def test_provider_info_metadata_keeps_rejected_end_session():
+    with pytest.warns(UserWarning, match="different origin than the issuer"):
+        info = rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/logout"))
+    assert info.end_session_endpoint is None
+    assert info.metadata.end_session_endpoint == "https://evil.example/logout"
+    # "not advertised" differs from "rejected"
+    clean = rp.ProviderInfo.from_metadata(rp.discover(_NoEndSession(), ISSUER))
+    assert clean.end_session_endpoint is None and clean.metadata.end_session_endpoint is None
+
+
+def test_end_session_url_error_distinguishes_rejected_from_not_advertised():
+    raw = "https://evil.example/logout"
+    with pytest.warns(UserWarning):
+        rejected = rp.ProviderInfo.from_metadata(_raw_md(raw))
+    with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata") as ei:
+        rp.end_session_url(rejected)
+    assert raw not in str(ei.value) and "does not advertise" not in str(ei.value)
+    clean = rp.ProviderInfo.from_metadata(rp.discover(_NoEndSession(), ISSUER))
+    with pytest.raises(ConfigError, match="does not advertise end_session_endpoint") as ei:
+        rp.end_session_url(clean)
+    assert "rejected" not in str(ei.value)
+    hand = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    with pytest.raises(ConfigError, match="does not advertise"):
+        rp.end_session_url(hand)
+
+
+# --- check_rp_compatibility -----------------------------------------------------------------
+
+
+def _md(**changes):
+    md = metadata.ProviderMetadata(ISSUER)
+    for k, v in changes.items():
+        setattr(md, k, v)
+    return md
+
+
+def test_compat_against_in_process_op(prov, rpc):
+    assert rp.check_rp_compatibility(prov) == []
+    assert (
+        rp.check_rp_compatibility(
+            prov,
+            client=rpc,
+            pkce=True,
+            algorithms=rp.asymmetric_algorithms(),
+            scopes=["openid", "email"],
+        )
+        == []
+    )
+    assert rp.check_rp_compatibility(prov.metadata, pkce=True) == []
+
+
+def test_compat_ok_with_pkce_unset_or_false():
+    md = _md(code_challenge_methods_supported=["plain"])
+    assert rp.check_rp_compatibility(md) == []
+    assert rp.check_rp_compatibility(md, pkce=False) == []
+
+
+def test_compat_response_type_mismatch():
+    out = rp.check_rp_compatibility(_md(response_types_supported=["id_token"]))
+    assert len(out) == 1 and "'code'" in out[0] and not out[0].startswith("not advertised:")
+    out = rp.check_rp_compatibility(_md(response_types_supported=[]))
+    assert len(out) == 1 and out[0].startswith("not advertised: response_types_supported")
+
+
+def test_compat_pkce_mismatch_and_not_advertised():
+    out = rp.check_rp_compatibility(_md(code_challenge_methods_supported=["plain"]), pkce=True)
+    assert len(out) == 1 and "S256" in out[0] and not out[0].startswith("not advertised:")
+    # ORCID-like: nothing advertised
+    out = rp.check_rp_compatibility(_md(code_challenge_methods_supported=[]), pkce=True)
+    assert out == ["not advertised: code_challenge_methods_supported (cannot confirm PKCE S256 support)"]
+
+
+def test_compat_algorithms():
+    md = _md(id_token_signing_alg_values_supported=["RS256"])
+    assert rp.check_rp_compatibility(md, algorithms=["RS256", "ES256"]) == []
+    out = rp.check_rp_compatibility(md, algorithms=["ES256", "EdDSA"])
+    assert len(out) == 1 and "id_token_signing_alg_values_supported" in out[0]
+    assert not out[0].startswith("not advertised:")
+    out = rp.check_rp_compatibility(_md(id_token_signing_alg_values_supported=[]), algorithms=["ES256"])
+    assert len(out) == 1 and out[0].startswith("not advertised: id_token_signing_alg_values_supported")
+    with pytest.raises(ConfigError):
+        rp.check_rp_compatibility(md, algorithms=[])
+
+
+def _hs_none_md(algs=("HS256", "none", "RS256")):
+    return metadata.ProviderMetadata.from_dict(
+        {**metadata.ProviderMetadata(ISSUER).to_dict(), "id_token_signing_alg_values_supported": list(algs)}
+    )
+
+
+def test_compat_hs_refused_by_default():
+    md = _hs_none_md()
+    out = rp.check_rp_compatibility(md, algorithms=["HS256"])
+    assert out != []
+    assert len(out) == 1 and not out[0].startswith("not advertised:")
+    assert "shared_secret_keys=True" in out[0] and "ADR 0006" in out[0]
+    # HS alone against an OP advertising it: only the HS message, no intersection noise
+    out = rp.check_rp_compatibility(_hs_none_md(["HS256"]), algorithms=["HS256"])
+    assert len(out) == 1 and "client_secret" in out[0]
+    # mixed: HS message only, RS256 intersects
+    out = rp.check_rp_compatibility(_hs_none_md(["HS256", "RS256"]), algorithms=["HS256", "RS256"])
+    assert len(out) == 1 and "client_secret" in out[0]
+    assert rp.check_rp_compatibility(md, algorithms=["RS256"]) == []
+    assert rp.check_rp_compatibility(md, algorithms=["RS256"], shared_secret_keys=True) == []
+    out = rp.check_rp_compatibility(md, algorithms=["hs384"])
+    assert len(out) == 1 and "client_secret" in out[0]
+
+
+def test_compat_none_always_refused():
+    md = _hs_none_md()
+    for shared in (False, True):
+        out = rp.check_rp_compatibility(md, algorithms=["none"], shared_secret_keys=shared)
+        assert len(out) == 1 and "'none'" in out[0] and "ADR 0006" in out[0]
+        assert not out[0].startswith("not advertised:")
+        assert "fix the RP config, not the OP" in out[0]
+        out = rp.check_rp_compatibility(md, algorithms=["NONE"], shared_secret_keys=shared)
+        assert len(out) == 1 and "'NONE'" in out[0]
+        # none never counts as an intersection match
+        out = rp.check_rp_compatibility(md, algorithms=["none", "ES256"], shared_secret_keys=shared)
+        assert len(out) == 2 and "always refused" in out[0] and "none of the allowed" in out[1]
+    out = rp.check_rp_compatibility(md, algorithms=["HS512", "none"])
+    assert len(out) == 2
+    assert any("always refused" in m for m in out) and any("client_secret" in m for m in out)
+
+
+def test_compat_shared_secret_keys():
+    md = _hs_none_md()
+    assert rp.check_rp_compatibility(md, algorithms=["HS256"], shared_secret_keys=True) == []
+    out = rp.check_rp_compatibility(_hs_none_md(["RS256"]), algorithms=["HS256"], shared_secret_keys=True)
+    assert len(out) == 1 and out[0].startswith("none of the allowed id_token algorithms")
+    out = rp.check_rp_compatibility(_hs_none_md([]), algorithms=["HS256"], shared_secret_keys=True)
+    assert len(out) == 1 and out[0].startswith("not advertised:")
+    out = rp.check_rp_compatibility(md, algorithms=["HS512", "none"], shared_secret_keys=True)
+    assert len(out) == 2 and "always refused" in out[0] and "none of the allowed" in out[1]
+
+
+def test_compat_alg_messages_escaped():
+    evil = "ES\u202e256\n" + "x" * 100
+    md = _hs_none_md(["RS256"])
+    out = rp.check_rp_compatibility(md, algorithms=[evil, "HS256", "none"])
+    joined = "\n".join(out)
+    assert "\u202e" not in joined and "x" * 65 not in joined
+    assert "\\u{202e}" in joined
+    many = [f"HS{i}" for i in range(30)] + ["HS256"]
+    out = rp.check_rp_compatibility(md, algorithms=many)
+    assert any("more)" in m for m in out)
+
+
+def test_compat_scopes():
+    md = _md(scopes_supported=["openid", "email"])
+    assert rp.check_rp_compatibility(md, scopes=["openid"]) == []
+    out = rp.check_rp_compatibility(md, scopes=["openid", "groups", "phone"])
+    assert len(out) == 1 and "'groups'" in out[0] and "'phone'" in out[0] and "'openid', " not in out[0].split("(")[0]
+    out = rp.check_rp_compatibility(_md(scopes_supported=[]), scopes=["openid"])
+    assert len(out) == 1 and out[0].startswith("not advertised: scopes_supported")
+
+
+def test_compat_acr_values():
+    assert rp.check_rp_compatibility(_md(), acr_values=["urn:x"])[0].startswith("not advertised: acr_values_supported")
+    md = _md(acr_values_supported=["urn:a", "urn:b"])
+    assert rp.check_rp_compatibility(md, acr_values=["urn:a"]) == []
+    out = rp.check_rp_compatibility(md, acr_values=["urn:a", "urn:c"])
+    assert len(out) == 1 and "'urn:c'" in out[0] and not out[0].startswith("not advertised:")
+    # not requested: no message even though nothing is advertised
+    assert rp.check_rp_compatibility(_md()) == []
+
+
+def test_compat_client_auth_method():
+    pk = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret="s")
+    md = _md(token_endpoint_auth_methods_supported=["private_key_jwt"])
+    out = rp.check_rp_compatibility(md, client=pk)
+    assert len(out) == 1 and "client_secret_basic" in out[0] and not out[0].startswith("not advertised:")
+    ok = _md(token_endpoint_auth_methods_supported=["client_secret_basic"])
+    assert rp.check_rp_compatibility(ok, client=pk) == []
+
+
+def test_compat_client_auth_method_absent_assumes_spec_default():
+    # OIDC Discovery 1.0 s3 / RFC 8414 s2: absent means ["client_secret_basic"].
+    basic = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret="s")
+    post = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret="s", auth_method="client_secret_post")
+    pub = rp.RpClient(CLIENT_ID, REDIRECT_URI)
+
+    class _NoAuthMethods:
+        def get(self, url):
+            doc = metadata.ProviderMetadata(ISSUER).to_dict()
+            doc.pop("token_endpoint_auth_methods_supported", None)
+            return 200, json.dumps(doc).encode(), "application/json"
+
+        def post_form(self, url, form, headers):
+            raise AssertionError
+
+    absent = rp.discover(_NoAuthMethods(), ISSUER)
+    for md in (absent, _md(token_endpoint_auth_methods_supported=[])):
+        assert rp.check_rp_compatibility(md, client=basic) == []
+        for c, name in ((post, "client_secret_post"), (pub, "none")):
+            out = rp.check_rp_compatibility(md, client=c)
+            assert len(out) == 1 and not out[0].startswith("not advertised:")
+            assert name in out[0] and "absent" in out[0] and "client_secret_basic" in out[0]
+
+
+def test_compat_reports_several_and_escapes_untrusted():
+    md = _md(response_types_supported=["code\u202e\nevil"], code_challenge_methods_supported=["plain"])
+    out = rp.check_rp_compatibility(md, pkce=True)
+    assert len(out) == 2
+    assert all("\n" not in m and "\u202e" not in m for m in out)
+
+
+def test_compat_provider_info_without_metadata():
+    hand = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    with pytest.raises(ConfigError, match="no metadata"):
+        rp.check_rp_compatibility(hand)
+    with pytest.raises(TypeError):
+        rp.check_rp_compatibility({"issuer": ISSUER})  # type: ignore[arg-type]

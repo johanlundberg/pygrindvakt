@@ -66,6 +66,31 @@ requested; plain ``get`` and ``post_form`` are unaffected. The type-checking
 protocols for such a client are :class:`HttpClientWithHeadersProtocol` and
 :class:`HttpClientGetWithHeadersProtocol` (both stub-only).
 
+.. py:function:: supports_get_with_headers(client: object | None) -> TypeGuard[HttpClientWithHeadersProtocol | HttpClientGetWithHeadersProtocol | ReqwestClient | None]
+
+   Whether ``client`` can send request headers on GET, using the same test as
+   the networked functions but **without performing any request**. ``None``
+   (the built-in client) and a :class:`ReqwestClient` are ``True``. Any other
+   object is ``True`` only if it has callable ``get`` and ``post_form`` and
+   either a callable ``get_with_headers`` or a ``get`` that accepts ``headers``
+   by keyword (or ``**kwargs``). It never raises: an object of any other shape,
+   or one whose attributes raise, gives ``False``.
+
+   Call it at startup to fail early instead of on the first
+   ``rp.fetch_userinfo(method="GET")``. The ``TypeGuard`` return type narrows
+   the argument for the type checker, so no ``cast`` to
+   :class:`HttpClientWithHeadersProtocol` is needed:
+
+   .. code-block:: python
+
+      from pygrindvakt import http, rp
+
+      if not http.supports_get_with_headers(my_client):
+          raise SystemExit("my_client cannot send headers on GET; use method=\"POST\"")
+      rp.fetch_userinfo(my_client, info.userinfo_endpoint, token, sub, info.issuer, method="GET")
+
+   .. versionadded:: 0.3.0
+
 Inbound request
 ---------------
 

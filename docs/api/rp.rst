@@ -55,6 +55,25 @@ Provider and client
       then raises :class:`pygrindvakt.ConfigError`. (The direct constructor is
       strict and raises.)
 
+      A dropped ``end_session_endpoint`` also emits a :class:`UserWarning`
+      (it is never silent). That includes a non-string advertised value
+      (number, object, list, ...), reported as "non-string value (<type>)".
+      :func:`end_session_url` words its :class:`pygrindvakt.ConfigError` from
+      the outcome recorded here: not advertised, rejected (cross-origin or
+      unsafe) or advertised with a non-string value. The returned object keeps the discovery document
+      as :attr:`metadata`, so a caller can tell "no endpoint" from "rejected
+      endpoint":
+
+      .. code-block:: python
+
+         info = rp.ProviderInfo.from_metadata(md)
+         advertised = info.metadata.end_session_endpoint
+         if info.end_session_endpoint is None and advertised is not None:
+             log.warning("OP logout endpoint %r was rejected", advertised)
+
+      .. versionchanged:: 0.3.0
+         Keeps the source document as :attr:`metadata`.
+
    .. py:property:: issuer
       :type: str
    .. py:property:: authorization_endpoint
@@ -71,6 +90,32 @@ Provider and client
       OIDC RP-Initiated Logout endpoint, or ``None``. Validated like the
       other endpoints at construction and bound to the issuer's origin
       (see above). Used by :func:`end_session_url`.
+
+   .. py:property:: metadata
+      :type: ProviderMetadata | None
+
+      The :class:`pygrindvakt.metadata.ProviderMetadata` this value was built
+      from: set by :meth:`from_metadata`, so
+      ``ProviderInfo.from_metadata(discover(...))`` has it; ``None`` for a
+      hand-built ``ProviderInfo``. Each
+      access returns a copy. It is not part of ``repr()``.
+
+      .. warning::
+
+         EVERY endpoint on ``info.metadata`` (``userinfo_endpoint``,
+         ``token_endpoint``, ``authorization_endpoint``, ``jwks_uri``,
+         ``end_session_endpoint`` ...) is UNVALIDATED data from the OP
+         (ADR 0004 section 3 exempts discovery). Never send credentials or
+         tokens to them. Use the validated properties on the
+         :class:`ProviderInfo` itself (``info.userinfo_endpoint``,
+         ``info.token_endpoint`` ...). The raw ``end_session_endpoint`` is
+         kept only so you can diagnose a rejection; never redirect to it.
+
+      Equality, hashing and copying of ``ProviderInfo`` are
+      unchanged (it defines no ``__eq__``/``__hash__``, so instances compare
+      by identity).
+
+      .. versionadded:: 0.3.0
 
 .. py:class:: RpClient(client_id: str, redirect_uri: str, *, scope: str = "openid profile email", client_secret: str | None = None, auth_method: str | None = None, signing_key: SigningKey | None = None, post_logout_redirect_uris: list[str] | None = None, redirect_uris: list[str] | None = None, allow_unregistered_redirect_uri: bool = False)
 
@@ -153,9 +198,9 @@ Provider and client
 
 .. py:class:: TokenSet
 
-   The result of a successful code exchange. ``access_token``, ``id_token``
-   and ``token_type`` are pulled out of the response; :attr:`raw` is the
-   full JSON body (for ``refresh_token``, ``expires_in``, ``scope``, ...).
+   The result of a successful code exchange. ``access_token``, ``id_token``,
+   ``token_type``, ``refresh_token``, ``expires_in`` and ``scope`` are pulled
+   out of the response; :attr:`raw` is the full JSON body.
    ``repr()`` never shows the token values.
 
    .. py:property:: access_token
@@ -164,6 +209,32 @@ Provider and client
       :type: str
    .. py:property:: token_type
       :type: str
+   .. py:property:: refresh_token
+      :type: str | None
+
+      ``raw["refresh_token"]`` if it is a string, else ``None``. A long-lived
+      credential: store it encrypted and never log it. ``repr()`` shows only
+      ``refresh_token=<set>`` or ``None``.
+
+      .. versionadded:: 0.3.0
+   .. py:property:: expires_in
+      :type: int | None
+
+      ``raw["expires_in"]`` in seconds: a non-negative JSON integer (an
+      integral float is accepted) or a digits-only string, at most 10 years
+      (315360000 seconds). ``None`` means "absent or not acceptable"
+      (negative, non-integer, garbage, longer than 10 years), NEVER "no
+      expiry": apply your own default lifetime when it is ``None`` and do not
+      treat ``None`` as unbounded.
+
+      .. versionadded:: 0.3.0
+   .. py:property:: scope
+      :type: str | None
+
+      ``raw["scope"]`` if it is a string, else ``None``. The granted scope,
+      which the OP may have narrowed.
+
+      .. versionadded:: 0.3.0
    .. py:property:: raw
       :type: dict[str, Any]
 
@@ -193,20 +264,41 @@ Starting the flow
    :class:`pygrindvakt.BadRequestError` is raised, and the same value must
    be passed to :func:`exchange_code`; keep it in the session.
 
-.. py:function:: begin(provider: ProviderInfo, client: RpClient, *, extra: dict[str, str] | list[tuple[str, str]] | None = None, redirect_uri: str | None = None, pkce: bool = True, request_object_key: SigningKey | None = None) -> tuple[str, str, str, str | None]
+.. py:function:: begin(provider: ProviderInfo, client: RpClient, *, extra: dict[str, str] | list[tuple[str, str]] | None = None, redirect_uri: str | None = None, pkce: bool = True, request_object_key: SigningKey | None = None) -> BeginResult
 
    Start an authorization-code flow: generate a fresh ``state`` and
    ``nonce`` (32 random bytes each, base64url) and a PKCE verifier (48
-   random bytes, 64 characters), and return ``(url, state, nonce,
-   verifier)``. The challenge is ``S256``. Store ``state``, ``nonce`` and
-   ``verifier`` (and ``redirect_uri`` if overridden) in the user's session.
+   random bytes, 64 characters), and return a :class:`BeginResult`
+   ``(url, state, nonce, code_verifier)``. The challenge is ``S256``. Store
+   ``state``, ``nonce`` and ``code_verifier`` (and ``redirect_uri`` if
+   overridden) in the user's session.
 
-   ``pkce=False`` omits PKCE and returns ``None`` as the verifier; it is
+   ``pkce=False`` omits PKCE and returns ``None`` as the code verifier; it is
    refused with :class:`pygrindvakt.ConfigError` for public clients
    (``auth_method="none"``). With ``request_object_key`` a signed request
    object (see :func:`signed_request_object`) is added as the ``request``
    parameter. ``extra`` and ``redirect_uri`` behave as in
    :func:`authorization_url`.
+
+.. py:class:: BeginResult
+
+   The return type of :func:`begin`: a :func:`collections.namedtuple`
+   subclass with the fields ``url: str``, ``state: str``, ``nonce: str`` and
+   ``code_verifier: str | None`` (the name matches the ``code_verifier``
+   parameter of :func:`exchange_code`). It is a real :class:`tuple`: unpacking
+   (``url, state, nonce, verifier = rp.begin(...)``), indexing, ``==`` and
+   ``isinstance(x, tuple)`` all keep working, and ``_fields`` / ``_replace``
+   are available.
+
+   ``state``, ``nonce`` and ``code_verifier`` are secrets, so ``repr()``
+   redacts them, and the query of ``url`` (which carries ``state`` and
+   ``nonce``) is replaced by ``?…``::
+
+      BeginResult(url='https://op.example.com/authorization?…', state=<redacted>, nonce=<redacted>, code_verifier=<redacted>)
+
+   A ``code_verifier`` of ``None`` (``pkce=False``) is shown as ``None``.
+
+   .. versionadded:: 0.3.0
 
 .. py:function:: signed_request_object(provider: ProviderInfo, client: RpClient, key: SigningKey, state: str, nonce: str, code_challenge: str | None = None, *, redirect_uri: str | None = None) -> str
 
@@ -1017,6 +1109,102 @@ distinction; branch on the class instead.
    unsatisfiable for EdDSA tokens: filter with
    :func:`pygrindvakt.jwt.supports_oidc_token_hash` or pass an explicit
    allowlist.
+
+   .. versionadded:: 0.3.0
+
+.. py:function:: claims_audiences(claims: Mapping[str, Any]) -> list[str]
+
+   Normalise the ``aud`` claim of a claims dict to a **non-empty** list of
+   non-empty strings: a string becomes ``[string]``, a list of strings is
+   copied. The function returns a non-empty list or raises, so a caller's
+   ``all(a in {CLIENT} for a in aud)`` or ``set(aud) <= {CLIENT}`` can never
+   be vacuously true for a token without an audience binding. A missing
+   ``aud``, ``aud: []``, ``aud: ""`` or an empty-string list member raises
+   :class:`pygrindvakt.BadRequestError`, as does ``aud`` of any other type
+   (including ``None``), a list member that is not a string, or a string that
+   is not valid Unicode (a lone surrogate). The claims are per-request input;
+   the message never echoes the value. A ``claims`` that is not a mapping
+   raises :class:`TypeError`. The dict passed in is never modified.
+
+   This is a convenience for application code only.
+   :func:`verify_id_token` returns ``aud`` verbatim, and the ``aud`` and
+   ``azp`` checks are made by the library inside it; do not re-implement them
+   with this function.
+
+   .. versionadded:: 0.3.0
+
+Startup checks
+--------------
+
+.. py:function:: check_rp_compatibility(provider: ProviderInfo | ProviderMetadata, *, client: RpClient | None = None, pkce: bool | None = None, algorithms: Sequence[str] | None = None, scopes: Sequence[str] | None = None, acr_values: Sequence[str] | None = None, shared_secret_keys: bool = False) -> list[str]
+
+   Compare what the RP intends to use with what the OP advertises in its
+   discovery document, and return human-readable findings. An empty list means
+   nothing contradicts the document. Pure: no I/O, nothing is enforced.
+
+   ``provider`` is a :class:`ProviderInfo` that has :attr:`ProviderInfo.metadata`
+   (build it with ``ProviderInfo.from_metadata(discover(...))``; one without
+   raises :class:`pygrindvakt.ConfigError`) or the
+   :class:`pygrindvakt.metadata.ProviderMetadata` returned by :func:`discover`
+   directly. Checks exactly:
+
+   * always: ``"code"`` is in ``response_types_supported``;
+   * ``pkce=True`` (the RP sends an S256 challenge; ``None`` and ``False`` skip
+     the check): ``"S256"`` is in ``code_challenge_methods_supported``;
+   * ``algorithms`` (the id_token algorithms the RP allows; must not be empty):
+     at least one is in ``id_token_signing_alg_values_supported``. Two rules
+     mirror ADR 0006 and are real mismatches (no
+     ``not advertised:`` prefix): ``none`` (any case) is always refused by this
+     library, so the message says to fix the RP config, not the OP; and
+     ``HS256``/``HS384``/``HS512`` are only usable with a key set derived from
+     the ``client_secret`` (OpenID Connect Core 1.0 section 10.1) and are
+     refused with ``JwksCache`` / published JWKS. Pass
+     ``shared_secret_keys=True`` if you verify with such a caller-built key
+     set; HS* is then not flagged and takes part in the normal intersection
+     check. ``none`` is never counted as a match, and HS* is ignored by the
+     intersection check unless ``shared_secret_keys=True``. The function
+     cannot see your key source, so the default fails closed;
+   * ``scopes``: every scope is in ``scopes_supported``;
+   * ``acr_values``: every value is in ``acr_values_supported``;
+   * ``client``: ``client.auth_method`` is in
+     ``token_endpoint_auth_methods_supported``. If that member is absent or
+     empty, the spec default ``["client_secret_basic"]`` (OpenID Connect
+     Discovery 1.0 section 3, RFC 8414 section 2) is assumed: any other
+     ``auth_method`` is then a real mismatch (the message says the list was
+     absent and the default assumed), and ``client_secret_basic`` passes. An
+     absent member and an explicit ``[]`` are indistinguishable after parsing
+     and are treated the same.
+
+   Not checked: ``grant_types_supported``, ``response_modes_supported``,
+   ``pkce=False`` or ``None``, DPoP, request-object support, claims, or any
+   other member of the document.
+
+   Messages come in two kinds. A message starting with ``"not advertised:"``
+   is **informational**: the OP lists nothing (absent or empty) for a check
+   that was performed, so the support can be neither confirmed nor refuted
+   (no default is assumed for these lists; in particular ``RS256`` is not
+   assumed for ``id_token_signing_alg_values_supported``; the one exception
+   is ``token_endpoint_auth_methods_supported`` above),
+   for example ``not advertised: code_challenge_methods_supported (cannot
+   confirm PKCE S256 support)`` for an OP such as ORCID that omits the member.
+   It is only produced for checks that were requested (the ``code`` check is
+   always requested). Every other message is a mismatch with a value the OP
+   does advertise. Filter on the prefix to decide what is fatal:
+
+   .. code-block:: python
+
+      problems = rp.check_rp_compatibility(info, client=me, pkce=True, algorithms=["ES256"])
+      mismatches = [p for p in problems if not p.startswith("not advertised:")]
+      if mismatches:
+          raise SystemExit("OP is not compatible: " + "; ".join(mismatches))
+
+   .. warning::
+
+      The metadata is untrusted, unauthenticated data from the OP (for
+      example, ``scopes_supported`` is not required to be exhaustive). This
+      function is advisory: it does not enforce anything and an empty result
+      does not mean the OP will accept the request. Advertised values are
+      escaped and truncated in the messages.
 
    .. versionadded:: 0.3.0
 

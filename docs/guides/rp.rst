@@ -29,7 +29,22 @@ wrong place cannot redirect you to someone else's endpoints.
 
 Discovery is one HTTP round trip; keep ``info`` for the process lifetime and
 refresh it on a timer. The provider's signing keys are cached by a
-:class:`~pygrindvakt.rp.JwksCache` (see below). For a statically configured OP, build the
+:class:`~pygrindvakt.rp.JwksCache` (see below).
+
+``ProviderInfo.from_metadata(discover(...))`` keeps the discovery document as
+``info.metadata``; ``discover`` itself returns a
+:class:`~pygrindvakt.metadata.ProviderMetadata`, which has no ``.metadata``.
+
+.. warning::
+
+   Every endpoint on ``info.metadata`` (``userinfo_endpoint``,
+   ``token_endpoint``, ``authorization_endpoint``, ``jwks_uri``,
+   ``end_session_endpoint`` ...) is UNVALIDATED data from the OP. Never send
+   credentials or tokens to them; use the validated properties on ``info``
+   itself (``info.userinfo_endpoint``, ``info.token_endpoint`` ...). The raw
+   ``end_session_endpoint`` is kept only to diagnose a rejection.
+
+For a statically configured OP, build the
 :class:`~pygrindvakt.rp.ProviderInfo` by hand instead:
 
 .. code-block:: python
@@ -57,6 +72,44 @@ inconsistent combinations raise :class:`~pygrindvakt.ConfigError` (also a
    me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret=os.environ["OIDC_CLIENT_SECRET"])
    # or, for a public client (native app, SPA): rp.RpClient("spa", "https://rp.example.com/cb")
 
+Startup checks
+--------------
+
+Two checks let a service fail at startup instead of on the first login.
+:func:`~pygrindvakt.rp.check_rp_compatibility` compares your intent with what
+the OP advertises, and :func:`pygrindvakt.http.supports_get_with_headers`
+checks a custom HTTP client before you rely on ``fetch_userinfo(method="GET")``:
+
+.. code-block:: python
+
+   problems = rp.check_rp_compatibility(info, client=me, pkce=True, algorithms=["ES256"])
+   hard = [p for p in problems if not p.startswith("not advertised:")]
+   if hard:
+       raise SystemExit("; ".join(hard))
+   if not http.supports_get_with_headers(http_client):
+       raise SystemExit("http_client cannot send headers on GET")
+
+``check_rp_compatibility`` accepts the ``ProviderInfo`` or the
+``ProviderMetadata`` from ``discover`` directly. It checks ``code`` in
+``response_types_supported``, ``S256`` in ``code_challenge_methods_supported``
+(only with ``pkce=True``), your ``algorithms``, ``scopes`` and ``acr_values``,
+and the client's token endpoint auth method. Two ``algorithms`` rules mirror
+ADR 0006: ``none`` is always reported (fix the RP config), and ``HS256``/
+``HS384``/``HS512`` are reported unless you pass ``shared_secret_keys=True``
+(you verify with a key set derived from the ``client_secret``). It remains
+advisory. It does not check
+``grant_types_supported``, ``response_modes_supported``, DPoP or anything else.
+
+Messages starting with ``not advertised:`` are informational (the OP omits
+that metadata member; no default is assumed, so ``RS256`` is not assumed for
+``id_token_signing_alg_values_supported``). The one exception is
+``token_endpoint_auth_methods_supported``: when absent or empty, the spec
+default ``["client_secret_basic"]`` is assumed, so a ``client_secret_post``,
+``private_key_jwt`` or ``none`` client is reported as a real mismatch. The
+metadata is untrusted data from the OP, so treat the result as advice. If ``from_metadata`` dropped the OP's
+``end_session_endpoint`` (it warns), compare ``info.end_session_endpoint``
+with ``info.metadata.end_session_endpoint`` to see that it was rejected.
+
 Starting the flow: PKCE, state and nonce in the session
 -------------------------------------------------------
 
@@ -75,9 +128,17 @@ before redirecting:
 
    @app.get("/login")
    def login():
-       url, state, nonce, verifier = rp.begin(info, me)
-       session["oidc"] = {"state": state, "nonce": nonce, "verifier": verifier}
-       return redirect(url)
+       started = rp.begin(info, me)          # a rp.BeginResult (still a tuple)
+       session["oidc"] = {
+           "state": started.state,
+           "nonce": started.nonce,
+           "verifier": started.code_verifier,
+       }
+       return redirect(started.url)
+
+The result is a named tuple, so ``url, state, nonce, verifier = rp.begin(info,
+me)`` works too. Its ``repr()`` redacts the secrets, so it is safe in a debug
+log.
 
 ``state`` and ``nonce`` are 32 random bytes each and the verifier is 48
 (64 characters, within the RFC 7636 range). ``pkce=False`` is refused for
@@ -562,8 +623,9 @@ endpoint to have the same origin as the issuer (scheme, host, effective port),
 besides the https / no-credentials / no-fragment checks. ``ProviderInfo(...)``
 raises ``ConfigError`` for a cross-origin endpoint, and
 ``ProviderInfo.from_metadata`` drops it, so ``info.end_session_endpoint`` is
-``None`` and ``end_session_url`` raises ``ConfigError`` (the advertised endpoint
-was missing, unsafe, or on a different origin than the issuer). If the OP
+``None`` and ``end_session_url`` raises ``ConfigError``. The message says
+whether the provider does not advertise the endpoint or the advertised value
+was rejected (cross-origin or unsafe). If the OP
 legitimately logs out on another origin, opt in explicitly with
 ``allow_cross_origin_end_session=True`` on ``ProviderInfo(...)`` or
 ``ProviderInfo.from_metadata(...)``.

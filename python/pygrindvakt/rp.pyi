@@ -1,7 +1,7 @@
 """Type stubs for ``pygrindvakt.rp`` - the relying-party (client) side of OIDC."""
 
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Literal, Protocol, overload
+from typing import Any, Literal, NamedTuple, Protocol, overload
 
 from .http import HttpRequestData, _HttpArg, _HttpHeadersArg
 from .keys import SigningKey
@@ -27,6 +27,11 @@ class ProviderInfo:
     ``end_session_url`` raises ``ConfigError``). The opt-in still requires the
     scheme/userinfo/fragment checks to pass. Other metadata endpoints are not
     origin-checked.
+
+    ``from_metadata`` also emits a ``UserWarning`` when it drops an
+    ``end_session_endpoint``; compare ``end_session_endpoint`` with
+    ``metadata.end_session_endpoint`` to tell "not advertised" from "rejected".
+    A non-string advertised value is ignored with a ``UserWarning`` too.
     """
 
     def __init__(
@@ -54,6 +59,23 @@ class ProviderInfo:
     def jwks_uri(self) -> str | None: ...
     @property
     def end_session_endpoint(self) -> str | None: ...
+    @property
+    def metadata(self) -> ProviderMetadata | None:
+        """The discovery document this was built from (a copy), or ``None``.
+
+        Set by ``from_metadata``, so ``ProviderInfo.from_metadata(discover(...))``
+        has it; ``None`` for a hand-built ``ProviderInfo``. Not in ``repr()``.
+
+        WARNING: EVERY endpoint on this document (``userinfo_endpoint``,
+        ``token_endpoint``, ``authorization_endpoint``, ``jwks_uri``,
+        ``end_session_endpoint`` ...) is UNVALIDATED data from the OP (ADR 0004
+        section 3 exempts discovery). Never send credentials or tokens to
+        them; use the validated properties on the ``ProviderInfo`` itself
+        (``info.userinfo_endpoint``, ``info.token_endpoint`` ...). The raw
+        ``end_session_endpoint`` is kept only so you can diagnose a rejection.
+
+        .. versionadded:: 0.3.0
+        """
     def __repr__(self) -> str: ...
 
 class RpClient:
@@ -109,7 +131,10 @@ class RpClient:
     def __repr__(self) -> str: ...
 
 class TokenSet:
-    """The result of a successful code exchange."""
+    """The result of a successful code exchange.
+
+    ``repr()`` never prints a token.
+    """
 
     @property
     def access_token(self) -> str: ...
@@ -117,6 +142,32 @@ class TokenSet:
     def id_token(self) -> str: ...
     @property
     def token_type(self) -> str: ...
+    @property
+    def refresh_token(self) -> str | None:
+        """``raw["refresh_token"]`` if it is a string, else ``None``.
+
+        SECURITY: a long-lived credential; store it encrypted, never log it.
+
+        .. versionadded:: 0.3.0
+        """
+    @property
+    def expires_in(self) -> int | None:
+        """``raw["expires_in"]`` in seconds, else ``None``.
+
+        A non-negative JSON integer (or integral float) or a digits-only
+        string, at most 10 years (315360000). ``None`` means "absent or not
+        acceptable" (negative, non-integer, garbage, longer than 10 years),
+        NEVER "no expiry": apply your own default lifetime when it is
+        ``None`` and do not treat ``None`` as unbounded.
+
+        .. versionadded:: 0.3.0
+        """
+    @property
+    def scope(self) -> str | None:
+        """``raw["scope"]`` if it is a string, else ``None``.
+
+        .. versionadded:: 0.3.0
+        """
     @property
     def raw(self) -> dict[str, Any]: ...
     def __repr__(self) -> str: ...
@@ -141,6 +192,22 @@ def signed_request_object(
     *,
     redirect_uri: str | None = ...,
 ) -> str: ...
+
+class BeginResult(NamedTuple):
+    """Result of ``begin``: a real ``tuple`` ``(url, state, nonce, code_verifier)``.
+
+    ``state``, ``nonce`` and ``code_verifier`` are secrets: ``repr()`` redacts
+    them and strips the query from ``url``.
+
+    .. versionadded:: 0.3.0
+    """
+
+    url: str
+    state: str
+    nonce: str
+    code_verifier: str | None
+    def __repr__(self) -> str: ...
+
 def begin(
     provider: ProviderInfo,
     client: RpClient,
@@ -149,7 +216,66 @@ def begin(
     redirect_uri: str | None = ...,
     pkce: bool = ...,
     request_object_key: SigningKey | None = ...,
-) -> tuple[str, str, str, str | None]: ...
+) -> BeginResult: ...
+def claims_audiences(claims: Mapping[str, Any]) -> list[str]:
+    """Normalise ``claims["aud"]`` to a NON-EMPTY list of non-empty strings.
+
+    Fails closed: a missing ``aud``, ``aud: []``, ``aud: ""`` or an
+    empty-string member raises ``BadRequestError``, so ``all(a in {CLIENT} for
+    a in aud)`` cannot be vacuously true. Also raises ``BadRequestError`` for
+    a non-string/list ``aud``, a non-string member, or a string that is not
+    valid Unicode (lone surrogate). ``claims`` is not modified;
+    ``verify_id_token`` returns ``aud`` verbatim and performs the ``aud`` /
+    ``azp`` checks itself.
+
+    .. versionadded:: 0.3.0
+    """
+
+def check_rp_compatibility(
+    provider: ProviderInfo | ProviderMetadata,
+    *,
+    client: RpClient | None = ...,
+    pkce: bool | None = ...,
+    algorithms: Sequence[str] | None = ...,
+    scopes: Sequence[str] | None = ...,
+    acr_values: Sequence[str] | None = ...,
+    shared_secret_keys: bool = ...,
+) -> list[str]:
+    """Advisory comparison of the RP's intent with the OP's discovery document.
+
+    ``provider`` is a ``ProviderInfo`` built with ``from_metadata`` (one
+    without ``metadata`` raises ``ConfigError``) or the ``ProviderMetadata``
+    returned by ``discover`` directly.
+
+    Checks exactly: ``"code"`` in ``response_types_supported`` (always);
+    ``"S256"`` in ``code_challenge_methods_supported`` when ``pkce=True``;
+    ``algorithms`` intersects ``id_token_signing_alg_values_supported``;
+    ``scopes`` are in ``scopes_supported``; ``acr_values`` are in
+    ``acr_values_supported``; ``client.auth_method`` is in
+    ``token_endpoint_auth_methods_supported``. Not checked:
+    ``grant_types_supported``, ``response_modes_supported``,
+    ``pkce=False``/``None``, DPoP, or any other member.
+
+    Two ``algorithms`` rules mirror ADR 0006 (still advisory): ``none``
+    (case-insensitive) is always a mismatch and never counts as a match;
+    ``HS256``/``HS384``/``HS512`` are a mismatch unless
+    ``shared_secret_keys=True`` (you verify with a key set derived from the
+    ``client_secret``, OIDC Core 10.1; they are refused with ``JwksCache`` /
+    published JWKS), and are ignored by the intersection check otherwise.
+
+    Returns mismatch strings; ``[]`` means nothing contradicts the document.
+    Strings starting with ``"not advertised:"`` are informational (the OP lists
+    nothing for a check that was performed; no default is assumed, in
+    particular not ``RS256`` for ``id_token_signing_alg_values_supported``).
+    Exception: an absent or empty ``token_endpoint_auth_methods_supported``
+    (indistinguishable after parsing) is treated as the spec default
+    ``["client_secret_basic"]`` (OIDC Discovery 1.0 section 3, RFC 8414
+    section 2), so any other ``client.auth_method`` is a real mismatch. Pure,
+    no I/O, enforces nothing; the metadata is untrusted.
+
+    .. versionadded:: 0.3.0
+    """
+
 def discover(http: _HttpArg, issuer: str) -> ProviderMetadata: ...
 def end_session_url(
     provider: ProviderInfo,

@@ -82,6 +82,47 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `oidc_token_hash` raises `CryptoError` for an unknown or unparseable `alg`
   (like the other `jwt.*` primitives) and for `EdDSA`;
   `supports_oidc_token_hash` returns `False` for both and never raises.
+- `rp.begin()` returns a `rp.BeginResult`, a `collections.namedtuple`
+  subclass `(url, state, nonce, code_verifier)` that you can type against.
+  It is still a real `tuple` (unpacking, indexing, `==` unchanged). Its
+  `repr()` redacts `state`, `nonce` and `code_verifier` and strips the query
+  from `url`.
+- `rp.TokenSet.refresh_token`, `.expires_in` (non-negative integer up to 10 years,
+  315360000 s; a digits-only string is accepted; anything else is `None`,
+  which means "absent or not acceptable", NEVER "no expiry": apply your own
+  default lifetime and do not treat `None` as unbounded) and `.scope`,
+  read from `raw`. `repr()` shows `refresh_token=<set>` / `None`, never the
+  value.
+- `rp.claims_audiences(claims)`: `aud` as a non-empty list of non-empty
+  strings. Fails closed: a missing `aud`, `aud: []`, `aud: ""` or an
+  empty-string member raises `BadRequestError`, so `all(a in {CLIENT} for a
+  in aud)` cannot pass vacuously; other types, or strings with lone
+  surrogates, also raise `BadRequestError`. Convenience only.
+- `http.supports_get_with_headers(client)`: whether a client can send headers
+  on GET (for `rp.fetch_userinfo(method="GET")`), decided without any request
+  and without raising, so an application can fail at startup. Typed as a
+  `TypeGuard`, which removes the need for a `cast`.
+- `rp.ProviderInfo.metadata`: the discovery document a `ProviderInfo` built by
+  `from_metadata` came from, so `ProviderInfo.from_metadata(discover(...))`
+  has it (`None` for a hand-built one); `end_session_endpoint` dropped by
+  `from_metadata` can be compared with `metadata.end_session_endpoint`, and
+  `end_session_url` now says "not advertised", "rejected" or "advertised a
+  non-string value" in its `ConfigError`, from the outcome recorded when the
+  `ProviderInfo` was built. A non-string advertised `end_session_endpoint`
+  (number, object, list ...) now also emits a `UserWarning` and is ignored.
+  Every endpoint on `info.metadata` is UNVALIDATED data from the OP: never
+  send credentials to them; use the validated properties on the
+  `ProviderInfo`.
+- `rp.check_rp_compatibility(provider, *, client, pkce, algorithms, scopes,
+  acr_values, shared_secret_keys)`: advisory, pure comparison of the RP's intent with the OP's
+  advertised metadata (accepts a `ProviderInfo` or the `ProviderMetadata`
+  from `discover`); returns mismatch strings, with `not advertised:`
+  prefixed informational ones. An absent or empty
+  `token_endpoint_auth_methods_supported` assumes the spec default
+  `["client_secret_basic"]` (a real mismatch for other auth methods). Mirrors
+  ADR 0006: `algorithms` containing `none` is always a mismatch, and `HS*` is a
+  mismatch unless `shared_secret_keys=True` (key set derived from the
+  client_secret).
 
 ### Security
 

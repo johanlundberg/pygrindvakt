@@ -15,6 +15,7 @@ from pygrindvakt import (
     discovery,
     federation,
     jwt,
+    metadata,
     rp,
 )
 
@@ -310,3 +311,57 @@ def use_authorization_response(req: pygrindvakt.http.HttpRequestData) -> None:
     st_ok: bool = r.matches_state("expected-state")
     st_opt: bool = r.matches_state("expected-state", required=False)
     del code, state, error, desc, uri, iss, jarm, mode, flags, ok, st_ok, st_opt
+
+
+def use_helpers(unknown: object, md: metadata.ProviderMetadata) -> None:
+    info = rp.ProviderInfo.from_metadata(md)
+    me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
+    res: rp.BeginResult = rp.begin(info, me)
+    begin_url: str = res.url
+    begin_state: str = res.state
+    begin_nonce: str = res.nonce
+    begin_verifier: str | None = res.code_verifier
+    as_tuple: tuple[str, str, str, str | None] = res
+    url, state, nonce, verifier = res
+    del begin_url, begin_state, begin_nonce, begin_verifier, as_tuple, url, state, nonce, verifier
+
+    ts: rp.TokenSet = rp.exchange_code(None, info, me, "code")
+    refresh: str | None = ts.refresh_token
+    expires: int | None = ts.expires_in
+    scope: str | None = ts.scope
+    del refresh, expires, scope
+
+    auds: list[str] = rp.claims_audiences({"aud": "a"})
+    del auds
+
+    embedded: metadata.ProviderMetadata | None = info.metadata
+    del embedded
+
+    problems: list[str] = rp.check_rp_compatibility(info)
+    rp.check_rp_compatibility(md)
+    rp.check_rp_compatibility(
+        info,
+        client=me,
+        pkce=True,
+        algorithms=["ES256"],
+        scopes=("openid", "email"),
+        acr_values=["urn:x"],
+        shared_secret_keys=True,
+    )
+    rp.check_rp_compatibility(
+        md, client=None, pkce=None, algorithms=None, scopes=None, acr_values=None, shared_secret_keys=False
+    )
+    del problems
+
+    ok: bool = pygrindvakt.http.supports_get_with_headers(unknown)
+    pygrindvakt.http.supports_get_with_headers(None)
+    if pygrindvakt.http.supports_get_with_headers(unknown):
+        rp.fetch_userinfo(
+            unknown,
+            "https://op.example.com/ui",
+            "tok",
+            "sub",
+            "https://op.example.com",
+            method="GET",
+        )
+    del ok

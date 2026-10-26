@@ -100,6 +100,9 @@ def test_stub_matches_runtime(name):
             continue
         cls = getattr(mod, cls_name)
         rt_members = {m for m in dir(cls) if not m.startswith("_")}
+        if issubclass(cls, tuple):
+            # NamedTuple stubs do not declare the builtin tuple methods.
+            rt_members -= {"count", "index"}
         assert rt_members == members, (
             f"{name}.{cls_name}: stub {sorted(members ^ rt_members)} differs "
             f"(stub-only: {sorted(members - rt_members)}, runtime-only: {sorted(rt_members - members)})"

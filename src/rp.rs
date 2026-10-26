@@ -20,11 +20,13 @@ use grindvakt::http::{HttpClient, HttpFetchResponse};
 use grindvakt::Error as RsError;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyTuple};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::jose_rs::jwk::JwkSet;
 use grindvakt::jwt as gj;
+use grindvakt::metadata as gm;
 use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
@@ -69,6 +71,27 @@ pub struct ProviderInfo {
     /// OIDC RP-Initiated Logout endpoint. Upstream `ProviderInfo` has no slot
     /// for it, so the binding carries it alongside.
     pub end_session_endpoint: Option<String>,
+    /// The discovery document this value was built from
+    /// (`ProviderInfo.from_metadata(discover(...))`). `None` for a hand-built
+    /// `ProviderInfo`.
+    pub metadata: Option<ProviderMetadata>,
+    /// What `from_metadata` decided about the advertised
+    /// `end_session_endpoint`, recorded then so `end_session_url` can explain
+    /// a missing endpoint without re-deriving it. Not in `repr()`.
+    end_session_outcome: EndSessionOutcome,
+}
+
+/// Outcome of the `end_session_endpoint` decision at build time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EndSessionOutcome {
+    /// Absent or JSON null, or a hand-built `ProviderInfo`.
+    NotAdvertised,
+    /// Advertised, valid, carried over.
+    Accepted,
+    /// Advertised as a string but unsafe or cross-origin; dropped.
+    Rejected,
+    /// Advertised with a non-string JSON value; dropped.
+    InvalidType,
 }
 
 /// Same-origin test: scheme, host (the `url` crate lower-cases and IDNA-
@@ -83,6 +106,30 @@ fn same_origin(a: &str, b: &str) -> bool {
         && a.host() == b.host()
         && a.port_or_known_default().is_some()
         && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// JSON type name for diagnostics (never the value itself).
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Best-effort `UserWarning`: a warnings filter of "error" must not make
+/// login depend on logout.
+fn warn_user(py: Python<'_>, text: &str) {
+    let msg = std::ffi::CString::new(text.replace('\0', "?")).expect("NUL removed");
+    let _ = PyErr::warn(
+        py,
+        &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        &msg,
+        1,
+    );
 }
 
 /// Why an `end_session_endpoint` was refused.
@@ -155,7 +202,13 @@ impl ProviderInfo {
         }
         Ok(Self {
             inner,
+            end_session_outcome: if end_session_endpoint.is_some() {
+                EndSessionOutcome::Accepted
+            } else {
+                EndSessionOutcome::NotAdvertised
+            },
             end_session_endpoint,
+            metadata: None,
         })
     }
 
@@ -163,8 +216,12 @@ impl ProviderInfo {
     /// endpoint is `None` if the provider does not advertise one). An
     /// advertised `end_session_endpoint` is carried over; one that is unsafe
     /// or on a different origin than the issuer (unless
-    /// `allow_cross_origin_end_session`) is dropped (`None`) so login never
-    /// depends on logout.
+    /// `allow_cross_origin_end_session`) is dropped (`None`) with a
+    /// `UserWarning`, so login never depends on logout; compare
+    /// `end_session_endpoint` with `metadata.end_session_endpoint` to tell
+    /// "not advertised" from "rejected". A non-string advertised value is
+    /// likewise ignored with a `UserWarning`. The whole document stays
+    /// reachable as `metadata`.
     #[staticmethod]
     #[pyo3(signature = (metadata, *, allow_cross_origin_end_session = false))]
     fn from_metadata(
@@ -174,49 +231,49 @@ impl ProviderInfo {
     ) -> PyResult<Self> {
         let inner = grp::ProviderInfo::from(metadata.inner.clone());
         inner.validate().map_err(config_from)?;
-        let end_session_endpoint = metadata
+        // Login must not depend on logout: an advertised endpoint that fails
+        // validation is dropped (with a UserWarning), never raised.
+        let (end_session_endpoint, end_session_outcome) = match metadata
             .inner
             .extra
             .get("end_session_endpoint")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-        // Login must not depend on logout: an advertised endpoint that fails
-        // issuer validation is dropped rather than raised.
-        let end_session_endpoint = match end_session_endpoint {
-            Some(e) => {
-                match check_end_session_endpoint(&e, &inner.issuer, allow_cross_origin_end_session)
-                {
-                    Ok(()) => Some(e),
+        {
+            None | Some(serde_json::Value::Null) => (None, EndSessionOutcome::NotAdvertised),
+            Some(serde_json::Value::String(e)) => {
+                match check_end_session_endpoint(e, &inner.issuer, allow_cross_origin_end_session) {
+                    Ok(()) => (Some(e.clone()), EndSessionOutcome::Accepted),
                     Err(reject) => {
                         let reason = match reject {
                             EndSessionReject::CrossOrigin => format!(
                                 "end_session_endpoint {e:?} is on a different origin than the \
-                                 issuer and was ignored; pass \
-                                 allow_cross_origin_end_session=True to trust it"
+                                     issuer and was ignored; pass \
+                                     allow_cross_origin_end_session=True to trust it"
                             ),
-                            EndSessionReject::Unsafe(cause) => {
-                                format!("end_session_endpoint {e:?} is unsafe ({cause}) and was ignored")
-                            }
+                            EndSessionReject::Unsafe(cause) => format!(
+                                "end_session_endpoint {e:?} is unsafe ({cause}) and was ignored"
+                            ),
                         };
-                        let msg =
-                            std::ffi::CString::new(reason.replace('\0', "?")).expect("NUL removed");
-                        // Best effort: a warnings filter of "error" must not
-                        // make login depend on logout.
-                        let _ = PyErr::warn(
-                            py,
-                            &py.get_type::<pyo3::exceptions::PyUserWarning>(),
-                            &msg,
-                            1,
-                        );
-                        None
+                        warn_user(py, &reason);
+                        (None, EndSessionOutcome::Rejected)
                     }
                 }
             }
-            None => None,
+            Some(other) => {
+                warn_user(
+                    py,
+                    &format!(
+                        "end_session_endpoint has a non-string value ({}) and was ignored",
+                        json_type_name(other)
+                    ),
+                );
+                (None, EndSessionOutcome::InvalidType)
+            }
         };
         Ok(Self {
             inner,
             end_session_endpoint,
+            end_session_outcome,
+            metadata: Some(metadata.clone()),
         })
     }
 
@@ -244,6 +301,21 @@ impl ProviderInfo {
     #[getter]
     fn end_session_endpoint(&self) -> Option<&str> {
         self.end_session_endpoint.as_deref()
+    }
+    /// The discovery document this value was built from (a copy), or `None`
+    /// for a hand-built `ProviderInfo`.
+    ///
+    /// WARNING: EVERY endpoint on this document (`userinfo_endpoint`,
+    /// `token_endpoint`, `authorization_endpoint`, `jwks_uri`,
+    /// `end_session_endpoint`, ...) is UNVALIDATED data from the OP
+    /// (ADR 0004 section 3 exempts discovery). Never send credentials or
+    /// tokens to them; use the validated properties on the `ProviderInfo`
+    /// itself (`info.userinfo_endpoint`, `info.token_endpoint`, ...). The raw
+    /// `end_session_endpoint` is kept only so you can diagnose a rejection.
+    /// Not part of `repr()`.
+    #[getter]
+    fn metadata(&self) -> Option<ProviderMetadata> {
+        self.metadata.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -528,9 +600,10 @@ impl RpClient {
 // TokenSet
 // ---------------------------------------------------------------------------
 
-/// The result of a successful code exchange. `access_token`, `id_token` and
-/// `token_type` are pulled out of the response; `raw` is the full JSON body
-/// as a dict (for `refresh_token`, `expires_in`, `scope`, ...).
+/// The result of a successful code exchange. `access_token`, `id_token`,
+/// `token_type`, `refresh_token`, `expires_in` and `scope` are pulled out of
+/// the response; `raw` is the full JSON body as a dict. `repr()` never prints
+/// a token.
 #[pyclass(module = "pygrindvakt.rp", name = "TokenSet", frozen, from_py_object)]
 #[derive(Clone)]
 pub struct TokenSet {
@@ -551,6 +624,41 @@ impl TokenSet {
     fn token_type(&self) -> &str {
         &self.inner.token_type
     }
+    /// The `refresh_token` member, or `None` when absent or not a string.
+    /// SECURITY: a long-lived credential; store it encrypted and never log it.
+    #[getter]
+    fn refresh_token(&self) -> Option<&str> {
+        self.inner.raw.get("refresh_token")?.as_str()
+    }
+    /// The `expires_in` member in seconds: a non-negative JSON integer (or
+    /// an integral float) or a digits-only string, at most 10 years
+    /// (315_360_000 s). `None` means "absent or not acceptable" (missing,
+    /// negative, non-integer, garbage, longer than 10 years), NEVER "no
+    /// expiry": apply your own default lifetime when it is `None` and do not
+    /// treat `None` as unbounded.
+    #[getter]
+    fn expires_in(&self) -> Option<u64> {
+        const MAX_EXPIRES_IN: u64 = 315_360_000;
+        let secs = match self.inner.raw.get("expires_in")? {
+            serde_json::Value::Number(n) => n.as_u64().or_else(|| {
+                n.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0 && *f < 1.8e19)
+                    .map(|f| f as u64)
+            }),
+            serde_json::Value::String(s)
+                if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                s.parse().ok()
+            }
+            _ => None,
+        };
+        secs.filter(|n| *n <= MAX_EXPIRES_IN)
+    }
+    /// The `scope` member, or `None` when absent or not a string.
+    #[getter]
+    fn scope(&self) -> Option<&str> {
+        self.inner.raw.get("scope")?.as_str()
+    }
     /// The complete token-endpoint response as a dict.
     #[getter]
     fn raw<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -559,8 +667,13 @@ impl TokenSet {
 
     fn __repr__(&self) -> String {
         format!(
-            "TokenSet(token_type={:?}, access_token=<set>, id_token=<set>)",
+            "TokenSet(token_type={:?}, access_token=<set>, id_token=<set>, refresh_token={})",
             self.inner.token_type,
+            if self.refresh_token().is_some() {
+                "<set>"
+            } else {
+                "None"
+            },
         )
     }
 }
@@ -700,23 +813,26 @@ fn signed_request_object(
 ///
 /// Generates a fresh `state` and `nonce` (32 random bytes each) and, unless
 /// `pkce=False`, a PKCE verifier (48 random bytes, 64 characters) with its
-/// `S256` challenge. Returns `(url, state, nonce, verifier)`; `verifier` is
-/// `None` when `pkce=False`. Store `state`, `nonce` and `verifier` (and
-/// `redirect_uri`, if overridden) in the user's session.
+/// `S256` challenge. Returns a `BeginResult` named tuple
+/// `(url, state, nonce, code_verifier)` (a real `tuple`: unpacking and
+/// indexing work); `code_verifier` is `None` when `pkce=False`. Store `state`,
+/// `nonce` and `code_verifier` (and `redirect_uri`, if overridden) in the
+/// user's session. Its `repr()` redacts them.
 ///
 /// Public clients (`auth_method="none"`) cannot disable PKCE: `pkce=False`
 /// raises `ConfigError`. When `request_object_key` is given, a signed
 /// request object (RFC 9101) is added as `extra["request"]`.
 #[pyfunction]
 #[pyo3(signature = (provider, client, *, extra = None, redirect_uri = None, pkce = true, request_object_key = None))]
-fn begin(
+fn begin<'py>(
+    py: Python<'py>,
     provider: &ProviderInfo,
     client: &RpClient,
     extra: Option<&Bound<'_, PyAny>>,
     redirect_uri: Option<String>,
     pkce: bool,
     request_object_key: Option<&SigningKey>,
-) -> PyResult<(String, String, String, Option<String>)> {
+) -> PyResult<Bound<'py, PyAny>> {
     let client = effective_client(client, redirect_uri)?;
     // Refuse before generating anything: a public client must not run the
     // code flow without PKCE (upstream also enforces this; do not depend on it).
@@ -753,7 +869,144 @@ fn begin(
         &extra_refs,
     )
     .map_err(err)?;
-    Ok((url, state, nonce, verifier))
+    begin_result_type(py)?.call1((url, state, nonce, verifier))
+}
+
+/// `BeginResult`: a `collections.namedtuple` subclass (module
+/// `pygrindvakt.rp`) with a `__repr__` that redacts `state`, `nonce` and
+/// `code_verifier` and strips the query from `url`. The class is defined in
+/// embedded Python below: keep `BeginResult` in `python/pygrindvakt/rp.pyi`
+/// in sync with it.
+static BEGIN_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn begin_result_type<'py>(py: Python<'py>) -> PyResult<&'py Bound<'py, PyAny>> {
+    BEGIN_RESULT
+        .get_or_try_init(py, || {
+            let globals = PyDict::new(py);
+            py.run(
+                cr##"
+import collections
+
+_Base = collections.namedtuple(
+    "BeginResult", ["url", "state", "nonce", "code_verifier"], module="pygrindvakt.rp"
+)
+
+
+class BeginResult(_Base):
+    __slots__ = ()
+    __module__ = "pygrindvakt.rp"
+
+    def __repr__(self):
+        url, _state, _nonce, verifier = self
+        if isinstance(url, str):
+            base = url.split("#", 1)[0]
+            if "?" in base:
+                base = base.split("?", 1)[0] + "?…"
+            url = base
+        return "BeginResult(url=%r, state=<redacted>, nonce=<redacted>, code_verifier=%s)" % (
+            url,
+            "None" if verifier is None else "<redacted>",
+        )
+
+
+BeginResult.__doc__ = (
+    "Result of rp.begin(): a named tuple (url, state, nonce, code_verifier). "
+    "state, nonce and code_verifier are secrets: repr() redacts them and "
+    "strips the query from url. code_verifier is None when pkce=False."
+)
+"##,
+                Some(&globals),
+                None,
+            )?;
+            Ok::<_, PyErr>(
+                globals
+                    .get_item("BeginResult")?
+                    .expect("defined above")
+                    .unbind(),
+            )
+        })
+        .map(|t| t.bind(py))
+}
+
+/// Normalise the `aud` claim of a claims dict to a NON-EMPTY list of
+/// strings: a non-empty string becomes `[string]`, a non-empty list of
+/// non-empty strings is copied. Fails closed: a missing `aud`, `aud: []`,
+/// `aud: ""` or an empty-string list member raises `BadRequestError`, so a
+/// caller's `all(a in {CLIENT} for a in aud)` can never pass vacuously. Also
+/// raises `BadRequestError` when `aud` is neither a string nor a list (or a
+/// list member is not a string). Convenience only: `verify_id_token` returns
+/// `aud` verbatim and the library itself performs the `aud` / `azp` checks;
+/// `claims` is not modified.
+#[pyfunction]
+fn claims_audiences(claims: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let py = claims.py();
+    let claims = claims.cast::<PyMapping>()?;
+    let aud = match claims.get_item("aud") {
+        Ok(v) => v,
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyKeyError>(py) => {
+            return Err(crate::errors::bad_request_err(
+                "claims have no 'aud': an audience check cannot pass".to_string(),
+            ))
+        }
+        Err(e) => return Err(e),
+    };
+    let empty_member = || {
+        crate::errors::bad_request_err(
+            "claims have an empty 'aud': an audience check cannot pass".to_string(),
+        )
+    };
+    let type_name = |o: &Bound<'_, PyAny>| {
+        o.get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+    };
+    // `to_cow` fails for lone surrogates; report a class, never the value.
+    let text = |s: &Bound<'_, pyo3::types::PyString>| -> PyResult<String> {
+        s.to_cow().map(|c| c.into_owned()).map_err(|_| {
+            crate::errors::bad_request_err(
+                "aud claim contains a string that is not valid Unicode (lone surrogate)"
+                    .to_string(),
+            )
+        })
+    };
+    if let Ok(s) = aud.cast::<pyo3::types::PyString>() {
+        let t = text(s)?;
+        if t.is_empty() {
+            return Err(empty_member());
+        }
+        return Ok(vec![t]);
+    }
+    let items: Vec<Bound<'_, PyAny>> = if let Ok(l) = aud.cast::<PyList>() {
+        l.iter().collect()
+    } else if let Ok(t) = aud.cast::<PyTuple>() {
+        t.iter().collect()
+    } else {
+        return Err(crate::errors::bad_request_err(format!(
+            "aud claim must be a string or a list of strings, got {}",
+            escape_untrusted_text(&type_name(&aud), 64)
+        )));
+    };
+    if items.is_empty() {
+        return Err(empty_member());
+    }
+    items
+        .iter()
+        .map(|i| match i.cast::<pyo3::types::PyString>() {
+            Ok(s) => {
+                let t = text(s)?;
+                if t.is_empty() {
+                    Err(empty_member())
+                } else {
+                    Ok(t)
+                }
+            }
+            Err(_) => Err(crate::errors::bad_request_err(format!(
+                "aud claim list members must be strings, got {}",
+                escape_untrusted_text(&type_name(i), 64)
+            ))),
+        })
+        .collect()
 }
 
 /// Discover provider metadata from `issuer` (`/.well-known/openid-configuration`).
@@ -890,11 +1143,26 @@ fn end_session_url(
     extra: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<String> {
     let endpoint = provider.end_session_endpoint.as_deref().ok_or_else(|| {
-        err(RsError::Config(
-            "provider has no usable end_session_endpoint (the advertised endpoint was missing, \
-             unsafe, or on a different origin than the issuer)"
-                .into(),
-        ))
+        let msg = match provider.end_session_outcome {
+            EndSessionOutcome::Rejected => {
+                "provider has no usable end_session_endpoint: the advertised value was rejected by \
+                 ProviderInfo.from_metadata (cross-origin or unsafe; see the UserWarning emitted \
+                 when the ProviderInfo was built, and info.metadata.end_session_endpoint for the \
+                 raw, UNTRUSTED value (diagnostics only, never redirect to it))"
+            }
+            EndSessionOutcome::InvalidType => {
+                "provider has no usable end_session_endpoint: the provider advertised a \
+                 non-string end_session_endpoint, ignored by ProviderInfo.from_metadata (see the \
+                 UserWarning emitted when the ProviderInfo was built, and \
+                 info.metadata.end_session_endpoint for the raw, UNTRUSTED value (diagnostics \
+                 only, never redirect to it))"
+            }
+            EndSessionOutcome::NotAdvertised | EndSessionOutcome::Accepted => {
+                "provider has no usable end_session_endpoint: the provider does not advertise \
+                 end_session_endpoint"
+            }
+        };
+        err(RsError::Config(msg.into()))
     })?;
     // Origin binding was decided when the ProviderInfo was built (it may have
     // opted in); re-check only the shared safety rules here.
@@ -2694,6 +2962,244 @@ fn parse_authorization_response(
     })
 }
 
+/// Render untrusted OP-advertised values for a message: each escaped and
+/// capped, at most 20 shown.
+fn show_list(items: &[String]) -> String {
+    let mut parts: Vec<String> = items
+        .iter()
+        .take(20)
+        .map(|i| format!("'{}'", escape_untrusted_quoted(i, 64)))
+        .collect();
+    if items.len() > 20 {
+        parts.push(format!("... ({} more)", items.len() - 20));
+    }
+    format!("[{}]", parts.join(", "))
+}
+
+/// Compare what the RP intends to use with what the OP's discovery document
+/// advertises. Pure and advisory: no I/O, nothing is enforced, and the
+/// metadata is untrusted, unauthenticated data from the OP.
+///
+/// `provider` is a `ProviderInfo` built by `discover` /
+/// `ProviderInfo.from_metadata` (one without metadata raises `ConfigError`)
+/// or a `ProviderMetadata`. Always checked: `"code"` in
+/// `response_types_supported`. Checked when given: `pkce=True` (RP will send
+/// an S256 challenge; `None`/`False` skip it) against
+/// `code_challenge_methods_supported`; `algorithms` (the RP's allowed
+/// id_token algorithms, must intersect `id_token_signing_alg_values_supported`);
+/// `scopes` against `scopes_supported`; `acr_values` against
+/// `acr_values_supported`; `client.auth_method` against
+/// `token_endpoint_auth_methods_supported`.
+///
+/// Two `algorithms` rules mirror ADR 0006 (the function stays advisory):
+/// `none` (case-insensitive) is always a mismatch ("fix the RP config, not
+/// the OP") and never counts as an intersection match; `HS256/384/512` are a
+/// mismatch unless `shared_secret_keys=True` (the RP verifies with a key set
+/// derived from the client_secret, OIDC Core 10.1; they are refused with
+/// `JwksCache` / published JWKS) and are ignored by the intersection check in
+/// that case. With `shared_secret_keys=True` HS* takes part in the normal
+/// intersection. If no other algorithm remains, the intersection check is
+/// skipped.
+///
+/// Not checked: `grant_types_supported`, `response_modes_supported`,
+/// `pkce=False`/`None`, DPoP, request-object, claims or any other metadata.
+///
+/// Returns human-readable strings, empty when nothing contradicts the
+/// document. A string starting with `"not advertised:"` is informational: the
+/// OP lists no values (absent or empty) for a check that was performed, so it
+/// can be neither confirmed nor refuted. No default is assumed for those
+/// lists (in particular not `RS256` for `id_token_signing_alg_values_supported`).
+/// Any other string is a mismatch.
+///
+/// Exception: when `token_endpoint_auth_methods_supported` is absent or empty
+/// (indistinguishable after parsing, so both count as absent) the spec default
+/// `["client_secret_basic"]` (OIDC Discovery 1.0 section 3, RFC 8414 section
+/// 2) is assumed: any other `client.auth_method` is a real mismatch.
+#[pyfunction]
+#[pyo3(signature = (provider, *, client = None, pkce = None, algorithms = None, scopes = None, acr_values = None, shared_secret_keys = false))]
+fn check_rp_compatibility(
+    provider: &Bound<'_, PyAny>,
+    client: Option<&RpClient>,
+    pkce: Option<bool>,
+    algorithms: Option<Vec<String>>,
+    scopes: Option<Vec<String>>,
+    acr_values: Option<Vec<String>>,
+    shared_secret_keys: bool,
+) -> PyResult<Vec<String>> {
+    let md: gm::ProviderMetadata = if let Ok(info) = provider.cast::<ProviderInfo>() {
+        match &info.get().metadata {
+            Some(m) => m.inner.clone(),
+            None => {
+                return Err(config_err(
+                    "ProviderInfo has no metadata; build it with rp.discover / \
+                     ProviderInfo.from_metadata",
+                ))
+            }
+        }
+    } else if let Ok(m) = provider.cast::<ProviderMetadata>() {
+        m.borrow().inner.clone()
+    } else {
+        return Err(PyTypeError::new_err(
+            "provider must be a ProviderInfo or a ProviderMetadata",
+        ));
+    };
+    if matches!(&algorithms, Some(a) if a.is_empty()) {
+        return Err(config_err("algorithms must not be empty"));
+    }
+    let acr_supported: Vec<String> = md
+        .extra
+        .get("acr_values_supported")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    let na = |field: &str, why: &str| format!("not advertised: {field} ({why})");
+
+    if md.response_types_supported.is_empty() {
+        out.push(na(
+            "response_types_supported",
+            "cannot confirm the authorization code flow",
+        ));
+    } else if !md.response_types_supported.iter().any(|t| t == "code") {
+        out.push(format!(
+            "response_types_supported does not include 'code' (OP advertises {})",
+            show_list(&md.response_types_supported)
+        ));
+    }
+    if pkce == Some(true) {
+        let m = &md.code_challenge_methods_supported;
+        if m.is_empty() {
+            out.push(na(
+                "code_challenge_methods_supported",
+                "cannot confirm PKCE S256 support",
+            ));
+        } else if !m.iter().any(|x| x == "S256") {
+            out.push(format!(
+                "code_challenge_methods_supported does not include 'S256' (OP advertises {})",
+                show_list(m)
+            ));
+        }
+    }
+    if let Some(algs) = &algorithms {
+        // ADR 0006: `none` is always refused; HS* only works with a key set
+        // derived from the client_secret, which this function cannot see.
+        let is_none = |a: &String| a.eq_ignore_ascii_case("none");
+        let is_hs = |a: &String| {
+            ["HS256", "HS384", "HS512"]
+                .iter()
+                .any(|h| a.eq_ignore_ascii_case(h))
+        };
+        for a in algs.iter().filter(|a| is_none(a)) {
+            out.push(format!(
+                "allowed id_token algorithm '{}' is always refused by this library \
+                 (ADR 0006): fix the RP config, not the OP",
+                escape_untrusted_quoted(a, 64)
+            ));
+        }
+        if !shared_secret_keys {
+            let hs: Vec<String> = algs.iter().filter(|a| is_hs(a)).cloned().collect();
+            if !hs.is_empty() {
+                out.push(format!(
+                    "allowed id_token algorithms {} are only usable with a key set derived \
+                     from the client_secret (OIDC Core 10.1) and are refused with JwksCache / \
+                     published JWKS (ADR 0006); pass shared_secret_keys=True if that is how \
+                     you verify, otherwise remove them",
+                    show_list(&hs)
+                ));
+            }
+        }
+        let relevant: Vec<String> = algs
+            .iter()
+            .filter(|a| !is_none(a) && (shared_secret_keys || !is_hs(a)))
+            .cloned()
+            .collect();
+        if !relevant.is_empty() {
+            let sup = &md.id_token_signing_alg_values_supported;
+            if sup.is_empty() {
+                out.push(na(
+                    "id_token_signing_alg_values_supported",
+                    "cannot confirm a usable id_token signing algorithm",
+                ));
+            } else if !relevant.iter().any(|a| sup.contains(a)) {
+                out.push(format!(
+                    "none of the allowed id_token algorithms {} is in \
+                     id_token_signing_alg_values_supported (OP advertises {})",
+                    show_list(&relevant),
+                    show_list(sup)
+                ));
+            }
+        }
+    }
+    if let Some(wanted) = &scopes {
+        let sup = &md.scopes_supported;
+        if sup.is_empty() {
+            out.push(na(
+                "scopes_supported",
+                "cannot confirm the requested scopes",
+            ));
+        } else {
+            let missing: Vec<String> = wanted
+                .iter()
+                .filter(|w| !sup.contains(w))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                out.push(format!(
+                    "scopes not in scopes_supported: {} (OP advertises {})",
+                    show_list(&missing),
+                    show_list(sup)
+                ));
+            }
+        }
+    }
+    if let Some(wanted) = &acr_values {
+        if acr_supported.is_empty() {
+            out.push(na(
+                "acr_values_supported",
+                "cannot confirm the requested acr_values",
+            ));
+        } else {
+            let missing: Vec<String> = wanted
+                .iter()
+                .filter(|w| !acr_supported.contains(w))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                out.push(format!(
+                    "acr_values not in acr_values_supported: {} (OP advertises {})",
+                    show_list(&missing),
+                    show_list(&acr_supported)
+                ));
+            }
+        }
+    }
+    if let Some(client) = client {
+        let method = auth_method_name(&client.inner.auth);
+        let sup = &md.token_endpoint_auth_methods_supported;
+        if sup.is_empty() {
+            if method != "client_secret_basic" {
+                out.push(format!(
+                    "client auth_method '{method}' is not usable: \
+                     token_endpoint_auth_methods_supported is absent, so the spec default \
+                     ['client_secret_basic'] was assumed"
+                ));
+            }
+        } else if !sup.iter().any(|s| s == method) {
+            out.push(format!(
+                "client auth_method '{method}' is not in token_endpoint_auth_methods_supported \
+                 (OP advertises {})",
+                show_list(sup)
+            ));
+        }
+    }
+    Ok(out)
+}
+
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = new_submodule(py, parent, "rp")?;
     m.add_class::<ProviderInfo>()?;
@@ -2704,6 +3210,9 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(authorization_url, &m)?)?;
     m.add_function(wrap_pyfunction!(signed_request_object, &m)?)?;
     m.add_function(wrap_pyfunction!(begin, &m)?)?;
+    m.add("BeginResult", begin_result_type(py)?)?;
+    m.add_function(wrap_pyfunction!(claims_audiences, &m)?)?;
+    m.add_function(wrap_pyfunction!(check_rp_compatibility, &m)?)?;
     m.add_function(wrap_pyfunction!(discover, &m)?)?;
     m.add_function(wrap_pyfunction!(end_session_url, &m)?)?;
     m.add_function(wrap_pyfunction!(fetch_jwks, &m)?)?;
