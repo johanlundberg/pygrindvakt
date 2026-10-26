@@ -11,6 +11,34 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Added
 
+- `pygrindvakt.testing`: test-only helpers, plain Python shipped in the wheel and
+  not imported by `import pygrindvakt`. `StaticHttpClient(routes, *, default)`
+  (URL or `(METHOD, url)` to response or callable; responses are 4-tuples or the
+  legacy 3-tuple, other shapes raise `TypeError`; records `.calls`; never
+  follows redirects; `get_with_headers`), `ProviderHttpClient(op, issuer, ...)`
+  (bridges an RP's discovery / JWKS / token / UserInfo requests to an in-process
+  `Provider`; forwards `OAuthError` response headers; discovery and JWKS carry
+  `Cache-Control` per keyword `cache_control="max-age=300"`, `None` for none;
+  `StaticHttpClient.from_json(..., cache_control=...)` likewise; a route needs
+  headers for `JwksCache`/`DiscoveryCache` to avoid the headerless warning),
+  `RecordedRequest`,
+  `FetchResult` and `mint_id_token(key, *, issuer, client_id, ...)` (refuses
+  `extra` overriding protocol claims; `azp`, `auth_time`, `jti`, `acr`, `amr` are
+  allowed; `lifetime` must be an int > 0 and `iat` None or an int >= 0, else
+  `ValueError`). `ProviderHttpClient` sets `cache-control: no-store` and
+  `pragma: no-cache` on token success responses, accepts a form-encoded
+  `access_token` on a UserInfo POST (RFC 6750 section 2.2; together with an
+  `Authorization` header it is a 400 `invalid_request`) and answers 401 with
+  `www-authenticate: Bearer`. DPoP is NOT supported by `ProviderHttpClient`: a
+  `DPoP` header or `Authorization: DPoP` scheme on the token or UserInfo
+  endpoint raises `NotImplementedError`. `StaticHttpClient` upper-cases the
+  method in `(METHOD, url)` route keys. `RecordedRequest.__repr__` redacts
+  sensitive header and form values (`RecordedRequest.redacted()` returns a
+  redacted copy; attributes stay verbatim, redact before serialising `calls`).
+  Request headers and form pairs must be `(str, str)`, else `TypeError`.
+  A present `Authorization` header that is not exactly `Bearer <token>` is a 401
+  on UserInfo and never falls back to the form `access_token`. See
+  `docs/api/testing.rst`.
 - `rp.DiscoveryCache(http, issuer, *, default_ttl=3600, min_ttl=60, max_ttl=86400,
   failure_backoff=10, stale_on_error=True, max_stale=86400, fetch_timeout=45.0,
   allow_cross_origin_end_session=False)`: a thread-safe, frozen cache of one

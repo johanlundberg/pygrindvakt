@@ -6,6 +6,8 @@ the built-in ``ReqwestClient``, ``None`` and a custom protocol client.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pygrindvakt.http
 from pygrindvakt import (
     AuthnError,
@@ -15,9 +17,15 @@ from pygrindvakt import (
     discovery,
     federation,
     jwt,
+    keys,
     metadata,
+    provider,
     rp,
+    testing,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class TupleClient:
@@ -386,3 +394,55 @@ def use_helpers(unknown: object, md: metadata.ProviderMetadata) -> None:
             method="GET",
         )
     del ok
+
+
+def use_testing(op: provider.Provider, key: keys.SigningKey) -> None:
+    """``pygrindvakt.testing`` is type-checked here, so it is covered by ``--strict``."""
+    route: testing.FetchResult = (200, b"{}", "application/json", (("Cache-Control", "max-age=60"),))
+
+    def dynamic(req: testing.RecordedRequest) -> testing.FetchResult:
+        return 200, req.url.encode(), None, ()
+
+    static = testing.StaticHttpClient(
+        {"https://a/x": route, ("POST", "https://a/y"): dynamic}, default=(500, b"", None, ())
+    )
+    routes_a: dict[str, testing.FetchResult] = {"https://a/a": route}
+    routes_b: dict[tuple[str, str], testing.FetchResult] = {("GET", "https://a/b"): route}
+    routes_c: dict[str | tuple[str, str], testing.FetchResult] = {"https://a/c": route, ("GET", "https://a/d"): route}
+    routes_d: dict[str, Callable[[testing.RecordedRequest], testing.FetchResult]] = {"https://a/e": dynamic}
+    for routes in (testing.StaticHttpClient(routes_a), testing.StaticHttpClient(routes_b)):
+        rp.discover(routes, "https://op.example.com")
+    testing.StaticHttpClient(routes_c, default=(500, b"", None))
+    testing.StaticHttpClient(routes_d)
+    from_json = testing.StaticHttpClient.from_json({"https://a/z": {"k": 1}})
+    testing.StaticHttpClient.from_json({"https://a/z": {"k": 1}}, cache_control=None)
+    bridge = testing.ProviderHttpClient(op, "https://op.example.com", token_path="/t", jwks_path="/j")
+    testing.ProviderHttpClient(op, "https://op.example.com", cache_control=None)
+    testing.ProviderHttpClient(op, "https://op.example.com", cache_control="max-age=60")
+    rp.discover(static, "https://op.example.com")
+    rp.discover(from_json, "https://op.example.com")
+    rp.discover(bridge, "https://op.example.com")
+    rp.fetch_userinfo(bridge, "https://op.example.com/userinfo", "tok", "sub", "https://op.example.com", method="GET")
+    rp.fetch_userinfo(static, "https://a/x", "tok", "sub", "https://op.example.com", method="GET")
+    recorded: list[testing.RecordedRequest] = static.calls + bridge.calls
+    forms: list[list[tuple[str, str]]] = bridge.forms
+    first: testing.RecordedRequest = recorded[0]
+    method: str = first.method
+    form: tuple[tuple[str, str], ...] | None = first.form
+    hdrs: tuple[tuple[str, str], ...] = first.headers
+    authz: str | None = first.header("authorization")
+    del forms, method, form, hdrs, authz
+    token: str = testing.mint_id_token(
+        key,
+        issuer="https://op.example.com",
+        client_id="demo",
+        sub="bob",
+        nonce="n",
+        access_token="at",
+        code="c",
+        lifetime=60,
+        iat=1,
+        extra={"acr": "x", "azp": "demo", "auth_time": 1, "jti": "j"},
+    )
+    testing.mint_id_token(key, issuer="https://op.example.com", client_id="demo")
+    del token

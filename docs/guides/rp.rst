@@ -644,12 +644,16 @@ Testing without a network
 -------------------------
 
 Because the HTTP client is injectable, an RP can be tested end to end against
-an in-process :class:`~pygrindvakt.provider.Provider`, as
-``tests/test_rp.py`` does: a fake client answers discovery and JWKS from
-``op.discovery_document()`` / ``op.jwks_document()`` and forwards token and
-userinfo requests to ``op.handle_token_request`` / ``op.userinfo``. Those
-nested calls into pygrindvakt from inside the fake are supported; each runs
-on a helper thread (see :doc:`stores`).
+an in-process :class:`~pygrindvakt.provider.Provider`. The test-only module
+:mod:`pygrindvakt.testing` ships the pieces: ``ProviderHttpClient`` answers
+discovery and JWKS from ``op.discovery_document()`` / ``op.jwks_document()``
+and forwards token and userinfo requests to ``op.handle_token_request`` /
+``op.userinfo`` (``tests/test_rp.py`` is built on it); ``StaticHttpClient``
+serves fixed responses and records the requests; ``mint_id_token`` signs an
+ID Token with a key you hold. Import them explicitly
+(``from pygrindvakt import testing``) and never ship them in your application.
+Nested calls into pygrindvakt from inside such a client are supported; each
+runs on a helper thread (see :doc:`stores`).
 
 Logout
 ------

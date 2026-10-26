@@ -16,7 +16,7 @@ import textwrap
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from pygrindvakt import OAuthError, client, keys, metadata, provider, tokens
+from pygrindvakt import client, keys, metadata, provider, tokens
 
 ISSUER = "https://op.example.com"
 TOKEN_URL = f"{ISSUER}/token"
@@ -97,62 +97,6 @@ def op(op_key, rp_key, demo_client):
         tokens.TokenCodec("op-secret"),
         token_use_store=provider.InMemoryTokenUseStore(),
     )
-
-
-class FakeHttpClient:
-    """An ``HttpClient`` protocol implementation that serves an in-process
-    ``Provider`` and any extra ``routes`` (url -> (status, body, content_type)).
-    """
-
-    def __init__(self, op=None, routes=None):
-        self.op = op
-        self.routes = dict(routes or {})
-        self.calls: list[tuple[str, str]] = []
-
-    @staticmethod
-    def _json(obj, status=200):
-        import json
-
-        return status, json.dumps(obj).encode(), "application/json"
-
-    def get(self, url):
-        self.calls.append(("GET", url))
-        if url in self.routes:
-            return self.routes[url]
-        if self.op is not None:
-            if url == f"{ISSUER}/.well-known/openid-configuration":
-                return self._json(self.op.discovery_document())
-            if url == f"{ISSUER}/jwks":
-                return self._json(self.op.jwks_document())
-        return 404, b"not found", "text/plain"
-
-    def post_form(self, url, form, headers):
-        self.calls.append(("POST", url))
-        if url in self.routes:
-            return self.routes[url]
-        if self.op is None:
-            return 404, b"not found", "text/plain"
-        hdrs = {k.lower(): v for k, v in headers}
-        if url == TOKEN_URL:
-            try:
-                tr = self.op.handle_token_request(list(form), TOKEN_URL, auth_header=hdrs.get("authorization"))
-            except OAuthError as e:
-                r = e.to_response()
-                return r.status, r.body, "application/json"
-            return self._json(tr.to_dict())
-        if url == USERINFO_URL:
-            auth = hdrs.get("authorization", "")
-            try:
-                return self._json(self.op.userinfo(auth.split(" ", 1)[1]))
-            except OAuthError as e:
-                r = e.to_response()
-                return r.status, r.body, "application/json"
-        return 404, b"not found", "text/plain"
-
-
-@pytest.fixture
-def fake_http(op):
-    return FakeHttpClient(op)
 
 
 @pytest.fixture(scope="session")

@@ -6,7 +6,6 @@ from conftest import (
     ISSUER,
     REDIRECT_URI,
     TOKEN_URL,
-    FakeHttpClient,
     basic_auth,
     code_from_redirect,
 )
@@ -23,6 +22,7 @@ from pygrindvakt import (
     tokens,
     util,
 )
+from pygrindvakt.testing import ProviderHttpClient
 
 
 class DictClientStore:
@@ -197,7 +197,7 @@ def test_reentrant_http_client_drives_in_process_provider(op):
     completes a full RP code exchange (nested async inside async)."""
     from urllib.parse import parse_qs, urlparse
 
-    fake = FakeHttpClient(op)
+    fake = ProviderHttpClient(op, ISSUER)
     info = rp.ProviderInfo.from_metadata(rp.discover(fake, ISSUER))
     me = rp.RpClient("demo", REDIRECT_URI, client_secret="s3cret")
     verifier = util.random_token(32)
@@ -222,12 +222,10 @@ def test_reentrant_http_client_drives_in_process_provider(op):
 
 
 def test_python_http_client_is_used(op):
-    fake = FakeHttpClient(op)
+    fake = ProviderHttpClient(op, ISSUER)
     md = rp.discover(fake, ISSUER)
-    assert md.issuer == ISSUER and fake.calls[0] == (
-        "GET",
-        f"{ISSUER}/.well-known/openid-configuration",
-    )
+    assert md.issuer == ISSUER
+    assert (fake.calls[0].method, fake.calls[0].url) == ("GET", f"{ISSUER}/.well-known/openid-configuration")
 
 
 def test_python_http_client_raising(op):

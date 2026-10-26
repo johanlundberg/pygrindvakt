@@ -1,6 +1,6 @@
 """Tests for ``pygrindvakt.rp`` - the relying-party side of OIDC.
 
-An in-process ``Provider`` plays the upstream OP; a ``FakeHttpClient`` routes
+An in-process ``Provider`` plays the upstream OP; a ``testing.ProviderHttpClient`` routes
 the RP's outbound requests straight into it, so the full code flow
 (discovery -> authorization -> code exchange -> id_token -> userinfo) runs
 without any network.
@@ -41,6 +41,7 @@ from pygrindvakt import (
     util,
 )
 from pygrindvakt import http as pyhttp
+from pygrindvakt.testing import ProviderHttpClient, StaticHttpClient
 
 ISSUER = "https://op.example.com"
 CLIENT_ID = "demo"
@@ -48,81 +49,7 @@ CLIENT_SECRET = "s3cret"
 REDIRECT_URI = "https://rp.example.com/cb"
 
 
-def in_thread(fn, *args, **kwargs):
-    """Run ``fn`` on a fresh thread and return its result (re-raising errors).
-
-    Not required (pygrindvakt runs re-entrant calls on a helper thread itself;
-    see ``tests/test_adapters.py``), but it mirrors the real topology: a real
-    OP runs in its own process, so its endpoints run off the RP's thread here.
-    """
-    box: dict = {}
-
-    def run():
-        try:
-            box["value"] = fn(*args, **kwargs)
-        except BaseException as e:  # noqa: BLE001 - re-raised below
-            box["error"] = e
-
-    t = threading.Thread(target=run)
-    t.start()
-    t.join()
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
-
-
 ALT_REDIRECT_URI = "https://rp.example.com/alt-cb"
-
-
-class FakeHttpClient:
-    """An ``HttpClient`` protocol object that dispatches into an in-process OP."""
-
-    def __init__(self, op):
-        self.op = op
-        self.calls: list[tuple[str, str]] = []
-        self.forms: list[list[tuple[str, str]]] = []
-
-    @staticmethod
-    def _json(value, status=200):
-        return status, json.dumps(value).encode(), "application/json"
-
-    @staticmethod
-    def _oauth_error(e: OAuthError):
-        resp = e.to_response()
-        return resp.status, resp.body, resp.header("content-type")
-
-    def get(self, url):
-        self.calls.append(("GET", url))
-        if url == f"{ISSUER}/.well-known/openid-configuration":
-            return self._json(self.op.discovery_document())
-        if url == f"{ISSUER}/jwks":
-            return self._json(self.op.jwks_document())
-        return 404, b"not found", "text/plain"
-
-    def post_form(self, url, form, headers):
-        self.calls.append(("POST", url))
-        self.forms.append(list(form))
-        hdrs = {k.lower(): v for k, v in headers}
-        if url == f"{ISSUER}/token":
-            try:
-                tr = in_thread(
-                    self.op.handle_token_request,
-                    list(form),
-                    f"{ISSUER}/token",
-                    auth_header=hdrs.get("authorization"),
-                )
-            except OAuthError as e:
-                return self._oauth_error(e)
-            return self._json(tr.to_dict())
-        if url == f"{ISSUER}/userinfo":
-            auth = hdrs.get("authorization", "")
-            if not auth.startswith("Bearer "):
-                return 401, b"", None
-            try:
-                return self._json(in_thread(self.op.userinfo, auth[len("Bearer ") :]))
-            except OAuthError as e:
-                return self._oauth_error(e)
-        return 404, b"not found", "text/plain"
 
 
 class RaisingHttpClient:
@@ -160,7 +87,7 @@ def op(op_key):
 
 @pytest.fixture
 def http(op):
-    return FakeHttpClient(op)
+    return ProviderHttpClient(op, ISSUER)
 
 
 @pytest.fixture
@@ -207,7 +134,7 @@ def test_discover_returns_metadata_for_issuer(http):
     md = rp.discover(http, ISSUER)
     assert isinstance(md, metadata.ProviderMetadata)
     assert md.issuer == ISSUER
-    assert http.calls == [("GET", f"{ISSUER}/.well-known/openid-configuration")]
+    assert [(r.method, r.url) for r in http.calls] == [("GET", f"{ISSUER}/.well-known/openid-configuration")]
 
 
 def test_discover_with_trailing_slash(http):
@@ -237,14 +164,11 @@ def test_discover_fails_closed_when_http_client_raises():
 def test_discover_rejects_issuer_mismatch(op):
     """The issuer in the returned document must match the requested one."""
 
-    class Liar(FakeHttpClient):
-        def get(self, url):
-            doc = self.op.discovery_document()
-            doc["issuer"] = "https://evil.example.com"
-            return self._json(doc)
-
+    doc = op.discovery_document()
+    doc["issuer"] = "https://evil.example.com"
+    liar = StaticHttpClient.from_json({f"{ISSUER}/.well-known/openid-configuration": doc})
     with pytest.raises(AuthnError, match="does not match"):
-        rp.discover(Liar(op), ISSUER)
+        rp.discover(liar, ISSUER)
 
 
 def test_fetch_jwks_returns_one_key(http, prov):
@@ -737,7 +661,7 @@ def test_exchange_code_with_client_secret_post(op, prov):
     )
     verifier = util.random_token(48)
     code = run_authorization(op2, prov, rpc, "st", "n", verifier)
-    ts = rp.exchange_code(FakeHttpClient(op2), prov, rpc, code, verifier)
+    ts = rp.exchange_code(ProviderHttpClient(op2, ISSUER), prov, rpc, code, verifier)
     assert ts.id_token
 
 
@@ -1017,7 +941,7 @@ def test_private_key_jwt_client_authenticates(op, http, prov, rp_key):
         tokens.TokenCodec("op-secret"),
         token_use_store=provider.InMemoryTokenUseStore(),
     )
-    http2 = FakeHttpClient(op2)
+    http2 = ProviderHttpClient(op2, ISSUER)
     rpc = rp.RpClient("jwt-client", REDIRECT_URI, auth_method="private_key_jwt", signing_key=rp_key)
     verifier = util.random_token(48)
     code = run_authorization(op2, prov, rpc, "st", "n", verifier)
@@ -1419,7 +1343,7 @@ def test_provider_info_carries_end_session_endpoint_from_discovery(op, op_key):
         tokens.TokenCodec("s"),
         token_use_store=provider.InMemoryTokenUseStore(),
     )
-    discovered = rp.discover(FakeHttpClient(op2), ISSUER)
+    discovered = rp.discover(ProviderHttpClient(op2, ISSUER), ISSUER)
     assert discovered.end_session_endpoint == f"{ISSUER}/logout"
     assert discovered.raw is not None and discovered.raw["end_session_endpoint"] == f"{ISSUER}/logout"
     info = rp.ProviderInfo.from_metadata(discovered)
@@ -2338,16 +2262,25 @@ def _verify_hs(jwks, token, alg="HS256"):
     return rp.verify_id_token(jwks, token, ISSUER, CLIENT_ID, "n", [alg])
 
 
-class OctJwksHttp(FakeHttpClient):
+def _json_response(value, headers=(("cache-control", "max-age=300"),)):
+    return 200, json.dumps(value).encode(), "application/json", list(headers)
+
+
+def _headerless_warnings(record):
+    """Recorded warnings that are the one-time 'reports no response headers' one."""
+    return [w for w in record if "reports no response headers" in str(w.message)]
+
+
+class OctJwksHttp(ProviderHttpClient):
     """An OP that (wrongly) publishes a symmetric key next to its signing key."""
 
     secret = b"s" * 64
 
-    def get(self, url):
-        if url == f"{ISSUER}/jwks":
+    def _answer(self, request):
+        if request.method == "GET" and request.url == f"{ISSUER}/jwks":
             doc = self.op.jwks_document()
-            return self._json({"keys": [*doc["keys"], *_oct_set(self.secret)["keys"]]})
-        return super().get(url)
+            return _json_response({"keys": [*doc["keys"], *_oct_set(self.secret)["keys"]]})
+        return super()._answer(request)
 
 
 @pytest.mark.parametrize(
@@ -2495,13 +2428,13 @@ def test_none_algorithm_is_refused_at_parse(op_key, alg):
     with pytest.raises(ConfigError, match="invalid JWS algorithm") as exc:
         rp.verify_id_token(op_key.to_public_jwks(), token, ISSUER, CLIENT_ID, "n", [alg])
     assert exc.value.code == "config"
-    cache = rp.JwksCache(FakeHttpClient(None), f"{ISSUER}/jwks", ISSUER)
+    cache = rp.JwksCache(StaticHttpClient({}), f"{ISSUER}/jwks", ISSUER)
     with pytest.raises(ConfigError, match="invalid JWS algorithm"):
         cache.verify_id_token(token, CLIENT_ID, "n", [alg])
 
 
 def test_fetch_jwks_drops_oct_keys_and_warns_once(op, op_key):
-    http = OctJwksHttp(op)
+    http = OctJwksHttp(op, ISSUER)
     with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored") as record:
         jwks = rp.fetch_jwks(http, f"{ISSUER}/jwks", ISSUER)
     assert len(record) == 1
@@ -2525,22 +2458,28 @@ def test_fetch_jwks_clean_set_has_no_warning(http, prov):
     assert [k["kid"] for k in jwks["keys"]] == ["op-1"]
 
 
-def test_fetched_jwks_only_oct_gives_empty_set_that_verifies_nothing(op):
-    class OnlyOct(FakeHttpClient):
-        def get(self, url):
-            if url == f"{ISSUER}/jwks":
-                return self._json(_oct_set(OctJwksHttp.secret))
-            return super().get(url)
+def test_oct_jwks_subclass_keeps_get_with_headers_and_recording(op):
+    http = OctJwksHttp(op, ISSUER)
+    status, body, _, _ = http.get_with_headers(f"{ISSUER}/jwks", [("X-Probe", "1")])
+    assert status == 200 and b'"oct"' in body
+    assert http.get(f"{ISSUER}/jwks")[0] == 200
+    assert [(r.method, r.url) for r in http.calls] == [("GET", f"{ISSUER}/jwks")] * 2
+    assert http.calls[0].header("x-probe") == "1"
+    # Non-overridden URLs still reach the base class.
+    assert http.get_with_headers(f"{ISSUER}/.well-known/openid-configuration", [])[0] == 200
 
+
+def test_fetched_jwks_only_oct_gives_empty_set_that_verifies_nothing(op):
+    only_oct = StaticHttpClient.from_json({f"{ISSUER}/jwks": _oct_set(OctJwksHttp.secret)})
     with pytest.warns(UserWarning, match="symmetric"):
-        jwks = rp.fetch_jwks(OnlyOct(op), f"{ISSUER}/jwks", ISSUER)
+        jwks = rp.fetch_jwks(only_oct, f"{ISSUER}/jwks", ISSUER)
     assert jwks == {"keys": []}
     with pytest.raises(GrindvaktError):
         _verify_hs(jwks, _mac_token(OctJwksHttp.secret))
 
 
 def test_jwks_cache_refuses_hs_algorithms_without_fetching(op):
-    http = OctJwksHttp(op)
+    http = OctJwksHttp(op, ISSUER)
     cache = rp.JwksCache(http, f"{ISSUER}/jwks", ISSUER)
     token = _mac_token(OctJwksHttp.secret)
     for algs in (["HS256"], ["ES256", "HS384"], ["HS512"]):
@@ -2556,18 +2495,20 @@ def test_jwks_cache_refuses_hs_algorithms_without_fetching(op):
 
 
 def test_jwks_cache_fetch_drops_oct_keys_and_warns(op, op_key):
-    http = OctJwksHttp(op)
+    http = OctJwksHttp(op, ISSUER)
     cache = rp.JwksCache(http, f"{ISSUER}/jwks", ISSUER)
     with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored") as record:
         jwks = cache.jwks()
     assert len([w for w in record if "symmetric" in str(w.message)]) == 1
+    assert _headerless_warnings(record) == []
     assert [k["kty"] for k in jwks["keys"]] == ["EC"]
-    with warnings.catch_warnings():  # cached: no second fetch, no second warning
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as again:  # cached: no second fetch, no second warning
+        warnings.simplefilter("always")
         cache.jwks()
         es = jwt.sign(op_key, _co())
         assert cache.verify_id_token(es, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
         assert rp.verify_id_token(cache, es, ISSUER, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+    assert [str(w.message) for w in again] == []
 
 
 def test_userinfo_hs256_with_caller_built_set_and_cache_refusal(op):
@@ -2595,7 +2536,7 @@ def test_userinfo_hs256_with_caller_built_set_and_cache_refusal(op):
         )
     assert exc.value.code == "weak_shared_secret"
     # A JwksCache never carries the MAC key: refused before any request.
-    cache = rp.JwksCache(OctJwksHttp(op), f"{ISSUER}/jwks", ISSUER)
+    cache = rp.JwksCache(OctJwksHttp(op, ISSUER), f"{ISSUER}/jwks", ISSUER)
     rec = UserinfoRecorder(body=body, ctype="application/jwt")
     with pytest.raises(ConfigError) as exc:
         ui(
@@ -2719,11 +2660,11 @@ def test_fetch_jwks_drops_uppercase_oct_kty(op, op_key):
             if url == f"{ISSUER}/jwks":
                 doc = self.op.jwks_document()
                 oct_key = {**_oct_set(self.secret)["keys"][0], "kty": "OCT"}
-                return self._json({"keys": [*doc["keys"], oct_key]})
+                return _json_response({"keys": [*doc["keys"], oct_key]})
             return super(OctJwksHttp, self).get(url)
 
     with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored"):
-        jwks = rp.fetch_jwks(UpperOct(op), f"{ISSUER}/jwks", ISSUER)
+        jwks = rp.fetch_jwks(UpperOct(op, ISSUER), f"{ISSUER}/jwks", ISSUER)
     assert all(k["kty"] != "OCT" for k in jwks["keys"])
 
 
@@ -2756,7 +2697,7 @@ def test_authorization_response_round_trip_with_provider(op, prov, rpc):
     with_iss = rp.parse_authorization_response([*pairs, ("iss", ISSUER)])
     assert with_iss.matches_iss(ISSUER)
     # The code is usable.
-    ts = rp.exchange_code(FakeHttpClient(op), prov, rpc, parsed.code, code_verifier=verifier)
+    ts = rp.exchange_code(ProviderHttpClient(op, ISSUER), prov, rpc, parsed.code, code_verifier=verifier)
     assert ts.id_token
 
 
