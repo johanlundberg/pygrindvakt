@@ -166,6 +166,18 @@ def test_to_redirect_rejects_hostile_base(base, mode):
     assert "evil" not in msg and "X-Injected" not in msg and "not a url" not in msg
 
 
+@pytest.mark.parametrize("description", ["\ud800", "ab\udfffcd", "x" * 600 + "\ud800", "\ud800\u202e"])
+def test_oauth_error_str_survives_lone_surrogate(description):
+    """str() and logging must not raise for a description decoded from JSON "\\ud800"."""
+    e = OAuthError("invalid_request", description)
+    text = str(e)
+    assert text.startswith("invalid_request: ")
+    assert not any(0xD800 <= ord(c) <= 0xDFFF for c in text)
+    text.encode("utf-8")  # renderable
+    assert e.description == description  # raw value preserved
+    assert "invalid_request" in f"{e}" and repr(e)
+
+
 @pytest.mark.parametrize("mode", ["query", "fragment"])
 @pytest.mark.parametrize(
     "base",

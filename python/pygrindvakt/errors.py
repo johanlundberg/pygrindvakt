@@ -45,7 +45,14 @@ class OAuthError(_native.GrindvaktError):
         # description is untrusted and may be attacker-influenced; escape and
         # cap it so str(exc) is safe to log. .description stays raw.
         if self.description:
-            safe = _native.escape_untrusted_text(self.description, _STR_DESCRIPTION_MAX)
+            try:
+                safe = _native.escape_untrusted_text(self.description, _STR_DESCRIPTION_MAX)
+            except UnicodeEncodeError:
+                # A lone surrogate (e.g. JSON "\ud800") is not valid for the
+                # native &str. Escape it as \udXXX text and retry; str() must
+                # not raise, or a log record formatting it is lost.
+                text = self.description.encode("utf-8", "backslashreplace").decode("utf-8")
+                safe = _native.escape_untrusted_text(text, _STR_DESCRIPTION_MAX)
             return f"{self.code}: {safe}"
         return self.code
 
