@@ -772,7 +772,10 @@ def parse_authorization_response(
     an ordered list of ``(str, str)`` pairs, a multi-dict
     ``{name: [values]}`` (``urllib.parse.parse_qs`` shape) or an object with a
     ``lists()`` method (werkzeug ``MultiDict``). A plain ``dict[str, str]`` raises ``TypeError`` because mappings
-    discard duplicate parameters. ``response_mode`` labels list and multi-dict
+    discard duplicate parameters. Build pairs with
+    ``parse_qsl(qs, keep_blank_values=True)``: by default ``parse_qsl`` and
+    ``parse_qs`` drop blank values, which hides a duplicate such as
+    ``code=valid&code=``. ``response_mode`` labels list and multi-dict
     input (default ``"query"``).
 
     Raises ``BadRequestError`` for a repeated parameter, both or neither of

@@ -46,7 +46,7 @@ docs did the same. That code goes wrong in predictable ways:
    character set.
 2. **Inputs that can carry duplicates only.** `http.HttpRequestData` (GET uses
    `query_pairs`, POST uses `form_pairs`), an ordered list of pairs, a
-   multi-dict (`parse_qs` shape) or an object with a `.lists()` method
+   multi-dict (`parse_qs` shape, built with `keep_blank_values=True`) or an object with a `.lists()` method
    (werkzeug `MultiDict`, read by duck typing), all flattened with duplicates
    preserved. A mapping with a non-list value (a plain `dict[str, str]`, or a
    `MultiDict` subclass without `.lists()`) raises `TypeError` naming the
@@ -135,7 +135,10 @@ docs did the same. That code goes wrong in predictable ways:
   documentation says so in the API reference, the RP guide and the security
   guide.
 - Framework adapters must pass pairs (`request.args.items(multi=True)` in
-  Flask, `parse_qsl` elsewhere), not a dict. A `werkzeug` `MultiDict` is
+  Flask, `parse_qsl(..., keep_blank_values=True)` elsewhere), not a dict. Pass
+  `keep_blank_values=True` to `parse_qsl` and `parse_qs` too: by default they
+  drop `code=` from `code=valid&code=&state=expected`, hiding the duplicate
+  from the parser and defeating its fail-closed behaviour. A `werkzeug` `MultiDict` is
   accepted directly through its `.lists()` method; a dict subclass without it
   whose `items()` yields first values only is rejected with `TypeError`
   naming the key rather than trusted.

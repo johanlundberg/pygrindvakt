@@ -634,12 +634,17 @@ The authorization response
      Build it from a list of pairs (``request.args.items(multi=True)``). An
      empty mapping is accepted.
    * an ordered list of ``(str, str)`` pairs, for example
-     ``urllib.parse.parse_qsl(...)``;
+     ``urllib.parse.parse_qsl(qs, keep_blank_values=True)``;
    * a multi-dict ``{name: [values]}``, the shape ``urllib.parse.parse_qs``
      returns, which is flattened into pairs with duplicates preserved;
    * an object with a ``lists()`` method yielding ``(name, [values])``, such
      as a werkzeug ``MultiDict`` (``request.args``), read by duck typing so
      duplicates are kept.
+
+   Pass ``keep_blank_values=True`` to ``parse_qsl`` and ``parse_qs``. By
+   default they drop blank values, so ``code=valid&code=&state=expected``
+   reaches this function without its second ``code``: the duplicate is
+   hidden and the fail-closed refusal never happens.
 
    A mapping with a non-list value, such as a plain ``dict[str, str]``,
    raises ``TypeError`` naming the offending key: a mapping discards
