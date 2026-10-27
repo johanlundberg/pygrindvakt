@@ -50,6 +50,7 @@ Or serve fixed documents and assert on the requests made:
        }
    )
    cache = rp.DiscoveryCache(http, "https://op.example.com")
+   cache.metadata()  # the constructor makes no request; this fetches
    assert http.calls[0].method == "GET"
 
 Types

@@ -61,7 +61,11 @@ def create_app() -> Flask:
 
     @app.get("/callback")
     def callback():
-        pending = session.pop("oidc", None)  # popped first: a callback can never be replayed
+        # Popped first. This demo uses Flask's signed-cookie session, so an older
+        # cookie can restore the entry and concurrent callbacks can both pass the
+        # state check. For strict single use keep the entry server-side and
+        # consume it atomically.
+        pending = session.pop("oidc", None)
         try:
             # items(multi=True) keeps duplicates; a plain dict would hide them.
             resp = rp.parse_authorization_response(list(flask.request.args.items(multi=True)))

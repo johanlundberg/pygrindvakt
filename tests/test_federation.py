@@ -1102,14 +1102,15 @@ def test_clean_key_sets_verify_without_warning(fed):
     uri = LEAF + "/signed-jwks"
     doc = signed_jwks_document(fed.leaf_key, LEAF, pub["keys"])
     http = FakeHttpClient({uri: (200, doc, None)})
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         assert federation.fetch_signed_jwks(http, uri, LEAF, pub) == pub
         assert federation.entity_metadata_jwks(http, {"signed_jwks_uri": uri}, LEAF, pub) == pub
         assert federation.verify(fed.ta_ec, fed.ta_key.to_public_jwks()).iss() == TA
         assert federation.decode_unverified(fed.subordinate).jwks() == pub
         entity = federation.resolve_via_trust_anchors(fed.network(), LEAF, fed.trust_anchors())
         assert entity.subject_jwks == pub
+    assert caught == []
 
 
 def test_build_entity_configuration_warns_when_publishing_oct_key_but_signs(fed):
@@ -1122,6 +1123,7 @@ def test_build_entity_configuration_warns_when_publishing_oct_key_but_signs(fed)
 
 
 def test_build_entity_configuration_no_warning_for_asymmetric_keys(fed):
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         federation.build_entity_configuration(fed.leaf_key, LEAF, fed.leaf_key.to_public_jwks(), [TA], LEAF_METADATA)
+    assert caught == []

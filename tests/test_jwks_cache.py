@@ -299,9 +299,10 @@ def test_python_client_without_headers_warns_once_and_uses_default_ttl():
     cache.jwks()
     assert http.calls == 1
     clock.advance(2)  # expired: refetch must not warn again
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         cache.jwks()
+    assert caught == []
     assert http.calls == 2
     # Another cache warns for itself.
     other, _ = make_cache(ScriptedHttp({"keys": []}))
@@ -311,9 +312,10 @@ def test_python_client_without_headers_warns_once_and_uses_default_ttl():
 
 def test_builtin_client_does_not_warn(jwks_server):
     cache, _ = server_cache(jwks_server)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         cache.jwks()
+    assert caught == []
 
 
 @pytest.mark.parametrize("as_response", [False, True])
@@ -322,14 +324,15 @@ def test_python_client_with_headers_honours_cache_control(as_response):
     http.as_response = as_response
     http.headers = [("Cache-Control", "public, max-age=120"), ("Age", "100")]
     cache, clock = make_cache(http, min_ttl=1)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         cache.jwks()
         clock.advance(19)
         cache.jwks()
         assert http.calls == 1
         clock.advance(2)  # 120 - 100 = 20s lifetime
         cache.jwks()
+    assert caught == []
     assert http.calls == 2
 
 
@@ -1137,11 +1140,12 @@ def test_oct_keys_are_dropped_with_one_warning_per_fetch():
     assert len([w for w in record if "symmetric" in str(w.message)]) == 1
     assert doc == jwks_doc(k1)
     # Served from the cache: no second fetch, no second warning.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
         warnings.filterwarnings("ignore", message=".*reports no response headers.*")
         assert cache.jwks() == jwks_doc(k1)
         assert verify(cache, id_token(k1))["sub"] == "alice"
+    assert caught == []
     # An expired set is fetched again and warns again.
     clock.advance(11)
     with pytest.warns(UserWarning, match="symmetric"):
@@ -1181,9 +1185,10 @@ def test_clean_jwks_emits_no_warning_and_asymmetric_paths_work():
     k1 = make_key("k1")
     http = ScriptedHttp(jwks_doc(k1))
     cache, _ = make_cache(http)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
         warnings.filterwarnings("ignore", message=".*reports no response headers.*")
         assert cache.jwks() == jwks_doc(k1)
         assert verify(cache, id_token(k1))["sub"] == "alice"
         assert rp.verify_id_token(cache, id_token(k1), ISSUER, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+    assert caught == []

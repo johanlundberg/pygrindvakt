@@ -208,7 +208,8 @@ The callback: exchange and verify
 
 On the callback, parse the response with
 :func:`~pygrindvakt.rp.parse_authorization_response`, then check ``state``
-against the session entry (popped so it can be used only once) with
+against the session entry (popped first; see the warning below for what that
+does and does not guarantee) with
 :meth:`~pygrindvakt.rp.AuthorizationResponse.matches_state` and ``iss``
 with :meth:`~pygrindvakt.rp.AuthorizationResponse.matches_iss`. Then exchange the code with the stored verifier and verify the
 id_token against the issuer, your ``client_id`` and the stored nonce, using the
@@ -298,10 +299,15 @@ details never reach the browser.
 
 .. warning:: ``retryable`` does not make the callback safe to replay.
 
-   Pop the pending session before the token exchange, as the example app
-   does, so a callback can never be replayed. The authorization code may also
-   already be consumed at the OP. Retrying the same callback therefore fails
-   the state check. After a retryable failure, start a new login instead.
+   Pop the pending entry before the token exchange, but do not rely on the pop
+   alone for single use. With Flask's default signed-cookie session the pending
+   entry lives in the browser, so an older cookie can restore it, and
+   concurrent callbacks can each pass the state check. For strict single use,
+   keep the pending entry server-side and consume it in one atomic step (for
+   example a database ``DELETE ... RETURNING`` or a Redis ``GETDEL``). The OP
+   rejects a code it has already used, which is a separate protection.
+   After a retryable failure, start a new login instead of retrying the same
+   callback.
 
 :func:`~pygrindvakt.rp.verify_id_token` checks the signature against the
 JWKS, the explicit signing-algorithm allowlist, ``iss``, ``sub``, every

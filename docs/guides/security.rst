@@ -307,11 +307,14 @@ broken configuration is noticed:
 else gives 400. The status is for monitors and clients only; the body stays
 generic and no error detail is sent to the browser.
 
-``retryable`` does not make the callback safe to replay. Pop the pending
-session before the token exchange, so a callback can never be replayed. The
-authorization code may also already be consumed at the OP, so the same
-callback fails the state check. After a retryable failure, start a new login
-instead.
+``retryable`` does not make the callback safe to replay. Popping the pending
+entry before the token exchange is not enough for strict single use: with
+Flask's default signed-cookie session an older cookie can restore the entry,
+and concurrent callbacks can each pass the state check. Keep the pending entry
+server-side and consume it in one atomic step (for example a database
+``DELETE ... RETURNING`` or a Redis ``GETDEL``). The OP rejects a code it has
+already used, which is a separate protection. After a retryable failure, start
+a new login instead of retrying the same callback.
 
 
 The redirect policy
