@@ -292,9 +292,16 @@ a plain ``dict`` is refused. When building an
 :class:`~pygrindvakt.ConfigError` is handled before the generic branch, so a
 broken deployment never looks like a failed login. In the generic branch the
 status comes from the exception attributes: ``retryable`` (OP or network
-trouble, the same callback may be retried later) gives 503, ``auth_failure``
-gives 401, anything else gives 400. The status is for monitors and clients
-only; the page body is generic and error details never reach the browser.
+trouble) gives 503, ``auth_failure`` gives 401, anything else gives 400. The
+status is for monitors and clients only; the page body is generic and error
+details never reach the browser.
+
+.. warning:: ``retryable`` does not make the callback safe to replay.
+
+   Pop the pending session before the token exchange, as the example app
+   does, so a callback can never be replayed. The authorization code may also
+   already be consumed at the OP. Retrying the same callback therefore fails
+   the state check. After a retryable failure, start a new login instead.
 
 :func:`~pygrindvakt.rp.verify_id_token` checks the signature against the
 JWKS, the explicit signing-algorithm allowlist, ``iss``, ``sub``, every

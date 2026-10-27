@@ -303,10 +303,15 @@ broken configuration is noticed:
        return render_template("login_failed.html"), 401 if e.auth_failure else 400
 
 ``ConfigError`` is handled before the generic branch. There, ``retryable``
-(OP or network trouble, the same callback may be retried later) gives 503,
-``auth_failure`` gives 401 and anything else gives 400. The status is for
-monitors and clients only; the body stays generic and no error detail is sent
-to the browser.
+(OP or network trouble) gives 503, ``auth_failure`` gives 401 and anything
+else gives 400. The status is for monitors and clients only; the body stays
+generic and no error detail is sent to the browser.
+
+``retryable`` does not make the callback safe to replay. Pop the pending
+session before the token exchange, so a callback can never be replayed. The
+authorization code may also already be consumed at the OP, so the same
+callback fails the state check. After a retryable failure, start a new login
+instead.
 
 
 The redirect policy

@@ -324,6 +324,10 @@ def use_authorization_response(req: pygrindvakt.http.HttpRequestData) -> None:
     rp.parse_authorization_response([("code", "c"), ("state", "s")], response_mode="fragment")
     rp.parse_authorization_response({"code": ["c"]}, response_mode="form_post", accept_jarm=True)
     rp.parse_authorization_response({"code": ("c",)})
+    req.query = [("code", "c")]
+    req.form = [("code", "c")]
+    req.query = {"code": "c"}
+    req.form = {"code": "c"}
     # A plain dict[str, str] must not type-check (a str is a Sequence[str]).
     plain: dict[str, str] = {"code": "c"}
     rp.parse_authorization_response(plain)  # type: ignore[arg-type]

@@ -179,7 +179,9 @@ Base class
       defined by pygrindvakt, not by grindvakt. ``False`` otherwise,
       including for a 4xx answer from the upstream and for every error
       raised for invalid arguments. It says nothing about idempotency or
-      backoff; apply your own.
+      backoff; apply your own. In particular it does not make an RP callback
+      safe to replay: the pending session is gone and the authorization code
+      may be consumed, so start a new login instead (see :doc:`guides/rp`).
 
       .. versionadded:: 0.3.0
 
