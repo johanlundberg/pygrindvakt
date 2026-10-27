@@ -151,6 +151,17 @@ def test_supports_oidc_token_hash():
     assert jwt.supports_oidc_token_hash("vendor-alg-1") is False
 
 
+@pytest.mark.parametrize("alg", ["\ud800", "ES\udfff", "\ud800" * 3, "RS256\ud800"])
+def test_supports_oidc_token_hash_lone_surrogate_is_false(alg):
+    """A name that is not valid UTF-8 is unrecognised: the predicate returns False, never raises."""
+    assert jwt.supports_oidc_token_hash(alg) is False
+
+
+def test_supports_oidc_token_hash_rejects_non_str():
+    with pytest.raises(TypeError):
+        jwt.supports_oidc_token_hash(b"ES256")  # type: ignore[arg-type]
+
+
 # ---- jwt.verify_with_* shared-secret gate (RFC 7518 section 3.2, ADR 0006) ---
 
 _HS = {"HS256": (hashlib.sha256, 32), "HS384": (hashlib.sha384, 48), "HS512": (hashlib.sha512, 64)}

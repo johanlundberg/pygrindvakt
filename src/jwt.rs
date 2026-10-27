@@ -4,7 +4,7 @@
 //! builder mirroring `jose_rs::jwt::Validation`.
 
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyModule, PyString};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::jose_rs::jwk::{Jwk, JwkSet};
@@ -426,10 +426,16 @@ fn oidc_token_hash(alg: &str, value: &str) -> PyResult<String> {
 
 /// Whether OIDC Core defines a token-hash function for the JWS `alg`, i.e.
 /// whether `oidc_token_hash` succeeds for it. `False` for `EdDSA` and for an
-/// unrecognised `alg` name (it is a predicate and never raises).
+/// unrecognised `alg` name (it is a predicate and never raises for a `str`).
+///
+/// Takes the Python `str` itself rather than `&str`: a lone surrogate (for
+/// example from decoding JSON `"\ud800"`) cannot become UTF-8, so the
+/// argument conversion would raise before this runs. Such a name is simply
+/// unrecognised.
 #[pyfunction]
-fn supports_oidc_token_hash(alg: &str) -> bool {
-    JwsAlgorithm::from_str(alg).is_ok_and(gj::supports_oidc_token_hash)
+fn supports_oidc_token_hash(alg: &Bound<'_, PyString>) -> bool {
+    alg.to_cow()
+        .is_ok_and(|a| JwsAlgorithm::from_str(&a).is_ok_and(gj::supports_oidc_token_hash))
 }
 
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
