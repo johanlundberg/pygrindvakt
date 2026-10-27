@@ -192,9 +192,10 @@ def test_verify_mac_min_length_ok(fn, alg, kid, pinned):
         jwk["kid"] = kid
     if pinned:
         jwk["alg"] = alg
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         assert _verify(fn, jwk, _hs_token(secret, alg, kid), alg)["sub"] == "s"
+    assert caught == []
 
 
 @FUNCS
@@ -320,9 +321,10 @@ def test_verify_mac_invalid_k_material(fn, bad_k):
 @FUNCS
 def test_verify_asymmetric_unaffected(fn, op_key):
     tok = jwt.sign(op_key, {"exp": int(time.time()) + 60, "sub": "s"})
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         if fn == "jwks":
             assert jwt.verify_with_jwks(op_key.to_public_jwks(), tok, jwt.Validation())["sub"] == "s"
         else:
             assert jwt.verify_with_jwk(op_key.public_jwk(), tok, jwt.Validation())["sub"] == "s"
+    assert caught == []
