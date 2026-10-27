@@ -525,12 +525,11 @@ fn oauth_error_redirect(
     // Fail closed: the base is concatenated into `Location` verbatim, so it
     // must be a clean, fragment-free, userinfo-free URI (RFC 6749 4.1.2.1).
     // The caller is still responsible for the exact-match registration check.
-    // Core's parse/fragment errors quote the value; never echo it.
-    crate::rp::check_redirect_uri(redirect_uri).map_err(|e| match &e {
-        RsError::BadRequest(m) if !m.contains(redirect_uri) => err(e),
-        _ => {
-            bad_request_err("redirect_uri must be an absolute URI without a fragment (not echoed)")
-        }
+    // Core's errors may quote the value, and truncate rather than omit it
+    // (`display_safe`), so a long value's prefix survives. Never inspect or
+    // forward the upstream text: every failure maps to one fixed message.
+    crate::rp::check_redirect_uri(redirect_uri).map_err(|_| {
+        bad_request_err("redirect_uri must be an absolute URI without a fragment (not echoed)")
     })?;
     Ok(crate::http::Response::wrap(
         build_oauth_error(code, description, state)?.to_redirect(redirect_uri, fragment),

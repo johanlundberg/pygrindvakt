@@ -166,6 +166,25 @@ def test_to_redirect_rejects_hostile_base(base, mode):
     assert "evil" not in msg and "X-Injected" not in msg and "not a url" not in msg
 
 
+@pytest.mark.parametrize("mode", ["query", "fragment"])
+@pytest.mark.parametrize(
+    "base",
+    [
+        "SECRET-PREFIX-" + "a" * 300,
+        "https://SECRET-PREFIX-" + "a" * 300 + " b",
+        "https://rp.example.com/" + "a" * 300 + "#SECRET-PREFIX",
+        "https://SECRET-PREFIX:pw@rp.example.com/" + "a" * 300,
+    ],
+)
+def test_to_redirect_long_malformed_base_is_not_echoed(base, mode):
+    """A malformed base over 256 chars: no prefix of it reaches the message."""
+    e = OAuthError("access_denied", "nope", state="xyz")
+    with pytest.raises(BadRequestError) as ei:
+        e.to_redirect(base, mode)
+    assert "SECRET-PREFIX" not in str(ei.value)
+    assert str(ei.value) == "redirect_uri must be an absolute URI without a fragment (not echoed)"
+
+
 @pytest.mark.parametrize(
     ("base", "mode", "expected"),
     [
