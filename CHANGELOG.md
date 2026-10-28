@@ -242,6 +242,7 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Changed
 
+- Updated to `grindvakt` 0.9.1 (patch release of the 0.9 line; see its changelog).
 - The `examples/flask-rp` callback uses `rp.parse_authorization_response`
   (duplicate-safe parsing, constant-time `state` compare, `matches_iss` via the
   explicit `OP_SENDS_ISS` constant, no provider-supplied text on the page) and

@@ -552,36 +552,7 @@ fn escape_untrusted_text_py(s: &str, max_chars: usize) -> String {
 const LOG_CODE_MAX: usize = 64;
 const LOG_MSG_MAX: usize = 512;
 
-// TODO(core): make grindvakt::error::is_invisible_format pub and delete this copy
-/// Whether `c` is a bidirectional control, line/paragraph separator or other
-/// invisible formatting character. Verbatim copy of grindvakt's
-/// `error::is_invisible_format` (pub(crate) there).
-pub(crate) fn is_invisible_format(c: char) -> bool {
-    matches!(
-        c,
-        // Bidirectional controls and Unicode line/paragraph separators.
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
-            | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-            // Zero-width and other invisible format characters (general
-            // category Cf and Default_Ignorable_Code_Point): soft hyphen,
-            // number-sign prefixes, Mongolian vowel separator, zero-width
-            // space/joiners, word joiner and invisible operators, deprecated
-            // formatting, BOM, interlinear annotation, and similar.
-            | '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}'
-            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180B}'..='\u{180F}'
-            | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}'
-            | '\u{2065}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF0}'..='\u{FFFB}'
-            | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
-            // Invisible fillers and variation selectors.
-            | '\u{034F}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
-            | '\u{3164}' | '\u{FFA0}' | '\u{FE00}'..='\u{FE0F}'
-            // Tag characters (invisible, able to carry hidden data), the
-            // variation selectors supplement and the unassigned
-            // default-ignorable code points around them.
-            | '\u{E0000}'..='\u{E0FFF}'
-    )
-}
+pub(crate) use grindvakt::is_invisible_format;
 
 /// Escape untrusted text for logs and `str()`: control characters, anything
 /// matching `is_invisible_format`, and backslash become `\n`, `\r`, `\t`,

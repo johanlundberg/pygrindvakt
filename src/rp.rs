@@ -1031,17 +1031,15 @@ fn discover(
 /// A discovery document together with what the fetch reported about itself.
 struct Discovered {
     metadata: ProviderMetadata,
-    /// Headers of the 200 response the document came from (empty when the
-    /// client reports none).
-    headers: Vec<(String, String)>,
+    /// The 200 response the document came from (headers empty when the client
+    /// reports none).
+    response: HttpFetchResponse,
     /// A response arrived and carried no header at all.
     headerless: bool,
 }
 
-/// Run `grp::discover` through a [`RecordingClient`]. `grp::discover` returns
-/// only the parsed struct, so the client is wrapped to keep the fetched body
-/// as `raw` (and the response headers for the caller); all validation stays
-/// upstream.
+/// Run `grp::discover_response` and keep the fetched body as `raw` on the
+/// metadata; all validation stays upstream.
 fn discover_recorded(
     py: Python<'_>,
     http: Arc<dyn HttpClient>,
@@ -1053,19 +1051,16 @@ fn discover_recorded(
         saw_response: Default::default(),
         saw_headers: Default::default(),
     });
-    let recorder = Arc::new(RecordingClient {
-        inner: probe.clone(),
-        last_ok: Mutex::new(None),
-    });
-    let client: Arc<dyn HttpClient> = recorder.clone();
-    let r = crate::runtime::block_on(py, async move { grp::discover(&client, &issuer).await })?;
-    let metadata = r.map_err(|e| failures.err(py, e))?;
-    let (body, headers) = match recorder.last_ok.lock().ok().and_then(|mut g| g.take()) {
-        Some((b, h)) => (Some(b), h),
-        None => (None, Vec::new()),
-    };
-    let raw = body
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    let client: Arc<dyn HttpClient> = probe.clone();
+    let r = crate::runtime::block_on(
+        py,
+        async move { grp::discover_response(&client, &issuer).await },
+    )?;
+    let grp::DiscoveryResponse {
+        metadata, response, ..
+    } = r.map_err(|e| failures.err(py, e))?;
+    let raw = serde_json::from_slice::<serde_json::Value>(&response.body)
+        .ok()
         .and_then(|v| match v {
             serde_json::Value::Object(m) => Some(m),
             _ => None,
@@ -1087,49 +1082,9 @@ fn discover_recorded(
     };
     Ok(Discovered {
         metadata,
-        headers,
+        response,
         headerless: probe.headerless(),
     })
-}
-
-/// Body and headers of one response.
-type RecordedResponse = (Vec<u8>, Vec<(String, String)>);
-
-/// `HttpClient` decorator remembering the body and headers of the last 200 GET
-/// response.
-struct RecordingClient {
-    inner: Arc<dyn HttpClient>,
-    last_ok: Mutex<Option<RecordedResponse>>,
-}
-
-#[async_trait]
-impl HttpClient for RecordingClient {
-    async fn get(&self, url: &str) -> grindvakt::Result<HttpFetchResponse> {
-        let resp = self.inner.get(url).await?;
-        if resp.status == 200 {
-            if let Ok(mut g) = self.last_ok.lock() {
-                *g = Some((resp.body.clone(), resp.headers.clone()));
-            }
-        }
-        Ok(resp)
-    }
-
-    async fn post_form(
-        &self,
-        url: &str,
-        form: &[(String, String)],
-        headers: &[(String, String)],
-    ) -> grindvakt::Result<HttpFetchResponse> {
-        self.inner.post_form(url, form, headers).await
-    }
-
-    async fn get_with_headers(
-        &self,
-        url: &str,
-        headers: &[(String, String)],
-    ) -> grindvakt::Result<HttpFetchResponse> {
-        self.inner.get_with_headers(url, headers).await
-    }
 }
 
 /// Library-controlled RP-Initiated Logout parameters.
@@ -2517,23 +2472,9 @@ impl DiscoveryCache {
             );
         }
         // `Cache-Control` / `Age` are parsed by the upstream quote-aware
-        // parser: wrap the headers in the response shape it understands.
-        let resp = HttpFetchResponse {
-            headers: d.headers,
-            ..Default::default()
-        };
-        let shim = grp::JwksResponse {
-            jwks: JwkSet { keys: Vec::new() },
-            cache_control: resp.cache_control(),
-            etag: None,
-            age: resp
-                .header("age")
-                .map(str::trim)
-                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                // A digits-only value too large for u64 means "very old".
-                .map(|v| v.parse::<u64>().unwrap_or(u64::MAX)),
-        };
-        let ttl = shim
+        // parser: remaining freshness, capped at `max_ttl`.
+        let ttl = d
+            .response
             .cache_ttl_secs_max(self.max_ttl)
             .unwrap_or(self.default_ttl)
             .clamp(self.min_ttl, self.max_ttl);
