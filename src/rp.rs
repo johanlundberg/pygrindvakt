@@ -3242,6 +3242,9 @@ impl AuthorizationResponse {
         if typ.is_some() && trust != "typed" {
             return Err(config_err("typ is only used with trust=\"typed\""));
         }
+        if typ.is_some_and(|t| t.trim().is_empty()) {
+            return Err(config_err("typ must not be empty"));
+        }
         if allowed_algorithms.is_empty() {
             return Err(config_err("allowed_algorithms must not be empty"));
         }
@@ -3452,9 +3455,10 @@ fn flatten_multi<'py>(
             }
             raw.push(value);
         }
-        let key = key.map_err(|e| e.expect("key is a str"))?;
+        let shape = || PyTypeError::new_err(format!("params must be {SHAPES}"));
+        let key = key.map_err(|e| e.unwrap_or_else(shape))?;
         for value in raw {
-            let value = param_value(&value, &key).expect("value is a str")?;
+            let value = param_value(&value, &key).ok_or_else(shape)??;
             pairs.push((key.clone(), value));
         }
     }

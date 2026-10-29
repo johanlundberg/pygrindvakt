@@ -312,6 +312,17 @@ def test_empty_issuer_or_client_id_is_config_error(key, field):
         verify(typed(key), key, **{field: ""})
 
 
+@pytest.mark.parametrize("typ", ["", "  "])
+def test_empty_or_blank_typ_is_config_error(key, typ):
+    with pytest.raises(ConfigError, match="typ must not be empty"):
+        verify(typed(key), key, typ=typ)
+
+
+def test_empty_typ_with_untyped_trust_keeps_trust_error(key):
+    with pytest.raises(ConfigError, match='typ is only used with trust="typed"'):
+        verify(typed(key), key, typ="", trust="dedicated_keys")
+
+
 class Http:
     def __init__(self, doc):
         self.doc = doc
