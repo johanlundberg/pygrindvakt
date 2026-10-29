@@ -1293,16 +1293,16 @@ distinction; branch on the class instead.
 
 .. py:function:: asymmetric_algorithms() -> list[str]
 
-   A fixed list of the classical asymmetric JWS algorithms the library parses
+   The classical asymmetric JWS algorithms from the core library's catalogue
    (``RS256``, ``RS384``, ``RS512``, ``PS256``, ``PS384``, ``PS512``,
-   ``ES256``, ``ES384``, ``ES512``, ``ES256K``, ``EdDSA``). ``HS*`` and
+   ``ES256``, ``ES384``, ``ES512``, ``EdDSA``, ``ES256K``). ``HS*`` and
    ``none`` are never included. Post-quantum names (ML-DSA, feature-gated in
    jose-rs) are **not** included, even if the build parses them.
 
    It is **not** what an OP advertises (see
    ``id_token_signing_alg_values_supported`` in its metadata) or what suits
    your deployment. Pass an explicit allowlist as ``allowed_algorithms``. It is
-   a parser probe, not a recommended allowlist. It includes ``EdDSA``, for
+   a catalogue, not a recommended allowlist. It includes ``EdDSA``, for
    which :func:`pygrindvakt.jwt.supports_oidc_token_hash` is ``False``, so
    ``allowed_algorithms=rp.asymmetric_algorithms()`` together with
    ``strict_hashes=True`` on a flow that needs ``at_hash`` / ``c_hash`` is
@@ -1311,6 +1311,11 @@ distinction; branch on the class instead.
    allowlist.
 
    .. versionadded:: 0.3.0
+
+   .. versionchanged:: 0.4.0
+      The list comes from the core library's algorithm catalogue instead of a
+      fixed probe list. The names are unchanged; the order now follows the
+      catalogue (``ES512``, ``EdDSA``, ``ES256K``).
 
 .. py:function:: claims_audiences(claims: Mapping[str, Any]) -> list[str]
 

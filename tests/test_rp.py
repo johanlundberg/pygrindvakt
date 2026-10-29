@@ -2181,7 +2181,19 @@ def test_asymmetric_algorithms(op_key):
     assert len(set(algs)) == len(algs)
     assert not {"HS256", "HS384", "HS512", "none"} & set(algs)
     assert not any(a.startswith("HS") or a.lower() == "none" for a in algs)
-    assert {"RS256", "PS256", "ES256", "EdDSA"} <= set(algs)
+    assert set(algs) == {
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "ES384",
+        "ES512",
+        "EdDSA",
+        "ES256K",
+    }
     for alg in algs:
         assert isinstance(jwt.supports_oidc_token_hash(alg), bool)
     # Every name passes the allowed_algorithms parser (a bad name is a ConfigError before the token is read).

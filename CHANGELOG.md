@@ -11,6 +11,13 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ### Changed
 
+- `rp.asymmetric_algorithms()` takes its names from core's `JWS_ALGORITHMS`
+  catalogue (minus `HS*` and `none`) instead of a hard-coded probe list. The
+  11 names are unchanged; the order now follows core (`ES512`, `EdDSA`,
+  `ES256K`).
+- `retryable` for upstream HTTP failures uses core's
+  `UpstreamHttpError::is_retryable`, and OAuth error codes are parsed with
+  core's `OAuthErrorCode::from_str`. Behaviour is unchanged.
 - Bound to `grindvakt` 0.10.0 (`jose-rs` 0.10, `kryptering` 0.7). The minimum
   Rust version is now 1.89, as upstream's.
 - JSON <-> Python conversion (`src/convert.rs`) goes through `serde_json`:

@@ -504,16 +504,32 @@ def test_token_endpoint_400_is_auth_failure_not_retryable():
     assert ei.value.retryable is False
 
 
-def test_token_endpoint_503_is_retryable():
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 429])
+def test_token_endpoint_retryable_statuses(status):
     with pytest.raises(AuthnError) as ei:
-        rp.exchange_code(FakeTokenClient(503, b"down", "text/plain"), PROV, RPC, "code", VERIFIER)
+        rp.exchange_code(FakeTokenClient(status, b"down", "text/plain"), PROV, RPC, "code", VERIFIER)
     assert ei.value.retryable is True
 
 
-def test_token_endpoint_429_is_retryable():
+@pytest.mark.parametrize("status", [400, 401, 404])
+def test_token_endpoint_non_retryable_statuses(status):
     with pytest.raises(AuthnError) as ei:
-        rp.exchange_code(FakeTokenClient(429, b"slow", "text/plain"), PROV, RPC, "code", VERIFIER)
-    assert ei.value.retryable is True
+        rp.exchange_code(FakeTokenClient(status, b"no", "text/plain"), PROV, RPC, "code", VERIFIER)
+    assert ei.value.retryable is False
+
+
+def test_token_endpoint_200_oauth_error_body_not_retryable():
+    body = b'{"error":"temporarily_unavailable"}'
+    with pytest.raises(AuthnError) as ei:
+        rp.exchange_code(FakeTokenClient(200, body), PROV, RPC, "code", VERIFIER)
+    assert ei.value.retryable is False
+
+
+def test_upstream_error_code_cannot_spoof_retryable():
+    body = b'{"error":"transport"}'
+    with pytest.raises(AuthnError) as ei:
+        rp.exchange_code(FakeTokenClient(400, body), PROV, RPC, "code", VERIFIER)
+    assert ei.value.retryable is False
 
 
 def test_jwks_500_is_not_auth_failure_and_retryable():
@@ -787,3 +803,32 @@ def test_auth_failure_class_layout(cls, expected):
     # Pins the documented layout: auth_failure is the core's narrow
     # "authentication step" flag, not a general "authentication failed" one.
     assert cls.auth_failure is expected
+
+
+OAUTH_CODES = [
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "unsupported_response_type",
+    "invalid_scope",
+    "access_denied",
+    "login_required",
+    "server_error",
+    "temporarily_unavailable",
+    "invalid_dpop_proof",
+]
+
+
+@pytest.mark.parametrize("code", OAUTH_CODES)
+def test_oauth_error_accepts_every_core_code(code):
+    resp = OAuthError(code).to_response()
+    assert resp.status in (400, 401, 500, 503)
+    assert code.encode() in resp.body
+
+
+@pytest.mark.parametrize("code", ["INVALID_REQUEST", "invalid_request ", "consent_required", ""])
+def test_oauth_error_rejects_unknown_code(code):
+    with pytest.raises(ValueError, match="unknown OAuth error code"):
+        OAuthError(code).to_response()
