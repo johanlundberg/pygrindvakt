@@ -7,6 +7,19 @@ needed to track the upstream `grindvakt` library and correct protocol or
 security handling. `pygrindvakt` is a thin PyO3 binding; most entries reflect
 adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
+## [Unreleased]
+
+### Changed
+
+- Bound to `grindvakt` 0.10.0 (`jose-rs` 0.10, `kryptering` 0.7). The minimum
+  Rust version is now 1.89, as upstream's.
+- JSON <-> Python conversion (`src/convert.rs`) goes through `serde_json`:
+  `jose-rs` 0.10 enables `serde_json/arbitrary_precision` and reads `exp`,
+  `iat` and `nbf` from a `RawValue`, which `pythonize` alone cannot handle.
+  `pythonize` is built with its `arbitrary_precision` feature and `serde_json`
+  with `preserve_order`, so numbers stay native `int` / `float` and dicts keep
+  insertion order. Shape errors still raise `TypeError`.
+
 ## [0.3.0] - 2026-10-29
 
 ### Added

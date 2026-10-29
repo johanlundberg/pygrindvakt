@@ -1,7 +1,7 @@
 //! Shared helpers for the binding: submodule creation, warnings, JSON <-> Python
 //! conversion, and the fail-closed plumbing used by the Python protocol adapters.
 
-use pyo3::exceptions::{PyTypeError, PyUserWarning};
+use pyo3::exceptions::{PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use serde::de::DeserializeOwned;
@@ -41,12 +41,26 @@ pub fn to_py<'py, T: Serialize + ?Sized>(
     py: Python<'py>,
     value: &T,
 ) -> PyResult<Bound<'py, PyAny>> {
-    pythonize::pythonize(py, value).map_err(PyErr::from)
+    // Via `Value`: types holding a `RawValue` (jose-rs `NumericDate`) only
+    // serialize correctly through serde_json.
+    let value = serde_json::to_value(value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    pythonize::pythonize(py, &value).map_err(PyErr::from)
 }
 
 /// Deserialize native Python objects into any `serde::Deserialize` type.
 pub fn from_py<T: DeserializeOwned>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
-    pythonize::depythonize(obj).map_err(PyErr::from)
+    // Via JSON text: jose-rs `NumericDate` deserializes from a `RawValue`,
+    // which only serde_json's own deserializer can supply.
+    let value: serde_json::Value = pythonize::depythonize(obj).map_err(PyErr::from)?;
+    let text = serde_json::to_string(&value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    // A shape mismatch stays a `TypeError`, as with direct depythonize.
+    serde_json::from_str(&text).map_err(|e| {
+        if e.is_data() {
+            PyTypeError::new_err(e.to_string())
+        } else {
+            PyValueError::new_err(e.to_string())
+        }
+    })
 }
 
 /// Convert convenience request data into ordered form/query pairs.

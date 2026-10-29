@@ -1211,7 +1211,7 @@ distinction; branch on the class instead.
    (upstream's rule). This binding also rejects whitespace, control, bidi and
    invisible formatting characters and userinfo
    (``https://good.example@evil.example/cb``); this is binding-side hardening,
-   stricter than core 0.9. Raises :class:`pygrindvakt.BadRequestError`
+   stricter than core 0.10. Raises :class:`pygrindvakt.BadRequestError`
    otherwise (not ``ConfigError``: it can validate request input). The same
    check applies to ``RpClient`` ``redirect_uris`` and
    ``post_logout_redirect_uris`` (:class:`pygrindvakt.ConfigError`) and to
