@@ -22,7 +22,7 @@ use grindvakt::Error as RsError;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyTuple};
+use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PySequence, PyTuple};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::jose_rs::jwk::JwkSet;
@@ -31,7 +31,7 @@ use grindvakt::metadata as gm;
 use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
-use crate::convert::{from_py, new_submodule, protocol_parameter_pairs, to_py, warn};
+use crate::convert::{from_py, new_submodule, to_py, warn};
 use crate::errors::{
     config_err, config_from, err, escape_untrusted_quoted, escape_untrusted_text,
     is_invisible_format, with_code, with_code_retryable, AuthnError, InternalError,
@@ -3342,6 +3342,72 @@ const SHAPES: &str = "an http.HttpRequestData, a list of (str, str) pairs, a \
 multi-dict mapping of str to list[str] (the urllib.parse.parse_qs shape), or an \
 object with a .lists() method such as a werkzeug MultiDict";
 
+/// The protocol parameters that may be named in an error message. Any other
+/// name is attacker-chosen and is never echoed.
+const KNOWN_PARAMS: [&str; 7] = [
+    "code",
+    "state",
+    "error",
+    "error_description",
+    "error_uri",
+    "iss",
+    "response",
+];
+
+/// Text of a parameter name. `Err(None)` means "not a str" (the caller raises
+/// its own `TypeError`); a lone surrogate is per-request input and becomes a
+/// `BadRequestError` that never echoes the name.
+fn param_name(obj: &Bound<'_, PyAny>) -> Result<String, Option<PyErr>> {
+    let s = obj.cast::<pyo3::types::PyString>().map_err(|_| None)?;
+    s.to_cow().map(|c| c.into_owned()).map_err(|_| {
+        Some(bad_response(
+            "an authorization response parameter name must not contain lone surrogates",
+        ))
+    })
+}
+
+/// Text of the value of parameter `name`. `None` means "not a str"; a lone
+/// surrogate is a `BadRequestError` that names the parameter only when it is
+/// a known protocol parameter, and never echoes the value.
+fn param_value(obj: &Bound<'_, PyAny>, name: &str) -> Option<PyResult<String>> {
+    let s = obj.cast::<pyo3::types::PyString>().ok()?;
+    Some(s.to_cow().map(|c| c.into_owned()).map_err(|_| {
+        let label = if KNOWN_PARAMS.contains(&name) {
+            name
+        } else {
+            "a request parameter"
+        };
+        bad_response(format!("{label} must not contain lone surrogates"))
+    }))
+}
+
+/// Ordered `(str, str)` pairs from a list or tuple (any sequence, never a set,
+/// generator or dict view) of 2-tuples. Shape faults, including a non-`str`
+/// name or value, are `TypeError`; a lone surrogate in a name or value is
+/// `BadRequestError`.
+fn flatten_pairs(params: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
+    let shape = || PyTypeError::new_err(format!("params must be {SHAPES}"));
+    if params.is_instance_of::<pyo3::types::PyString>() || params.is_instance_of::<PyDict>() {
+        return Err(shape());
+    }
+    let seq = params.cast::<PySequence>().map_err(|_| shape())?;
+    let mut pairs = Vec::new();
+    for item in seq.try_iter().map_err(|_| shape())? {
+        let item = item.map_err(|_| shape())?;
+        let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract().map_err(|_| shape())?;
+        // Both type checks come before any surrogate check.
+        if !k.is_instance_of::<pyo3::types::PyString>()
+            || !v.is_instance_of::<pyo3::types::PyString>()
+        {
+            return Err(shape());
+        }
+        let key = param_name(&k).map_err(|e| e.unwrap_or_else(shape))?;
+        let value = param_value(&v, &key).ok_or_else(shape)??;
+        pairs.push((key, value));
+    }
+    Ok(pairs)
+}
+
 /// Flatten `(name, [values])` items, keeping duplicates. A non-list value
 /// names its key in the `TypeError`.
 fn flatten_multi<'py>(
@@ -3352,9 +3418,12 @@ fn flatten_multi<'py>(
     for item in items {
         let item = item?;
         let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-        let key: String = k.extract().map_err(|_| {
-            PyTypeError::new_err("authorization response parameter names must be str")
-        })?;
+        if !k.is_instance_of::<pyo3::types::PyString>() {
+            return Err(PyTypeError::new_err(
+                "authorization response parameter names must be str",
+            ));
+        }
+        let key = param_name(&k);
         if !(v.is_instance_of::<PyList>() || v.is_instance_of::<PyTuple>()) {
             let subclass = !owner.is_exact_instance_of::<PyDict>();
             let hint = if subclass {
@@ -3368,13 +3437,24 @@ fn flatten_multi<'py>(
             };
             return Err(PyTypeError::new_err(format!(
                 "params is a mapping with a non-list value for key '{}'{hint}; params must be {SHAPES}",
-                escape_untrusted_text(&key, 64)
+                escape_untrusted_text(key.as_deref().unwrap_or("?"), 64)
             )));
         }
+        // Value types are checked before the key or any value is tested for
+        // lone surrogates: a non-str value is a programmer error.
+        let mut raw = Vec::new();
         for value in v.try_iter()? {
-            let value: String = value?.extract().map_err(|_| {
-                PyTypeError::new_err("authorization response parameter values must be str")
-            })?;
+            let value = value?;
+            if !value.is_instance_of::<pyo3::types::PyString>() {
+                return Err(PyTypeError::new_err(
+                    "authorization response parameter values must be str",
+                ));
+            }
+            raw.push(value);
+        }
+        let key = key.map_err(|e| e.expect("key is a str"))?;
+        for value in raw {
+            let value = param_value(&value, &key).expect("value is a str")?;
             pairs.push((key.clone(), value));
         }
     }
@@ -3454,13 +3534,7 @@ fn response_pairs(
         let pairs = flatten_multi(mapping.items()?.try_iter()?, params)?;
         return Ok((pairs, mode));
     }
-    let pairs = protocol_parameter_pairs(params, "params").map_err(|e| {
-        if e.is_instance_of::<PyTypeError>(params.py()) {
-            PyTypeError::new_err(format!("params must be {SHAPES}"))
-        } else {
-            e
-        }
-    })?;
+    let pairs = flatten_pairs(params)?;
     Ok((pairs, mode))
 }
 
@@ -3476,7 +3550,10 @@ fn response_pairs(
 /// because a mapping discards duplicate parameters. `response_mode` (`"query"`, `"fragment"` or
 /// `"form_post"`) labels list and multi-dict input; default `"query"`.
 ///
-/// Raises `BadRequestError` for a repeated parameter, both or neither of
+/// Raises `BadRequestError` for a lone surrogate in a parameter name or value
+/// of pairs, multi-dict or `.lists()` input (`HttpRequestData` construction
+/// raises `TypeError` instead),
+/// a repeated parameter, both or neither of
 /// `code` and `error`, an empty `code` / `state` / `error` / `iss`, control, bidi or
 /// invisible characters or backslashes in `code` / `state` / `iss`, a `code` /
 /// `state` / `iss` over 2048 characters (a JARM `response` over 32768), an `error` outside RFC 6749 section

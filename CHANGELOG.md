@@ -95,6 +95,9 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   assigned a mapping (additive tracking; `HttpRequestData` behaviour is
   otherwise unchanged, and its `query` / `form` setters now also accept pairs).
   Raises `BadRequestError` for
+  a lone surrogate in a parameter name or value of pairs, multi-dict or
+  `.lists()` input (never echoed; only the seven known protocol parameters are
+  named; `HttpRequestData` construction still raises `TypeError`),
   repeated parameters, both or neither of `code` / `error`, empty
   `code` / `state` / `error` / `iss`,
   control, bidi / invisible-character or over-2048-character `code` / `state`

@@ -3281,29 +3281,127 @@ def test_authorization_response_parse_qsl_default_hides_blank_duplicate():
 
 
 _LONE_SURROGATE = "\ud800"
-_PARAMS_TYPE_MSG = "params must be an http.HttpRequestData"
 
 
-@pytest.mark.parametrize("name", ["code", "state", "iss", "error_uri", "response"])
-def test_authorization_response_lone_surrogate_pairs_type_error(name):
+_KNOWN_PARAMS = ("code", "state", "error", "error_description", "error_uri", "iss", "response")
+
+
+def _assert_surrogate_rejected(exc_info, name):
+    msg = str(exc_info.value)
+    assert not isinstance(exc_info.value, (TypeError, UnicodeError))
+    label = name if name in _KNOWN_PARAMS else "a request parameter"
+    assert f"{label} must not contain lone surrogates" in msg
+    if name not in _KNOWN_PARAMS:
+        assert name not in msg
+    assert "ud800" not in msg.lower() and _LONE_SURROGATE not in msg
+
+
+@pytest.mark.parametrize("name", ["code", "state", "iss", "error_uri", "response", "unknown"])
+def test_authorization_response_lone_surrogate_pairs_bad_request(name):
     base = [] if name in ("code", "response") else [("code", "c")]
-    with pytest.raises(TypeError, match=_PARAMS_TYPE_MSG):
+    with pytest.raises(BadRequestError) as ei:
         _parse([*base, (name, _LONE_SURROGATE)], accept_jarm=True)
+    _assert_surrogate_rejected(ei, name)
 
 
-def test_authorization_response_lone_surrogate_error_description_pairs_type_error():
-    with pytest.raises(TypeError, match=_PARAMS_TYPE_MSG):
+def test_authorization_response_lone_surrogate_error_description_pairs_bad_request():
+    with pytest.raises(BadRequestError) as ei:
         _parse([("error", "access_denied"), ("error_description", _LONE_SURROGATE)])
+    _assert_surrogate_rejected(ei, "error_description")
+
+
+def test_authorization_response_lone_surrogate_jarm_response_bad_request():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("response", "a.b." + _LONE_SURROGATE)], accept_jarm=True)
+    _assert_surrogate_rejected(ei, "response")
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("response", "a.b." + _LONE_SURROGATE)])
+    _assert_surrogate_rejected(ei, "response")
+
+
+def test_authorization_response_lone_surrogate_name_bad_request():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("code", "c"), (_LONE_SURROGATE, "x")])
+    assert "ud800" not in str(ei.value).lower() and _LONE_SURROGATE not in str(ei.value)
+    with pytest.raises(BadRequestError) as ei:
+        rp.parse_authorization_response({"code": ["c"], _LONE_SURROGATE: ["x"]})
+    assert "ud800" not in str(ei.value).lower() and _LONE_SURROGATE not in str(ei.value)
+
+
+def test_authorization_response_lone_surrogate_unknown_name_not_echoed():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("code", "c"), ("evil_name", _LONE_SURROGATE)])
+    assert "evil_name" not in str(ei.value)
+    assert "a request parameter must not contain lone surrogates" in str(ei.value)
+    with pytest.raises(BadRequestError) as ei:
+        rp.parse_authorization_response({"code": ["c"], "evil_name": [_LONE_SURROGATE]})
+    assert "evil_name" not in str(ei.value)
+
+
+def test_authorization_response_lone_surrogate_in_later_pair():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("code", "c"), ("state", "s"), ("iss", _LONE_SURROGATE)])
+    _assert_surrogate_rejected(ei, "iss")
+
+
+def test_authorization_response_lone_surrogate_in_tuple_multi_dict_value():
+    with pytest.raises(BadRequestError) as ei:
+        rp.parse_authorization_response({"code": ["c"], "state": ("ok", _LONE_SURROGATE)})
+    _assert_surrogate_rejected(ei, "state")
+
+
+@pytest.mark.parametrize("key", ["code", _LONE_SURROGATE])
+def test_authorization_response_non_str_value_beats_surrogate_key(key):
+    with pytest.raises(TypeError, match="params must be"):
+        _parse([(key, 1)])
+    with pytest.raises(TypeError, match="parameter values must be str"):
+        rp.parse_authorization_response({key: [1]})
+
+
+def test_authorization_response_non_str_value_before_surrogate_value_in_list():
+    with pytest.raises(TypeError, match="parameter values must be str"):
+        rp.parse_authorization_response({"code": [_LONE_SURROGATE, 1]})
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda pairs: set(pairs),
+        lambda pairs: (p for p in pairs),
+        lambda pairs: iter(pairs),
+        lambda pairs: frozenset(pairs),
+    ],
+    ids=["set", "generator", "iterator", "frozenset"],
+)
+def test_authorization_response_pairs_must_be_sequence(make):
+    with pytest.raises(TypeError, match="params must be"):
+        _parse(make([("code", "a"), ("code", "a")]))
+
+
+def test_authorization_response_dict_views_type_error():
+    d = {"code": "a"}
+    for view in (d.items(), d.keys(), d.values()):
+        with pytest.raises(TypeError, match="params must be"):
+            _parse(view)
 
 
 @pytest.mark.parametrize("wrapper", ["multi-dict", "lists-only"])
-@pytest.mark.parametrize("key", ["code", "state", "iss"])
-def test_authorization_response_lone_surrogate_duck_type_error(wrapper, key):
-    base = {} if key == "code" else {"code": ["c"]}
+@pytest.mark.parametrize("key", ["code", "state", "iss", "response"])
+def test_authorization_response_lone_surrogate_duck_bad_request(wrapper, key):
+    base = {} if key in ("code", "response") else {"code": ["c"]}
     data = {**base, key: [_LONE_SURROGATE]}
     params = data if wrapper == "multi-dict" else _ListsOnly(data)
+    with pytest.raises(BadRequestError) as ei:
+        rp.parse_authorization_response(params, accept_jarm=True)
+    _assert_surrogate_rejected(ei, key)
+
+
+@pytest.mark.parametrize("bad", [b"c", 1, None])
+def test_authorization_response_non_str_value_stays_type_error(bad):
+    with pytest.raises(TypeError, match="params must be"):
+        _parse([("code", bad)])
     with pytest.raises(TypeError, match="parameter values must be str"):
-        rp.parse_authorization_response(params)
+        rp.parse_authorization_response({"code": [bad]})
 
 
 def test_authorization_response_lone_surrogate_http_request_data_type_error():

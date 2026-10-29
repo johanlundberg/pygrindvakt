@@ -817,7 +817,10 @@ def parse_authorization_response(
     ``code=valid&code=``. ``response_mode`` labels list and multi-dict
     input (default ``"query"``).
 
-    Raises ``BadRequestError`` for a repeated parameter, both or neither of
+    Raises ``BadRequestError`` for a lone surrogate in a parameter name or
+    value of pairs, multi-dict or ``lists()`` input (the message never echoes
+    it; a non-``str`` name or value is a ``TypeError``, and so is a lone
+    surrogate in ``HttpRequestData`` construction), a repeated parameter, both or neither of
     ``code`` and ``error``, an empty ``code`` / ``state`` / ``error`` / ``iss`` / ``response``, control,
     bidi or invisible characters or backslashes in ``code`` / ``state`` /
     ``iss``, a ``code`` / ``state`` / ``iss`` over 2048 characters, a JARM

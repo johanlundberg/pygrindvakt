@@ -30,7 +30,18 @@ an unverified JARM stub could return True with `required=False`.
    implementation moved.
 2. **The binding keeps** what core cannot or should not decide:
    * the Python input adapter (`HttpRequestData`, pairs, multi-dict,
-     `.lists()`) and its `TypeError` for mappings that hide duplicates;
+     `.lists()`) and its `TypeError` for mappings that hide duplicates and
+     for non-`str` names or values (programmer errors). A `str` that is not
+     valid Unicode (a lone surrogate, e.g. from a decoded JSON `"\ud800"`)
+     is attacker-supplied per-request input, so it is a `BadRequestError`
+     naming the parameter only when it is one of the seven known protocol
+     parameters (otherwise "a request parameter") and never echoing the value,
+     as in `claims_audiences`. This applies to names and values in pairs,
+     multi-dict and `.lists()` input, including unknown parameters, because
+     extraction fails before the parameter is looked at. Pairs must be a
+     sequence (list or tuple): a set or generator is a `TypeError`, since a set
+     dedupes repeated parameters. `HttpRequestData` construction still raises
+     `TypeError` before the parser is reached;
    * the channel / `response_mode` messages and the transport
      `response_mode` label;
    * an additive JARM pre-check with our wording (plaintext parameters beside

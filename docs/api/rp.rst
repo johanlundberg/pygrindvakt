@@ -660,6 +660,12 @@ The authorization response
 
    Raises :class:`pygrindvakt.BadRequestError` (per-request input) when:
 
+   * a parameter name or value in pairs, multi-dict or ``.lists()`` input is
+     not valid Unicode (a lone surrogate, for example from a decoded
+     ``\ud800``); the message names the parameter only when it is a known
+     protocol parameter and never echoes the value. A name or value that is
+     not a ``str`` at all is a programmer error and raises :class:`TypeError`,
+     as does constructing ``HttpRequestData`` with a lone surrogate;
    * ``code``, ``state``, ``error``, ``error_description``, ``error_uri``,
      ``iss`` or ``response`` appears more than once;
    * ``code`` and ``error`` are both present, or neither is (unless
