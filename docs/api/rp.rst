@@ -665,6 +665,7 @@ The authorization response
    * ``code`` and ``error`` are both present, or neither is (unless
      ``response`` is present and ``accept_jarm=True``);
    * ``code``, ``state``, ``error`` or ``iss`` is the empty string;
+   * ``response`` is the empty string;
    * ``code``, ``state`` or ``iss`` contains a control character (newline,
      NUL, tab, DEL, ...), a bidi or invisible formatting character, or a
      backslash. Otherwise they are kept verbatim, without trimming;
@@ -791,7 +792,8 @@ The authorization response
       normalisation). When the response has no ``iss`` the result is
       ``not required``, so ``False`` by default. An empty ``expected`` is a
       configuration fault and always gives ``False``, regardless of
-      ``required``. Never raises. The caller
+      ``required``; so does an unverified JARM stub
+      (``response`` set). Never raises. The caller
       MUST call it. Pass ``required=False`` **only** when the OP does not
       advertise ``authorization_response_iss_parameter_supported`` in its
       metadata (RFC 9207 section 2.4); otherwise a mix-up attacker's response
@@ -806,7 +808,7 @@ The authorization response
       UTF-8 bytes (RFC 6749 sections 4.1.2.3 and 10.12). When the response has
       no ``state`` the result is ``not required``, so ``False`` by default.
       An empty ``expected`` always gives ``False``, regardless of
-      ``required``. Never raises for a mismatch; ``expected`` must be a ``str`` (``TypeError``
+      ``required``, as does an unverified JARM stub (``response`` set). Never raises for a mismatch; ``expected`` must be a ``str`` (``TypeError``
       otherwise). ``state`` in the response is conditional on the request
       carrying one; :func:`authorization_url` and :func:`begin` always send it,
       so keep ``required=True``. Pass ``required=False`` only for a request you

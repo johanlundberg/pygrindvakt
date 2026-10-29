@@ -3226,11 +3226,12 @@ impl AuthorizationResponse {
     /// `not required`, so False by default. Pass `required=False` ONLY when
     /// the OP does not advertise `authorization_response_iss_parameter_supported`
     /// (RFC 9207 section 2.4). An empty `expected` is a configuration fault
-    /// and always returns False, regardless of `required`. Never raises. The
-    /// caller MUST call it; parsing does not.
+    /// and always returns False, regardless of `required`, as does an
+    /// unverified JARM stub (`response` set; the binding cannot verify it).
+    /// Never raises. The caller MUST call it; parsing does not.
     #[pyo3(signature = (expected, *, required = true))]
     fn matches_iss(&self, expected: &str, required: bool) -> bool {
-        if expected.is_empty() {
+        if expected.is_empty() || self.response.is_some() {
             return false;
         }
         match self.iss.as_deref() {
@@ -3248,10 +3249,11 @@ impl AuthorizationResponse {
     /// built without `state`. Never raises for a mismatch. The caller MUST
     /// call it before exchanging the code; parsing does not. An empty
     /// `expected` (no state stored in the session) always returns False,
-    /// regardless of `required`.
+    /// regardless of `required`, as does an unverified JARM stub (`response`
+    /// set).
     #[pyo3(signature = (expected, *, required = true))]
     fn matches_state(&self, expected: &str, required: bool) -> bool {
-        if expected.is_empty() {
+        if expected.is_empty() || self.response.is_some() {
             return false;
         }
         match self.state.as_deref() {
@@ -3547,6 +3549,9 @@ fn parse_authorization_response(
         if let Some(v) = v {
             check_response_value(name, v)?;
         }
+    }
+    if response.as_deref() == Some("") {
+        return Err(bad_response("response must not be empty"));
     }
     if response
         .as_deref()

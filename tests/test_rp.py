@@ -3328,17 +3328,34 @@ def test_authorization_response_empty_post_needs_form_body_message():
     )
 
 
-def test_authorization_response_empty_jarm_response_accepted_today():
-    # flips in the next commit: an empty JARM response will be refused
-    r = _parse([("response", "")], accept_jarm=True)
-    assert r.response == "" and r.code is None and not r.is_error
+def test_authorization_response_empty_jarm_response_rejected():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("response", "")], accept_jarm=True)
+    assert str(ei.value) == "bad request: response must not be empty"
 
 
-def test_authorization_response_jarm_stub_matches_not_required_true_today():
-    # flips in the next commit: the unverified JARM stub will no longer match when required=False
+def test_authorization_response_empty_jarm_without_accept_jarm_refused_first():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("response", "")])
+    assert str(ei.value) == (
+        "bad request: JARM response parameter is not supported; pass accept_jarm=True only if "
+        "you verify the JWT yourself"
+    )
+
+
+def test_authorization_response_empty_jarm_alongside_code_reported_before_empty():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("response", ""), ("code", "c")], accept_jarm=True)
+    assert str(ei.value) == (
+        "bad request: a JARM response carries every parameter inside the JWT: code, state, "
+        "error, error_description, error_uri and iss must not appear alongside response"
+    )
+
+
+def test_authorization_response_jarm_stub_matches_always_false():
     r = _parse([("response", "a.b.c")], accept_jarm=True)
-    assert r.matches_state("x", required=False) is True
-    assert r.matches_iss("x", required=False) is True
+    assert r.matches_state("x", required=False) is False
+    assert r.matches_iss("x", required=False) is False
     assert r.matches_state("x") is False and r.matches_iss("x") is False
 
 

@@ -743,7 +743,8 @@ class AuthorizationResponse:
         default. Pass ``required=False`` ONLY when the OP does not advertise
         ``authorization_response_iss_parameter_supported`` (RFC 9207 section
         2.4). An empty ``expected`` is a configuration fault and always gives
-        ``False``, regardless of ``required``. Never raises.
+        ``False``, regardless of ``required``, as does an unverified JARM stub
+        (``response`` set). Never raises.
         """
     def matches_state(self, expected: str, *, required: bool = True) -> bool:
         """Constant-time comparison of ``state`` with ``expected`` (RFC 6749 4.1.2.3, 10.12).
@@ -753,7 +754,7 @@ class AuthorizationResponse:
         ``rp.begin`` always send ``state``, so keep ``required=True``; pass
         ``required=False`` only for a request deliberately built without
         ``state``. An empty ``expected`` always gives ``False``, regardless of
-        ``required``. Never raises for a mismatch. ALWAYS call it before
+        ``required``, as does an unverified JARM stub (``response`` set). Never raises for a mismatch. ALWAYS call it before
         exchanging the code.
         """
     def __repr__(self) -> str: ...
@@ -779,7 +780,7 @@ def parse_authorization_response(
     input (default ``"query"``).
 
     Raises ``BadRequestError`` for a repeated parameter, both or neither of
-    ``code`` and ``error``, an empty ``code`` / ``state`` / ``error`` / ``iss``, control,
+    ``code`` and ``error``, an empty ``code`` / ``state`` / ``error`` / ``iss`` / ``response``, control,
     bidi or invisible characters or backslashes in ``code`` / ``state`` /
     ``iss``, a ``code`` / ``state`` / ``iss`` over 2048 characters, a JARM
     ``response`` over 32768 characters, an
