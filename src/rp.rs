@@ -16,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use grindvakt::callback as gcb;
 use grindvakt::http::{HttpClient, HttpFetchResponse};
 use grindvakt::Error as RsError;
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -3074,48 +3075,6 @@ const RESPONSE_PARAMS: [&str; 7] = [
     "response",
 ];
 
-/// Every `error` code `AuthorizationResponse.error_known` treats as known: the
-/// union of RFC 6749 sections 4.1.2.1 and 5.2, OIDC Core 1.0 section 3.1.2.6,
-/// the JAR / registration codes an authorization endpoint may return, and
-/// every code `parse_oauth_code` (errors.rs) recognises (`login_required`,
-/// `invalid_dpop_proof`). Keep it a SUPERSET of `parse_oauth_code`.
-///
-/// "Known" here is WIDER than what `OAuthError(...)` accepts: `parse_oauth_code`
-/// knows only 12 codes, so e.g. `consent_required` is known but
-/// `OAuthError("consent_required")` raises `ValueError`. Never build an
-/// `OAuthError` from a callback value without catching `ValueError`.
-const KNOWN_ERROR_CODES: [&str; 20] = [
-    // RFC 6749 sections 4.1.2.1 and 5.2.
-    "invalid_request",
-    "invalid_client",
-    "invalid_grant",
-    "unauthorized_client",
-    "unsupported_grant_type",
-    "unsupported_response_type",
-    "invalid_scope",
-    "access_denied",
-    "server_error",
-    "temporarily_unavailable",
-    // OIDC Core section 3.1.2.6 and JAR / registration.
-    "login_required",
-    "interaction_required",
-    "account_selection_required",
-    "consent_required",
-    "invalid_request_uri",
-    "invalid_request_object",
-    "request_not_supported",
-    "request_uri_not_supported",
-    "registration_not_supported",
-    // RFC 9449 (DPoP).
-    "invalid_dpop_proof",
-];
-
-/// Cap (characters) of `code`, `state` and `iss`, and the raw `error_uri`.
-const RESPONSE_VALUE_MAX: usize = 2048;
-
-/// Cap (characters) of the JARM `response` JWT.
-const RESPONSE_JARM_MAX: usize = 32768;
-
 /// Cap (characters) of `AuthorizationResponse.error_description_safe`.
 const ERROR_DESCRIPTION_SAFE_MAX: usize = 256;
 
@@ -3142,15 +3101,14 @@ fn bad_response(msg: impl Into<String>) -> PyErr {
 )]
 #[derive(Clone)]
 pub struct AuthorizationResponse {
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
+    inner: gcb::AuthorizationResponse,
+    /// Transport label (`query` / `fragment` / `form_post`); the core's own
+    /// mode is `Jwt` for a JARM stub, which the binding never reports.
+    transport: &'static str,
+    /// Escaped with the binding's escaper from the single raw value.
     error_description_safe: Option<String>,
+    /// Core's normalised `error_uri` minus any URL with a fragment.
     error_uri: Option<String>,
-    iss: Option<String>,
-    response: Option<String>,
-    response_mode: &'static str,
-    error_known: bool,
 }
 
 #[pymethods]
@@ -3158,19 +3116,19 @@ impl AuthorizationResponse {
     /// The authorization code, verbatim, or `None` for an error response.
     #[getter]
     fn code(&self) -> Option<&str> {
-        self.code.as_deref()
+        self.inner.code()
     }
     /// The `state` echoed by the OP, verbatim. Check it with `matches_state`
     /// (constant time) before anything else.
     #[getter]
     fn state(&self) -> Option<&str> {
-        self.state.as_deref()
+        self.inner.state()
     }
     /// The OAuth error code (RFC 6749 charset, at most 64 characters), or
     /// `None`. Unknown codes are kept; see `error_known`.
     #[getter]
     fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.inner.error()
     }
     /// `error_description` escaped (control, bidi and invisible characters)
     /// and capped at 256 characters. The raw value is not exposed.
@@ -3190,24 +3148,24 @@ impl AuthorizationResponse {
     /// `matches_iss`.
     #[getter]
     fn iss(&self) -> Option<&str> {
-        self.iss.as_deref()
+        self.inner.iss()
     }
     /// The raw JARM `response` JWT, at most 32768 characters. UNVERIFIED and
     /// untrusted: the binding has no JARM support. Only set when
     /// `accept_jarm=True` was passed.
     #[getter]
     fn response(&self) -> Option<&str> {
-        self.response.as_deref()
+        self.inner.jarm_response()
     }
     /// How the response arrived: `"query"`, `"fragment"` or `"form_post"`.
     #[getter]
     fn response_mode(&self) -> &str {
-        self.response_mode
+        self.transport
     }
     /// True when the response carries an OAuth `error`.
     #[getter]
     fn is_error(&self) -> bool {
-        self.error.is_some()
+        self.inner.is_error()
     }
     /// True when `error` is a code the binding knows (RFC 6749, OIDC Core,
     /// DPoP). Unknown codes are kept, never rejected. "Known" is WIDER than
@@ -3218,7 +3176,7 @@ impl AuthorizationResponse {
     /// string instead.
     #[getter]
     fn error_known(&self) -> bool {
-        self.error_known
+        self.inner.error_known()
     }
 
     /// RFC 9207 issuer check, fail closed: exact, byte-for-byte comparison of
@@ -3231,13 +3189,7 @@ impl AuthorizationResponse {
     /// Never raises. The caller MUST call it; parsing does not.
     #[pyo3(signature = (expected, *, required = true))]
     fn matches_iss(&self, expected: &str, required: bool) -> bool {
-        if expected.is_empty() || self.response.is_some() {
-            return false;
-        }
-        match self.iss.as_deref() {
-            Some(iss) => iss == expected,
-            None => !required,
-        }
+        self.inner.matches_iss(expected, required)
     }
 
     /// `state` check, fail closed: constant-time comparison of the UTF-8
@@ -3253,30 +3205,24 @@ impl AuthorizationResponse {
     /// set).
     #[pyo3(signature = (expected, *, required = true))]
     fn matches_state(&self, expected: &str, required: bool) -> bool {
-        if expected.is_empty() || self.response.is_some() {
-            return false;
-        }
-        match self.state.as_deref() {
-            Some(state) => grindvakt::mac::constant_time_eq(state.as_bytes(), expected.as_bytes()),
-            None => !required,
-        }
+        self.inner.matches_state(expected, required)
     }
 
     fn __repr__(&self) -> String {
-        let quoted = |v: &Option<String>| match v {
+        let quoted = |v: Option<&str>| match v {
             Some(s) => format!("'{}'", escape_untrusted_quoted(s, 128)),
             None => "None".to_string(),
         };
-        let set = |v: &Option<String>| if v.is_some() { "<set>" } else { "None" };
+        let set = |v: Option<&str>| if v.is_some() { "<set>" } else { "None" };
         format!(
             "AuthorizationResponse(is_error={}, error={}, code={}, state={}, iss={}, response={}, response_mode='{}')",
-            if self.error.is_some() { "True" } else { "False" },
-            quoted(&self.error),
-            set(&self.code),
-            set(&self.state),
-            quoted(&self.iss),
-            set(&self.response),
-            self.response_mode,
+            if self.inner.is_error() { "True" } else { "False" },
+            quoted(self.inner.error()),
+            set(self.inner.code()),
+            set(self.inner.state()),
+            quoted(self.inner.iss()),
+            set(self.inner.jarm_response()),
+            self.transport,
         )
     }
 }
@@ -3419,56 +3365,6 @@ fn response_pairs(
     Ok((pairs, mode))
 }
 
-/// Cap the length and reject control, backslash and bidi / invisible
-/// formatting characters in a value kept verbatim. The message never echoes
-/// the value.
-fn check_response_value(name: &str, v: &str) -> PyResult<()> {
-    if v.chars().count() > RESPONSE_VALUE_MAX {
-        return Err(bad_response(format!(
-            "{name} must be at most {RESPONSE_VALUE_MAX} characters"
-        )));
-    }
-    if v.chars()
-        .any(|c| c.is_control() || c == '\\' || is_invisible_format(c))
-    {
-        return Err(bad_response(format!(
-            "{name} must not contain control, bidi or invisible formatting characters or backslashes"
-        )));
-    }
-    Ok(())
-}
-
-/// RFC 6749 section 5.2: `error` is %x20-21 / %x23-5B / %x5D-7E.
-fn check_error_code(v: &str) -> PyResult<()> {
-    if v.chars().count() > 64
-        || !v
-            .bytes()
-            .all(|b| matches!(b, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E))
-    {
-        return Err(bad_response(
-            "error must be at most 64 characters from the RFC 6749 section 5.2 set",
-        ));
-    }
-    Ok(())
-}
-
-/// `error_uri` survives only as a safe absolute http(s) URL.
-/// Returns the NORMALISED URL (`Url::as_str`), so what the caller sees is
-/// what was validated (`https:evil.example/x` becomes `https://evil.example/x`).
-fn safe_error_uri(uri: &str) -> Option<String> {
-    if uri.chars().count() > RESPONSE_VALUE_MAX {
-        return None;
-    }
-    check_redirect_uri(uri).ok()?;
-    let u = url::Url::parse(uri).ok()?;
-    let ok = matches!(u.scheme(), "http" | "https")
-        && check_redirect_uri_transport(u.as_str()).is_ok()
-        && u.host().is_some()
-        && u.username().is_empty()
-        && u.password().is_none();
-    ok.then(|| u.as_str().to_string())
-}
-
 /// Parse the authorization response (the callback) of an authorization
 /// request, fail closed.
 ///
@@ -3500,85 +3396,54 @@ fn parse_authorization_response(
     accept_jarm: bool,
 ) -> PyResult<AuthorizationResponse> {
     let (pairs, mode) = response_pairs(params, response_mode)?;
-    let mut found: BTreeMap<&str, String> = BTreeMap::new();
-    for (k, v) in pairs {
-        if let Some(name) = RESPONSE_PARAMS.iter().find(|n| **n == k) {
-            if found.insert(name, v).is_some() {
-                return Err(bad_response(format!("{name} must not be repeated")));
-            }
-        }
+    jarm_prechecks(&pairs, accept_jarm)?;
+    let mut opts = gcb::AuthorizationResponseOptions::new();
+    if accept_jarm {
+        opts = opts.accept_unverified_jarm();
     }
-    let mut take = |n: &str| found.remove(n);
-    let (code, state, error) = (take("code"), take("state"), take("error"));
-    let (description, uri) = (take("error_description"), take("error_uri"));
-    let (iss, response) = (take("iss"), take("response"));
+    let inner = gcb::parse_authorization_response(&pairs, &opts).map_err(err)?;
+    // The core rejected repeats, so at most one raw description exists.
+    let error_description_safe = pairs
+        .iter()
+        .find(|(k, _)| k == "error_description")
+        .map(|(_, d)| escape_untrusted_text(d, ERROR_DESCRIPTION_SAFE_MAX));
+    // A URL with a fragment is never exposed.
+    let error_uri = inner
+        .error_uri()
+        .filter(|u| url::Url::parse(u).is_ok_and(|p| p.fragment().is_none()))
+        .map(str::to_string);
+    Ok(AuthorizationResponse {
+        inner,
+        transport: mode,
+        error_description_safe,
+        error_uri,
+    })
+}
 
-    if response.is_some() && !accept_jarm {
+/// The binding's own wording for the two JARM refusals (default-off and
+/// `response` alongside other parameters). Additive: it only fires when no
+/// parameter repeats, so the core reports a repeat first, as before.
+fn jarm_prechecks(pairs: &[(String, String)], accept_jarm: bool) -> PyResult<()> {
+    let count = |n: &str| pairs.iter().filter(|(k, _)| k == n).count();
+    if RESPONSE_PARAMS.iter().any(|n| count(n) > 1) || count("response") == 0 {
+        return Ok(());
+    }
+    if !accept_jarm {
         return Err(bad_response(
             "JARM response parameter is not supported; pass accept_jarm=True only if you \
              verify the JWT yourself",
         ));
     }
-    if response.is_some()
-        && [&code, &state, &error, &description, &uri, &iss]
-            .iter()
-            .any(|v| v.is_some())
+    if RESPONSE_PARAMS
+        .iter()
+        .any(|n| *n != "response" && count(n) > 0)
     {
         return Err(bad_response(
             "a JARM response carries every parameter inside the JWT: code, state, error, \
              error_description, error_uri and iss must not appear alongside response",
         ));
     }
-    if code.is_some() && error.is_some() {
-        return Err(bad_response("code and error must not both be present"));
-    }
-    if code.is_none() && error.is_none() && response.is_none() {
-        return Err(bad_response("response has neither code nor error"));
-    }
-    for (name, v) in [
-        ("code", &code),
-        ("state", &state),
-        ("error", &error),
-        ("iss", &iss),
-    ] {
-        if v.as_deref() == Some("") {
-            return Err(bad_response(format!("{name} must not be empty")));
-        }
-    }
-    for (name, v) in [("code", &code), ("state", &state), ("iss", &iss)] {
-        if let Some(v) = v {
-            check_response_value(name, v)?;
-        }
-    }
-    if response.as_deref() == Some("") {
-        return Err(bad_response("response must not be empty"));
-    }
-    if response
-        .as_deref()
-        .is_some_and(|r| r.chars().count() > RESPONSE_JARM_MAX)
-    {
-        return Err(bad_response(format!(
-            "response must be at most {RESPONSE_JARM_MAX} characters"
-        )));
-    }
-    if let Some(e) = &error {
-        check_error_code(e)?;
-    }
-    let error_known = error
-        .as_deref()
-        .is_some_and(|e| KNOWN_ERROR_CODES.contains(&e));
-    Ok(AuthorizationResponse {
-        code,
-        state,
-        error,
-        error_description_safe: description
-            .map(|d| escape_untrusted_text(&d, ERROR_DESCRIPTION_SAFE_MAX)),
-        error_uri: uri.and_then(|u| safe_error_uri(&u)),
-        iss,
-        response,
-        response_mode: mode,
-        error_known,
-    })
+    Ok(())
 }
 
 /// Render untrusted OP-advertised values for a message: each escaped and
