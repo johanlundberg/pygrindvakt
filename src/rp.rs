@@ -452,6 +452,13 @@ pub(crate) fn reject_reinterpreted_url_chars(name: &str, raw: &str) -> Result<()
     Ok(())
 }
 
+/// Whitespace, control, bidi or invisible formatting character: the gate that
+/// keeps a URI safe to echo into a `Location` header.
+pub(crate) fn has_unsafe_uri_char(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_whitespace() || c.is_control() || is_invisible_format(c))
+}
+
 /// Binding-side redirect URI syntax check; every redirect URI in this module
 /// goes through it. Stricter than core's `validate_redirect_uri_syntax`, which
 /// parses with the `url` crate (that strips tab/CR/LF) while the raw string is
@@ -461,10 +468,7 @@ pub(crate) fn reject_reinterpreted_url_chars(name: &str, raw: &str) -> Result<()
 /// value is never echoed. Custom-scheme URIs without an authority pass.
 pub(crate) fn check_redirect_uri(uri: &str) -> Result<(), RsError> {
     reject_reinterpreted_url_chars("redirect_uri", uri)?;
-    if uri
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || is_invisible_format(c))
-    {
+    if has_unsafe_uri_char(uri) {
         return Err(RsError::BadRequest(
             "redirect_uri must not contain whitespace, control, bidi or invisible formatting characters"
                 .into(),

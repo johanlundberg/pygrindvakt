@@ -47,7 +47,7 @@ use grindvakt::Error as RsError;
 use crate::convert::{
     from_py, log_unraisable, new_submodule, parameter_pairs, require_methods, to_py,
 };
-use crate::errors::{err, internal_err, with_code, InternalError};
+use crate::errors::{bad_request_err, err, internal_err, with_code, InternalError};
 
 // ---------------------------------------------------------------------------
 // HttpRequestData
@@ -279,18 +279,44 @@ impl Response {
     }
 }
 
+/// Response header gate (header injection): `name` must be a non-empty RFC
+/// 9110 token; `value` must not hold a C0 control (HTAB allowed), DEL or NUL.
+/// Neither is echoed.
+fn check_response_header(name: &str, value: &str) -> PyResult<()> {
+    let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if name.is_empty() || !name.chars().all(token) {
+        return Err(bad_request_err(
+            "response header name must be a non-empty RFC 9110 token",
+        ));
+    }
+    if value.chars().any(|c| c.is_ascii_control() && c != '\t') {
+        return Err(bad_request_err(
+            "response header value must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
 #[pymethods]
 impl Response {
     #[new]
     #[pyo3(signature = (status, headers = None, body = None))]
-    fn new(status: u16, headers: Option<Vec<(String, String)>>, body: Option<&[u8]>) -> Self {
-        Self {
+    fn new(
+        status: u16,
+        headers: Option<Vec<(String, String)>>,
+        body: Option<&[u8]>,
+    ) -> PyResult<Self> {
+        let headers = headers.unwrap_or_default();
+        for (k, v) in &headers {
+            check_response_header(k, v)?;
+        }
+        Ok(Self {
             inner: gh::Response {
                 status,
-                headers: headers.unwrap_or_default(),
+                headers,
                 body: body.map(|b| b.to_vec()).unwrap_or_default(),
             },
-        }
+        })
     }
 
     #[getter]
@@ -306,8 +332,12 @@ impl Response {
         self.inner.headers.clone()
     }
     #[setter]
-    fn set_headers(&mut self, v: Vec<(String, String)>) {
+    fn set_headers(&mut self, v: Vec<(String, String)>) -> PyResult<()> {
+        for (k, val) in &v {
+            check_response_header(k, val)?;
+        }
         self.inner.headers = v;
+        Ok(())
     }
     #[getter]
     fn body<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
@@ -332,19 +362,28 @@ impl Response {
             .map(|(_, v)| v.clone())
     }
 
-    /// Return a copy with an extra header appended.
-    fn with_header(&self, name: String, value: String) -> Self {
-        Self::wrap(self.inner.clone().with_header(name, value))
+    /// Return a copy with an extra header appended. Raises `BadRequestError`
+    /// for an empty or non-token name or a control character in the value.
+    fn with_header(&self, name: String, value: String) -> PyResult<Self> {
+        check_response_header(&name, &value)?;
+        Ok(Self::wrap(self.inner.clone().with_header(name, value)))
     }
     /// Return a copy with the body replaced.
     fn with_body(&self, body: &[u8]) -> Self {
         Self::wrap(self.inner.clone().with_body(body.to_vec()))
     }
 
-    /// 302 redirect to `location`.
+    /// 302 redirect to `location`. Raises `BadRequestError` if it contains
+    /// whitespace, control, bidi or invisible formatting characters; no
+    /// scheme or host policy is applied.
     #[staticmethod]
-    fn redirect(location: String) -> Self {
-        Self::wrap(gh::Response::redirect(location))
+    fn redirect(location: String) -> PyResult<Self> {
+        if crate::rp::has_unsafe_uri_char(&location) {
+            return Err(bad_request_err(
+                "redirect location must not contain whitespace, control, bidi or invisible formatting characters",
+            ));
+        }
+        Ok(Self::wrap(gh::Response::redirect(location)))
     }
     /// A `text/html` response.
     #[staticmethod]

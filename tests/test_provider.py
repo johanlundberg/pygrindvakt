@@ -10,6 +10,7 @@ from conftest import ISSUER, REDIRECT_URI, TOKEN_URL, basic_auth, code_from_redi
 from pygrindvakt import (
     ConfigError,
     OAuthError,
+    client,
     jwt,
     keys,
     metadata,
@@ -17,6 +18,7 @@ from pygrindvakt import (
     provider,
     request,
     rp,
+    tokens,
     util,
 )
 
@@ -484,6 +486,28 @@ def test_minting_revalidates_deserialized_request(op):
     tampered = request.AuthorizationRequest.from_dict(stored)
     with pytest.raises(OAuthError, match="redirect_uri"):
         op.authorization_redirect(tampered, "alice")
+
+
+def test_authorization_redirect_refuses_crlf_redirect_uri_even_if_registered(op_key):
+    """Regression test: a registered redirect_uri with CRLF never reaches a Location header."""
+    evil = REDIRECT_URI + "\r\nSet-Cookie: x=1"
+    c = client.Client("crlf", client_secret="s", redirect_uris=[evil])
+    crlf_op = provider.Provider(
+        metadata.ProviderMetadata(ISSUER),
+        op_key,
+        client.InMemoryClientStore([c]),
+        tokens.TokenCodec("crlf-secret"),
+        token_use_store=provider.InMemoryTokenUseStore(),
+    )
+    base = request.AuthorizationRequest.from_params(
+        [("client_id", "crlf"), ("response_type", "code"), ("redirect_uri", REDIRECT_URI), ("scope", "openid")]
+    )
+    stored = base.to_dict()
+    stored["redirect_uri"] = evil
+    req = request.AuthorizationRequest.from_dict(stored)
+    with pytest.raises(OAuthError) as ei:
+        crlf_op.authorization_redirect(req, "alice")
+    assert ei.value.code == "invalid_request"
 
 
 def test_token_bearing_query_mode_and_empty_subject_are_rejected(op):
