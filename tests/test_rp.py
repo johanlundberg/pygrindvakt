@@ -3210,6 +3210,138 @@ def test_authorization_response_jarm_refused_by_default_accepted_raw():
         _parse([("response", "a"), ("response", "b")], accept_jarm=True)
 
 
+# --- baseline locks: behaviour that must survive delegating to the core parser ---------
+
+
+def test_authorization_response_parse_qsl_blank_duplicate_code_rejected():
+    # keep_blank_values=True keeps the empty duplicate, so it is seen and refused
+    pairs = parse_qsl("code=valid&code=&state=s", keep_blank_values=True)
+    assert pairs == [("code", "valid"), ("code", ""), ("state", "s")]
+    with pytest.raises(BadRequestError, match="code must not be repeated"):
+        _parse(pairs)
+
+
+def test_authorization_response_parse_qsl_default_hides_blank_duplicate():
+    # documents the footgun: default parse_qsl drops the blank duplicate, so callers must
+    # pass keep_blank_values=True to let the duplicate-code check see it
+    pairs = parse_qsl("code=valid&code=&state=s")
+    assert pairs == [("code", "valid"), ("state", "s")]
+
+
+_LONE_SURROGATE = "\ud800"
+_PARAMS_TYPE_MSG = "params must be an http.HttpRequestData"
+
+
+@pytest.mark.parametrize("name", ["code", "state", "iss", "error_uri", "response"])
+def test_authorization_response_lone_surrogate_pairs_type_error(name):
+    base = [] if name in ("code", "response") else [("code", "c")]
+    with pytest.raises(TypeError, match=_PARAMS_TYPE_MSG):
+        _parse([*base, (name, _LONE_SURROGATE)], accept_jarm=True)
+
+
+def test_authorization_response_lone_surrogate_error_description_pairs_type_error():
+    with pytest.raises(TypeError, match=_PARAMS_TYPE_MSG):
+        _parse([("error", "access_denied"), ("error_description", _LONE_SURROGATE)])
+
+
+@pytest.mark.parametrize("wrapper", ["multi-dict", "lists-only"])
+@pytest.mark.parametrize("key", ["code", "state", "iss"])
+def test_authorization_response_lone_surrogate_duck_type_error(wrapper, key):
+    base = {} if key == "code" else {"code": ["c"]}
+    data = {**base, key: [_LONE_SURROGATE]}
+    params = data if wrapper == "multi-dict" else _ListsOnly(data)
+    with pytest.raises(TypeError, match="parameter values must be str"):
+        rp.parse_authorization_response(params)
+
+
+def test_authorization_response_lone_surrogate_http_request_data_type_error():
+    # the TypeError comes from the HttpRequestData constructor, before any parsing
+    with pytest.raises(TypeError, match="query must be a dict"):
+        pyhttp.HttpRequestData(method="GET", query=[("code", _LONE_SURROGATE)])
+    with pytest.raises(TypeError, match="form must be a dict"):
+        pyhttp.HttpRequestData(method="POST", form=[("code", _LONE_SURROGATE)])
+
+
+def test_authorization_response_error_description_safe_exact_escapes():
+    r = _parse([("error", "x"), ("error_description", "a\x1bb\n")])
+    assert r.error_description_safe == "a\\u{001b}b\\n"
+    r = _parse([("error", "x"), ("error_description", "a\tb\rc\\d\u202e")])
+    assert r.error_description_safe == "a\\tb\\rc\\\\d\\u{202e}"
+
+
+def test_authorization_response_error_description_safe_cap_exact_length():
+    safe = _parse([("error", "x"), ("error_description", "a" * 300)]).error_description_safe
+    assert len(safe) == 256 and safe == "a" * 253 + "..."
+    exact = _parse([("error", "x"), ("error_description", "a" * 256)]).error_description_safe
+    assert exact == "a" * 256
+
+
+@pytest.mark.parametrize("name", ["code", "state", "iss"])
+def test_authorization_response_value_length_boundary_exact(name):
+    base = [] if name == "code" else [("code", "c")]
+    assert getattr(_parse([*base, (name, "a" * 2048)]), name) == "a" * 2048
+    with pytest.raises(BadRequestError, match=f"{name} must be at most 2048 characters"):
+        _parse([*base, (name, "a" * 2049)])
+
+
+def test_authorization_response_error_and_jarm_boundary_exact():
+    assert _parse([("error", "x" * 64)]).error == "x" * 64
+    with pytest.raises(BadRequestError, match="error must be at most 64 characters"):
+        _parse([("error", "x" * 65)])
+    assert _parse([("response", "a" * 32768)], accept_jarm=True).response == "a" * 32768
+    with pytest.raises(BadRequestError, match="response must be at most 32768 characters"):
+        _parse([("response", "a" * 32769)], accept_jarm=True)
+
+
+def test_authorization_response_jarm_refusal_message():
+    with pytest.raises(BadRequestError) as ei:
+        _parse([("response", "a.b.c")])
+    assert str(ei.value) == (
+        "bad request: JARM response parameter is not supported; pass accept_jarm=True only if you "
+        "verify the JWT yourself"
+    )
+
+
+def test_authorization_response_mode_mismatch_messages():
+    get = pyhttp.HttpRequestData(method="GET", query=[("code", "c")])
+    with pytest.raises(ConfigError) as ei:
+        rp.parse_authorization_response(get, response_mode="form_post")
+    assert str(ei.value) == (
+        'response_mode "form_post" does not match the request (GET is "query"); '
+        "omit response_mode for an HttpRequestData"
+    )
+    post = pyhttp.HttpRequestData(method="POST", form=[("code", "c")])
+    with pytest.raises(ConfigError) as ei:
+        rp.parse_authorization_response(post, response_mode="query")
+    assert str(ei.value) == (
+        'response_mode "query" does not match the request (POST is "form_post"); '
+        "omit response_mode for an HttpRequestData"
+    )
+
+
+def test_authorization_response_empty_post_needs_form_body_message():
+    with pytest.raises(BadRequestError) as ei:
+        rp.parse_authorization_response(pyhttp.HttpRequestData(method="POST"))
+    assert str(ei.value) == (
+        "bad request: a form_post callback needs a form body: parse the form before building the "
+        "HttpRequestData (no form parameters were found)"
+    )
+
+
+def test_authorization_response_empty_jarm_response_accepted_today():
+    # flips in the next commit: an empty JARM response will be refused
+    r = _parse([("response", "")], accept_jarm=True)
+    assert r.response == "" and r.code is None and not r.is_error
+
+
+def test_authorization_response_jarm_stub_matches_not_required_true_today():
+    # flips in the next commit: the unverified JARM stub will no longer match when required=False
+    r = _parse([("response", "a.b.c")], accept_jarm=True)
+    assert r.matches_state("x", required=False) is True
+    assert r.matches_iss("x", required=False) is True
+    assert r.matches_state("x") is False and r.matches_iss("x") is False
+
+
 # --- G6 helpers: BeginResult, TokenSet getters, claims_audiences, metadata ----------------
 
 
