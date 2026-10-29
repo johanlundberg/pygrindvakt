@@ -96,6 +96,11 @@ if info.userinfo_endpoint is not None:  # OPs may omit UserInfo
     )
 ```
 
+On the callback, parse the query with `rp.parse_authorization_response(params)`
+(fail-closed; it never exposes the raw `error_description`) before reading
+`code`. Check `state` and compare `iss` yourself. See the
+[RP guide](https://pygrindvakt.readthedocs.io/en/latest/guides/rp.html).
+
 > **Note:** `from pygrindvakt import http` shadows the standard-library `http`
 > package in that module. If you also need `http.HTTPStatus` and friends, use
 > `from pygrindvakt import http as gv_http` or `import pygrindvakt.http`.
