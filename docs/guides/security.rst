@@ -123,6 +123,91 @@ framework integrations cannot accidentally omit deployment-critical choices.
        foreign document; upstream discovery still rejects malformed modelled
        endpoints. Re-validate before you act on what ``raw`` contains.
 
+   * - ``HS256`` / ``HS384`` / ``HS512`` in ``allowed_algorithms`` with a
+       :class:`~pygrindvakt.rp.JwksCache` (also via
+       :func:`~pygrindvakt.rp.verify_id_token` or
+       :func:`~pygrindvakt.rp.fetch_userinfo`) raise
+       :class:`~pygrindvakt.ConfigError` (``code == "shared_secret_algorithm"``).
+       An ``oct`` key in a JWK Set fetched from a ``jwks_uri``
+       (:func:`~pygrindvakt.rp.fetch_jwks`, ``JwksCache``, the federation
+       JWKS helpers, including inline ``jwks`` in entity metadata) is dropped
+       with a ``UserWarning``. The drop is unconditional: it also happens when
+       ``warnings`` is configured as errors (fail-closed). The same drop
+       applies to every key set that enters federation verification: the
+       ``jwks`` of :func:`~pygrindvakt.federation.verify` /
+       ``verify_typed``, the ``trust_anchors`` map of
+       :func:`~pygrindvakt.federation.resolve_via_trust_anchors`, the
+       ``subject_fed_jwks`` of ``entity_metadata_jwks`` / ``fetch_signed_jwks``,
+       and the getters ``EntityStatement.jwks()`` and
+       ``ResolvedEntity.subject_jwks``. ``federation.verify``,
+       ``verify_typed`` and ``verify_self_signed`` also refuse a token whose
+       header ``alg`` is ``HS*`` or ``none`` with
+       :class:`~pygrindvakt.AuthnError` (``code == "symmetric_algorithm"``).
+     - OIDC Core 10.1 derives the MAC key from the ``client_secret``; an OP
+       must not publish symmetric keys. Honouring a published ``oct`` key lets
+       whoever controls the JWKS document (or its transport) mint tokens that
+       pass an ``HS*`` allow-list. In a federation, an entity that publishes
+       an ``oct`` key in its ``jwks`` would otherwise let anyone sign a
+       ``jwk-set+jwt`` or entity statement with ``HS256`` and inject an
+       attacker key as the OP's signing key. Federation entities sign with
+       asymmetric keys; symmetric keys cannot be published.
+     - None, by design (ADR 0006). Verify ``HS*`` tokens with
+       :func:`~pygrindvakt.rp.verify_id_token` and a key set you build from
+       the ``client_secret``; that path needs no flag. The filter covers key
+       sets this library fetches; a JWKS dict you fetched or assembled
+       yourself is a caller-built key set and cannot be told apart from a
+       ``client_secret``-derived one, so never feed a fetched set into an
+       ``HS*`` allow-list.
+   * - An ``HS*`` ID token (or signed UserInfo), or a token passed to
+       :func:`~pygrindvakt.jwt.verify_with_jwks` /
+       :func:`~pygrindvakt.jwt.verify_with_jwk` (since 0.3.0; these were
+       ungated before), verified against a caller-built key set whose ``oct`` key (the one the token
+       selects by ``kid``, or the only key) is shorter than the hash output
+       (32 / 48 / 64 bytes) raises :class:`~pygrindvakt.ConfigError`
+       (``code == "weak_shared_secret"``).
+     - RFC 7518 3.2 requires a key at least as long as the hash output; a short
+       client secret is brute-forceable offline from one captured token.
+     - None; use a longer ``client_secret``.
+   * - :func:`pygrindvakt.rp.parse_authorization_response` raises
+       :class:`~pygrindvakt.BadRequestError` for repeated parameters, both or
+       neither of ``code`` and ``error``, a ``form_post`` response whose
+       protocol parameters also appear in the query string (or a query
+       response whose form body carries them), control, bidi or invisible
+       characters, backslashes or more than 2048 characters in ``code`` /
+       ``state`` / ``iss``, a malformed ``error``, a JARM ``response``, and
+       plaintext parameters next to a JARM ``response``; a mapping with
+       non-list values (a plain ``dict``) raises ``TypeError``. ``error_description`` is exposed only escaped and capped
+       (``error_description_safe``); ``error_uri`` only when it is a safe
+       absolute https URL (http only for loopback), normalised.
+     - Callback parameters are attacker-influenced. A mapping or a repeated
+       parameter lets a second value hide behind the first, and a provider
+       description with ANSI, bidi or newline characters can forge log
+       lines. The response proves nothing until ``state`` is compared and
+       ``iss`` is checked (RFC 9207 mix-up defence).
+     - ``accept_jarm=True`` exposes the raw, UNVERIFIED ``response`` JWT; you
+       must verify it yourself. ``matches_state`` and ``matches_iss``
+       are the caller's job and cannot be forced; both fail closed
+       (``matches_state`` on a missing ``state``, ``matches_iss`` on a missing
+       ``iss`` unless you pass ``required=False`` for an
+       OP that does not advertise
+       ``authorization_response_iss_parameter_supported``).
+   * - :class:`~pygrindvakt.rp.DiscoveryCache` serves an expired discovery
+       document only after a failed refetch, only with ``stale_on_error=True``
+       and only up to ``max_stale`` seconds past its expiry, and only for the
+       configured issuer: a document whose ``issuer`` differs is never cached
+       or served. Its ``jwks()`` returns a :class:`~pygrindvakt.rp.JwksCache`
+       that is rebuilt (the old one never returned again) when ``jwks_uri`` or
+       issuer change, and that never serves expired keys.
+     - Unbounded stale metadata would be fail-open: an OP that moved its
+       endpoints or retired a key location would be trusted indefinitely. The
+       bound, the opt-out and the surfaced failure (a one-time
+       ``UserWarning``, ``discovery_backoff`` with the original as
+       ``__cause__``) keep it visible. Keys, the actual trust anchor of
+       ID-token verification, stay never-stale, and keys cached for one
+       ``jwks_uri`` cannot verify tokens after the OP moves it (ADR 0008).
+     - ``stale_on_error=False`` to never serve expired metadata;
+       ``max_stale`` to shorten the window. Raising ``max_stale`` widens it.
+
 If grindvakt later adopts these guards upstream, the binding's checks become
 redundant but harmless.
 
@@ -183,8 +268,8 @@ Everything else should become a generic ``server_error``:
        tr = op.handle_token_request(form_pairs, TOKEN_URL, auth_header=auth)
    except OAuthError as e:
        return to_flask(e.to_response())
-   except GrindvaktError:
-       log.exception("token endpoint failure")             # str(e) goes to the log
+   except GrindvaktError as e:
+       log.error("token endpoint failure: %s", e.log_summary)   # log only, never the client
        return to_flask(OAuthError("server_error").to_response())
 
 The structured attributes on upstream failures need the same care.
@@ -196,8 +281,40 @@ log them verbatim and never return them to end users.
 
 On the RP side the same applies to :class:`pygrindvakt.AuthnError` raised by
 :func:`~pygrindvakt.rp.exchange_code` or
-:func:`~pygrindvakt.rp.verify_id_token`: log it, show the user a generic
-"login failed" page.
+:func:`~pygrindvakt.rp.verify_id_token`: log it
+(``e.log_summary``), show the user a generic "login failed" page. Catch
+:class:`pygrindvakt.ConfigError` first: it is a deployment fault (a bad
+``auth_method``, algorithm list or ``JwksCache`` argument), not a failed login.
+Log it and re-raise, never render it as "login failed" or as a 4xx/503, so a
+broken configuration is noticed:
+
+.. code-block:: python
+
+   try:
+       ts = rp.exchange_code(http, info, client, code, code_verifier=verifier)
+       claims = rp.verify_id_token(jwks, ts.id_token, info.issuer, client.client_id, nonce, ["ES256"])
+   except ConfigError as e:
+       log.error("RP misconfigured: %s", e.log_summary)
+       raise
+   except GrindvaktError as e:
+       log.warning("login failed: %s", e.log_summary)
+       if e.retryable:                                   # OP or network trouble
+           return render_template("login_unavailable.html"), 503
+       return render_template("login_failed.html"), 401 if e.auth_failure else 400
+
+``ConfigError`` is handled before the generic branch. There, ``retryable``
+(OP or network trouble) gives 503, ``auth_failure`` gives 401 and anything
+else gives 400. The status is for monitors and clients only; the body stays
+generic and no error detail is sent to the browser.
+
+``retryable`` does not make the callback safe to replay. Popping the pending
+entry before the token exchange is not enough for strict single use: with
+Flask's default signed-cookie session an older cookie can restore the entry,
+and concurrent callbacks can each pass the state check. Keep the pending entry
+server-side and consume it in one atomic step (for example a database
+``DELETE ... RETURNING`` or a Redis ``GETDEL``). The OP rejects a code it has
+already used, which is a separate protection. After a retryable failure, start
+a new login instead of retrying the same callback.
 
 
 The redirect policy
@@ -228,6 +345,11 @@ open redirector and a phishing tool.
 
 Matching is exact, with no prefix or wildcard support, and there is no
 ``localhost`` exception.
+
+As a last guard, ``to_redirect()`` raises ``BadRequestError`` if the base
+contains whitespace, control, bidi or invisible characters or userinfo, is
+unparsable, or has a fragment (``Location`` header injection). It does not
+check registration; the exact match above remains your job.
 
 **Outbound (HTTP client).** The built-in client refuses to follow redirects,
 because a 307 / 308 from a token endpoint would re-send the form body
@@ -328,6 +450,17 @@ Python protocol adapters
    you write yourself is inside the trust boundary. The binding guarantees
    that an *exception* fails closed; it cannot guarantee that a ``consume``
    that always returns ``True`` is a bug. Test them.
+
+``DiscoveryCache(stale_on_error=True, max_stale=...)``
+   During an outage of the well-known endpoint the cache keeps serving the
+   last discovery document, up to ``max_stale`` seconds (default 24 hours)
+   past its expiry, with a one-time ``UserWarning``. The worst case is the
+   document's lifetime plus ``max_stale``: with the defaults (``max_ttl`` 24
+   hours, ``max_stale`` 24 hours) an endpoint change can go unnoticed for up
+   to about two days of an outage. That keeps login working but means
+   endpoint changes made by the OP are not seen meanwhile. Pass
+   ``stale_on_error=False`` to fail instead, or lower ``max_stale``. Keys are
+   unaffected: ``cache.jwks()`` never serves an expired key set. See ADR 0008.
 
 In-memory stores
    :class:`~pygrindvakt.provider.InMemoryTokenUseStore`,

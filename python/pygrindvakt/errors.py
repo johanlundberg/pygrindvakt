@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pygrindvakt import _native
 
+_STR_DESCRIPTION_MAX = 512
+
 
 class OAuthError(_native.GrindvaktError):
     """An OAuth 2.0 / OpenID Connect protocol error (RFC 6749 section 5.2).
@@ -20,7 +22,9 @@ class OAuthError(_native.GrindvaktError):
 
     Attributes:
         code: the OAuth error string, e.g. ``"invalid_request"``.
-        description: optional human-readable ``error_description``.
+        description: optional human-readable ``error_description``. Raw and
+            untrusted (it may carry control, bidi or tag characters);
+            ``str(exc)`` is the escaped form.
         state: the client's ``state`` value to echo back, if known.
     """
 
@@ -38,8 +42,18 @@ class OAuthError(_native.GrindvaktError):
         self.state = state
 
     def __str__(self) -> str:
+        # description is untrusted and may be attacker-influenced; escape and
+        # cap it so str(exc) is safe to log. .description stays raw.
         if self.description:
-            return f"{self.code}: {self.description}"
+            try:
+                safe = _native.escape_untrusted_text(self.description, _STR_DESCRIPTION_MAX)
+            except UnicodeEncodeError:
+                # A lone surrogate (e.g. JSON "\ud800") is not valid for the
+                # native &str. Escape it as \udXXX text and retry; str() must
+                # not raise, or a log record formatting it is lost.
+                text = self.description.encode("utf-8", "backslashreplace").decode("utf-8")
+                safe = _native.escape_untrusted_text(text, _STR_DESCRIPTION_MAX)
+            return f"{self.code}: {safe}"
         return self.code
 
     def __repr__(self) -> str:
@@ -76,5 +90,15 @@ class OAuthError(_native.GrindvaktError):
         ``Provider.validate_authorization_request`` succeeded). Pass the
         validated request's ``"query"`` or ``"fragment"`` response mode;
         there is deliberately no default.
+
+        As a header-injection guard, ``redirect_uri`` is syntax-checked first
+        and :class:`BadRequestError` is raised if it contains whitespace,
+        control, bidi or invisible formatting characters or userinfo, is
+        unparsable, or has a fragment. The message never echoes the value.
+        This does not check that the URI is registered or that its scheme is
+        acceptable: exact-match it against the client's registered URIs first.
+
+        .. versionchanged:: 0.3.0
+           Raises :class:`BadRequestError` for an invalid base ``redirect_uri``.
         """
         return _native.oauth_error_redirect(self.code, redirect_uri, response_mode, self.description, self.state)

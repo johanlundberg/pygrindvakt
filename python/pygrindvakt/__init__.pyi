@@ -72,9 +72,17 @@ class GrindvaktError(Exception):
     upstream_error: str | None
     upstream_error_description: str | None
     upstream_body: str | None
+    auth_failure: bool
+    """True for an authentication-step failure (``AuthnError``, rejected token/UserInfo request). False for ``UnknownKeyError``, the DPoP errors and metadata fetches: not a general "authentication failed" flag."""
+    retryable: bool
+    """True for upstream status >= 500 or 429, or code ``transport``, ``jwks_fetch_timeout``, ``discovery_backoff`` (which takes the ``retryable`` of the failure it is chained to), ``discovery_fetch_timeout``."""
 
-class BadRequestError(GrindvaktError):
-    """The request was malformed (400)."""
+    @property
+    def log_summary(self) -> str:
+        """One line for logs: ``Class(code=..., status_hint=n): message``. Not for clients."""
+
+class BadRequestError(GrindvaktError, ValueError):
+    """The request was malformed or an argument was invalid (400)."""
 
 class AuthnError(GrindvaktError):
     """Authentication failed somewhere in the flow (401)."""
@@ -82,8 +90,8 @@ class AuthnError(GrindvaktError):
 class StateError(GrindvaktError):
     """Flow state could not be sealed/unsealed (500)."""
 
-class ConfigError(GrindvaktError):
-    """Configuration is invalid (500)."""
+class ConfigError(GrindvaktError, ValueError):
+    """Configuration is invalid (500). Log it, never put it in a response."""
 
 class CryptoError(GrindvaktError):
     """Cryptographic / key-material failure (500)."""

@@ -1,5 +1,6 @@
 //! Bindings for `grindvakt::metadata` - the OpenID Provider discovery document.
 
+use crate::errors::config_err;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -93,16 +94,21 @@ fn is_url_member(key: &str) -> bool {
 }
 
 /// Validate an endpoint URL against the metadata's issuer (absolute, https or
-/// loopback http, no fragment, no userinfo). Always `ValueError`.
+/// loopback http, no fragment, no userinfo). Raises `ConfigError`.
 fn validate_url_member(key: &str, url: &str, issuer: &str) -> PyResult<()> {
+    crate::rp::reject_reinterpreted_url_chars(key, url)
+        .and_then(|()| crate::rp::reject_reinterpreted_url_chars("issuer", issuer))
+        .map_err(|e| config_err(format!("metadata field {key:?}: {e}")))?;
     grindvakt::rp::validate_service_endpoint_for_issuer(key, url, issuer)
-        .map_err(|e| PyValueError::new_err(format!("metadata field {key:?}: {e}")))
+        .map_err(|e| config_err(format!("metadata field {key:?}: {e}")))
 }
 
 /// Validate the issuer itself (it decides whether loopback http is allowed).
 fn validate_issuer_value(issuer: &str) -> PyResult<()> {
+    crate::rp::reject_reinterpreted_url_chars("issuer", issuer)
+        .map_err(|e| config_err(format!("metadata field \"issuer\": {e}")))?;
     grindvakt::rp::validate_issuer(issuer)
-        .map_err(|e| PyValueError::new_err(format!("metadata field \"issuer\": {e}")))
+        .map_err(|e| config_err(format!("metadata field \"issuer\": {e}")))
 }
 
 /// Validate every modelled URL member of `md` against `issuer`.
@@ -223,14 +229,12 @@ fn validate_known_value(key: &str, value: &serde_json::Value, issuer: &str) -> P
         ExtraKind::Bool => "a boolean",
         ExtraKind::Str => "a string",
     };
-    Err(PyValueError::new_err(format!(
-        "metadata field {key:?} must be {want}"
-    )))
+    Err(config_err(format!("metadata field {key:?} must be {want}")))
 }
 
 fn validate_extra_key(key: &str) -> PyResult<()> {
     if RESERVED_METADATA_FIELDS.contains(&key) {
-        return Err(PyValueError::new_err(format!(
+        return Err(config_err(format!(
             "metadata extra field {key:?} is reserved or unsupported"
         )));
     }
@@ -327,7 +331,15 @@ impl ProviderMetadata {
         validate_issuer_value(&issuer)?;
         let inner = gm::ProviderMetadata::new(issuer, &base);
         validate_modelled_urls(&inner, &inner.issuer).map_err(|e| {
-            PyValueError::new_err(format!("base {base:?} yields an invalid endpoint: {e}"))
+            // Use only the message text, not `BadRequestError: ...`.
+            let detail = Python::attach(|py| {
+                e.value(py)
+                    .str()
+                    .map_or_else(|_| e.to_string(), |s| s.to_string())
+            });
+            config_err(format!(
+                "base {base:?} yields an invalid endpoint: {detail}"
+            ))
         })?;
         Ok(Self {
             inner,
@@ -390,7 +402,8 @@ impl ProviderMetadata {
     }
 
     /// The OIDC RP-Initiated Logout `end_session_endpoint` (stored in
-    /// `extra`), or `None`. The setter validates the URL against the issuer (`ValueError`).
+    /// `extra`), or `None`. The setter validates the URL against the issuer (`ConfigError`, also a
+    /// `ValueError`).
     #[getter]
     fn end_session_endpoint(&self) -> Option<String> {
         self.extra_str("end_session_endpoint")

@@ -27,7 +27,7 @@ calling thread while it holds the GIL, so one shared across threads must be
 thread-safe itself.
 """
 
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Protocol, TypeAlias, TypeGuard
 
 class HttpClientProtocol(Protocol):
     """Outbound HTTP client protocol accepted wherever ``http=`` is taken.
@@ -82,6 +82,13 @@ class HttpRequestData:
     Build one from your framework's request object. ``headers`` keys are
     lower-cased; ``form`` is the parsed ``application/x-www-form-urlencoded``
     body.
+
+    For authorization-response (protocol) parameters build ``query`` / ``form``
+    from a list of ``(str, str)`` pairs (``request.args.items(multi=True)``): a
+    mapping discards duplicate names, and ``rp.parse_authorization_response``
+    raises ``TypeError`` for a non-empty channel built from, or last assigned,
+    a mapping. Assigning pairs to the ``query`` / ``form`` setters is accepted
+    and keeps duplicates in ``query_pairs`` / ``form_pairs``.
     """
 
     def __init__(
@@ -110,13 +117,13 @@ class HttpRequestData:
     @property
     def query(self) -> dict[str, str]: ...
     @query.setter
-    def query(self, value: dict[str, str]) -> None: ...
+    def query(self, value: dict[str, str] | list[tuple[str, str]]) -> None: ...
     @property
     def query_pairs(self) -> list[tuple[str, str]]: ...
     @property
     def form(self) -> dict[str, str]: ...
     @form.setter
-    def form(self, value: dict[str, str]) -> None: ...
+    def form(self, value: dict[str, str] | list[tuple[str, str]]) -> None: ...
     @property
     def form_pairs(self) -> list[tuple[str, str]]: ...
     @property
@@ -270,6 +277,15 @@ _FetchResult: TypeAlias = (
 _HttpArg: TypeAlias = HttpClientProtocol | ReqwestClient | None  # noqa: PYI047 (imported by other stubs)
 # What a networked function accepts as ``http`` when it sends request headers on
 # GET (``rp.fetch_userinfo(method="GET")``).
-_HttpHeadersArg: TypeAlias = (  # noqa: PYI047 (imported by other stubs)
-    HttpClientWithHeadersProtocol | HttpClientGetWithHeadersProtocol | ReqwestClient | None
-)
+_HttpHeadersArg: TypeAlias = HttpClientWithHeadersProtocol | HttpClientGetWithHeadersProtocol | ReqwestClient | None
+
+def supports_get_with_headers(client: object | None) -> TypeGuard[_HttpHeadersArg]:
+    """Whether ``client`` can send request headers on GET, without any request.
+
+    ``None`` and ``ReqwestClient`` are ``True``; any other object only if it
+    has callable ``get`` and ``post_form`` and a ``get_with_headers`` or a
+    ``get`` accepting ``headers`` by keyword. Never raises; an unsupported
+    shape is ``False``. Narrows the type for ``rp.fetch_userinfo(method="GET")``.
+
+    .. versionadded:: 0.3.0
+    """

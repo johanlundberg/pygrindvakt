@@ -66,6 +66,31 @@ requested; plain ``get`` and ``post_form`` are unaffected. The type-checking
 protocols for such a client are :class:`HttpClientWithHeadersProtocol` and
 :class:`HttpClientGetWithHeadersProtocol` (both stub-only).
 
+.. py:function:: supports_get_with_headers(client: object | None) -> TypeGuard[HttpClientWithHeadersProtocol | HttpClientGetWithHeadersProtocol | ReqwestClient | None]
+
+   Whether ``client`` can send request headers on GET, using the same test as
+   the networked functions but **without performing any request**. ``None``
+   (the built-in client) and a :class:`ReqwestClient` are ``True``. Any other
+   object is ``True`` only if it has callable ``get`` and ``post_form`` and
+   either a callable ``get_with_headers`` or a ``get`` that accepts ``headers``
+   by keyword (or ``**kwargs``). It never raises: an object of any other shape,
+   or one whose attributes raise, gives ``False``.
+
+   Call it at startup to fail early instead of on the first
+   ``rp.fetch_userinfo(method="GET")``. The ``TypeGuard`` return type narrows
+   the argument for the type checker, so no ``cast`` to
+   :class:`HttpClientWithHeadersProtocol` is needed:
+
+   .. code-block:: python
+
+      from pygrindvakt import http, rp
+
+      if not http.supports_get_with_headers(my_client):
+          raise SystemExit("my_client cannot send headers on GET; use method=\"POST\"")
+      rp.fetch_userinfo(my_client, info.userinfo_endpoint, token, sub, info.issuer, method="GET")
+
+   .. versionadded:: 0.3.0
+
 Inbound request
 ---------------
 
@@ -78,6 +103,16 @@ Inbound request
    its leading slash, ``method`` is upper-cased, and header names are
    lower-cased. ``form`` is the parsed ``application/x-www-form-urlencoded``
    body; ``body`` is the raw bytes. Every attribute is readable and writable.
+
+   ``query`` and ``form`` accept a ``dict`` (or any mapping) or a list of
+   ``(str, str)`` pairs, in the constructor and the setters. For
+   authorization-response parameters build them from pairs
+   (``request.args.items(multi=True)``): a mapping, for example
+   ``request.args.to_dict()``, keeps one value per name. The instance
+   remembers whether each channel was last set from a mapping, and
+   :func:`pygrindvakt.rp.parse_authorization_response` raises
+   :class:`TypeError` when the channel it reads is non-empty and was set from a
+   mapping. The ``query`` / ``form`` getters and :meth:`param` are unchanged.
 
    .. py:attribute:: path
       :type: str

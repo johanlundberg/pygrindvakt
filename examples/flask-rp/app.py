@@ -18,7 +18,7 @@ import os
 
 import flask
 from flask import Flask, abort, session
-from pygrindvakt import GrindvaktError, rp
+from pygrindvakt import BadRequestError, ConfigError, GrindvaktError, rp
 from pygrindvakt.http import ReqwestClient
 
 OP_ISSUER = os.environ.get("OP_ISSUER", "http://127.0.0.1:5000")
@@ -31,6 +31,11 @@ CLIENT = rp.RpClient(
 # Outbound HTTP: never follows redirects, bounded timeouts and body size.
 # Anything implementing ``pygrindvakt.http.HttpClientProtocol`` works here.
 HTTP_CLIENT = ReqwestClient()
+# Whether the OP puts ``iss`` on the authorization response (RFC 9207). The demo
+# OP does not, so this is False here. Production RPs must set it from the OP's
+# metadata: True when it advertises authorization_response_iss_parameter_supported,
+# and then ``matches_iss(required=True)`` (fail closed) is the safe default.
+OP_SENDS_ISS = False
 
 
 def provider_info() -> rp.ProviderInfo:
@@ -56,18 +61,27 @@ def create_app() -> Flask:
 
     @app.get("/callback")
     def callback():
+        # Popped first. This demo uses Flask's signed-cookie session, so an older
+        # cookie can restore the entry and concurrent callbacks can both pass the
+        # state check. For strict single use keep the entry server-side and
+        # consume it atomically.
         pending = session.pop("oidc", None)
-        args = flask.request.args
-        if pending is None or args.get("state") != pending["state"]:
+        try:
+            # items(multi=True) keeps duplicates; a plain dict would hide them.
+            resp = rp.parse_authorization_response(list(flask.request.args.items(multi=True)))
+        except BadRequestError as e:
+            app.logger.warning("bad callback: %s", e.log_summary)
+            abort(400, "malformed callback")
+        # The parse proves nothing: state and iss are still ours to check.
+        if pending is None or not resp.matches_state(pending["state"]):
             abort(400, "state mismatch")
-        if "error" in args:
-            return (
-                f"<p>The OP refused: <b>{html.escape(args['error'])}</b> {html.escape(args.get('error_description', ''))}",
-                403,
-            )
-        code = args.get("code")
-        if not code:
-            abort(400, "missing code")
+        if not resp.matches_iss(OP_ISSUER, required=OP_SENDS_ISS):
+            abort(400, "wrong issuer")
+        if resp.is_error:
+            # Log only the escaped text; no provider-supplied text goes on the page.
+            app.logger.warning("OP refused login: %s %s", resp.error, resp.error_description_safe)
+            return "<p>The OP refused the login.", 403
+        code = resp.code
         try:
             prov = provider_info()
             tokens = rp.exchange_code(HTTP_CLIENT, prov, CLIENT, code, pending["verifier"])
@@ -87,10 +101,18 @@ def create_app() -> Flask:
                 id_claims["sub"],
                 prov.issuer,
             )
+        except ConfigError as e:
+            # A deployment fault, not a failed login: log it and let it surface
+            # as a 500 instead of a user-visible 4xx/503.
+            app.logger.error("RP misconfigured: %s", e.log_summary)
+            raise
         except GrindvaktError as e:
-            # Error details stay in the server log; never echo str(e) to the browser.
-            app.logger.warning("login failed: %s", e)
-            return "<p>Login failed; please try again.", 502
+            # Error details stay in the server log; never echo them to the browser.
+            # The status is for monitors and clients only.
+            app.logger.warning("login failed: %s", e.log_summary)
+            if e.retryable:  # OP or network trouble
+                return "<p>The sign-in service is unavailable; please try again shortly.", 503
+            return "<p>Login failed; please start again.", 401 if e.auth_failure else 400
         return (
             f"<h1>Signed in as {html.escape(id_claims['sub'])}</h1>"
             f"<h2>id_token claims</h2><pre>{html.escape(json.dumps(id_claims, indent=2))}</pre>"

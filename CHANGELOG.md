@@ -7,6 +7,294 @@ needed to track the upstream `grindvakt` library and correct protocol or
 security handling. `pygrindvakt` is a thin PyO3 binding; most entries reflect
 adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
+## Unreleased
+
+### Added
+
+- `pygrindvakt.testing`: test-only helpers, plain Python shipped in the wheel and
+  not imported by `import pygrindvakt`. `StaticHttpClient(routes, *, default)`
+  (URL or `(METHOD, url)` to response or callable; responses are 4-tuples or the
+  legacy 3-tuple, other shapes raise `TypeError`; records `.calls`; never
+  follows redirects; `get_with_headers`), `ProviderHttpClient(op, issuer, ...)`
+  (bridges an RP's discovery / JWKS / token / UserInfo requests to an in-process
+  `Provider`; forwards `OAuthError` response headers; discovery and JWKS carry
+  `Cache-Control` per keyword `cache_control="max-age=300"`, `None` for none;
+  `StaticHttpClient.from_json(..., cache_control=...)` likewise; a route needs
+  headers for `JwksCache`/`DiscoveryCache` to avoid the headerless warning),
+  `RecordedRequest`,
+  `FetchResult` and `mint_id_token(key, *, issuer, client_id, ...)` (refuses
+  `extra` overriding protocol claims; `azp`, `auth_time`, `jti`, `acr`, `amr` are
+  allowed; `lifetime` must be an int > 0 and `iat` None or an int >= 0, else
+  `ValueError`). `ProviderHttpClient` sets `cache-control: no-store` and
+  `pragma: no-cache` on token success responses, accepts a form-encoded
+  `access_token` on a UserInfo POST (RFC 6750 section 2.2; together with an
+  `Authorization` header it is a 400 `invalid_request`) and answers 401 with
+  `www-authenticate: Bearer`. DPoP is NOT supported by `ProviderHttpClient`: a
+  `DPoP` header or `Authorization: DPoP` scheme on the token or UserInfo
+  endpoint raises `NotImplementedError`. `StaticHttpClient` upper-cases the
+  method in `(METHOD, url)` route keys. `RecordedRequest.__repr__` redacts
+  sensitive header and form values (`RecordedRequest.redacted()` returns a
+  redacted copy; attributes stay verbatim, redact before serialising `calls`).
+  Request headers and form pairs must be `(str, str)`, else `TypeError`.
+  A present `Authorization` header that is not exactly `Bearer <token>` is a 401
+  on UserInfo and never falls back to the form `access_token`. See
+  `docs/api/testing.rst`.
+- `rp.DiscoveryCache(http, issuer, *, default_ttl=3600, min_ttl=60, max_ttl=86400,
+  failure_backoff=10, stale_on_error=True, max_stale=86400, fetch_timeout=45.0,
+  allow_cross_origin_end_session=False)`: a thread-safe, frozen cache of one
+  issuer's discovery document with `metadata()`, `info()`
+  (`ProviderInfo.from_metadata`, built once per fetch), `jwks()` (a
+  `JwksCache` bound to the advertised `jwks_uri`, the same object across
+  refreshes and replaced only when `jwks_uri` or issuer change), `refresh()`
+  and the read-only `issuer`, `failure_backoff` and `fetch_timeout`. Lifetime
+  from `Cache-Control: max-age` minus `Age` (else `default_ttl`, clamped; the
+  same one-time warning for clients that report no headers); single flight
+  with waiters bounded by `fetch_timeout` (`InternalError`,
+  `code == "discovery_fetch_timeout"`, retryable); no request for
+  `failure_backoff` seconds after a failed fetch (`InternalError`,
+  `code == "discovery_backoff"`; its `retryable` follows the original error,
+  chained as a traceback-free `__cause__`); a waiter that times out is served
+  stale metadata under the same policy;
+  expired metadata is served after a failed refetch only with
+  `stale_on_error=True` and at most `max_stale` seconds past expiry, with a
+  one-time `UserWarning` (unlike `JwksCache`, whose keys are never stale; the
+  `JwksCache` from `jwks()` keeps that policy). A discovery document whose
+  `issuer` differs from the configured one is never cached or served.
+  `rp.discover` and `ProviderInfo.from_metadata` are unchanged. See ADR 0008.
+- `rp.parse_authorization_response(params, *, response_mode=None, accept_jarm=False)`
+  and the frozen `rp.AuthorizationResponse` (`code`, `state`, `error`,
+  `error_description_safe`, `error_uri`, `iss`, `response`, `response_mode`,
+  `is_error`, `error_known`, `matches_iss(expected, *, required=True)`,
+  `matches_state(expected, *, required=True)`): the
+  RP-side counterpart of `request.AuthorizationRequest`, parsing the callback
+  fail closed. Accepts an `http.HttpRequestData` (GET query or POST form, with
+  a guard against response parameters present in the channel that is not read,
+  both for GET and POST), a list of pairs, a `parse_qs`-shaped multi-dict or an
+  object with `.lists()` (werkzeug `MultiDict`); a mapping with non-list values
+  (a plain `dict[str, str]`) raises `TypeError` naming the key because it
+  hides duplicates, and so does an `HttpRequestData` whose read channel
+  (`query` for GET, `form` for POST) is non-empty and was built from or
+  assigned a mapping (additive tracking; `HttpRequestData` behaviour is
+  otherwise unchanged, and its `query` / `form` setters now also accept pairs).
+  Raises `BadRequestError` for
+  repeated parameters, both or neither of `code` / `error`, empty
+  `code` / `state` / `error` / `iss`,
+  control, bidi / invisible-character or over-2048-character `code` / `state`
+  / `iss`, a malformed `error` and (unless `accept_jarm=True`, which exposes
+  the raw unverified JWT, and then only as the sole protocol parameter, capped at
+  32768 characters) a JARM `response`.
+  The raw `error_description` is never exposed, only an escaped, capped
+  `error_description_safe`; `error_uri` survives only as a safe, normalised https URL (http only for loopback) with a host;
+  unknown error codes are kept (`error_known` is false; "known" is wider than
+  what `OAuthError` accepts, so never build `OAuthError(resp.error)`
+  unguarded). An empty `expected` makes `matches_iss` / `matches_state` return
+  False. `repr()` shows `response=<set>` and escapes quotes. The response proves
+  nothing: call `matches_state` (constant-time, fails closed on a missing
+  `state`) and `matches_iss` (RFC 9207, fails closed on a missing `iss` unless
+  `required=False` because the OP does not advertise
+  `authorization_response_iss_parameter_supported`) before exchanging the code. See ADR 0007.
+- `rp.validate_issuer`, `rp.validate_redirect_uri_syntax` and
+  `rp.validate_service_endpoint(name, endpoint, issuer=None, *, allow_loopback_http=False)`: the core
+  syntax validators. `validate_issuer` and `validate_service_endpoint` raise
+  `ConfigError` (integrator config / provider metadata);
+  `validate_redirect_uri_syntax` raises `BadRequestError` (it can validate
+  request input). They check shape only and establish no trust;
+  `validate_redirect_uri_syntax` additionally rejects whitespace, control,
+  bidi and invisible formatting characters and userinfo (binding-side
+  hardening, stricter than core 0.9, also applied to `RpClient`
+  `redirect_uris` / `post_logout_redirect_uris` and per-request overrides);
+  `validate_redirect_uri_syntax` does not check the scheme (`javascript:` may
+  pass). It is the syntax step of `RpClient`'s registration, exact-match and
+  transport checks (ADR 0004), not a registration policy: it is not for
+  vetting client registrations on an OP, which needs a scheme allow-list and
+  exact-match comparison of its own.
+  All three also reject backslashes (the URL parser would reinterpret them
+  as `/`, so the parsed authority differs from the raw string, for example
+  `https://evil.example\@op.example.com`); the same gate covers
+  `RpClient` / `JwksCache` / metadata issuer and endpoint URLs and
+  `OAuthError.to_redirect`. Compare issuers byte-for-byte (exact string
+  match); never suffix/substring checks.
+  `validate_service_endpoint` is strict by default (`https` only). The
+  loopback-`http` development exception is opt-in via the keyword-only
+  `allow_loopback_http=True`, which requires `issuer`: the authenticated,
+  locally configured issuer, never taken from the document being validated.
+  A loopback-`http` issuer then permits loopback endpoints on any port, and
+  accepting a plain `http` endpoint emits a `UserWarning`. Without the opt-in,
+  a given `issuer` is still validated (invalid raises `ConfigError`) but never
+  enables `http`.
+- `rp.MAX_ID_TOKEN_LEEWAY` (300), the cap `verify_id_token` enforces on
+  `leeway`, and `rp.asymmetric_algorithms()`, a fixed list of the
+  classical asymmetric JWS algorithm names the library parses (no `HS*`,
+  `none` or post-quantum names). It is a parser probe, not a recommended
+  allowlist, and includes `EdDSA`, which has no OIDC token hash.
+- `jwt.oidc_token_hash(alg, value)` and `jwt.supports_oidc_token_hash(alg)`
+  for computing `at_hash` / `c_hash`. Computing is not verifying.
+  `oidc_token_hash` raises `CryptoError` for an unknown or unparseable `alg`
+  (like the other `jwt.*` primitives) and for `EdDSA`;
+  `supports_oidc_token_hash` returns `False` for both and never raises.
+- `rp.begin()` returns a `rp.BeginResult`, a `collections.namedtuple`
+  subclass `(url, state, nonce, code_verifier)` that you can type against.
+  It is still a real `tuple` (unpacking, indexing, `==` unchanged). Its
+  `repr()` redacts `state`, `nonce` and `code_verifier` and strips the query
+  from `url`.
+- `rp.TokenSet.refresh_token`, `.expires_in` (non-negative integer up to 10 years,
+  315360000 s; a digits-only string is accepted; anything else is `None`,
+  which means "absent or not acceptable", NEVER "no expiry": apply your own
+  default lifetime and do not treat `None` as unbounded) and `.scope`,
+  read from `raw`. `repr()` shows `refresh_token=<set>` / `None`, never the
+  value.
+- `rp.claims_audiences(claims)`: `aud` as a non-empty list of non-empty
+  strings. Fails closed: a missing `aud`, `aud: []`, `aud: ""` or an
+  empty-string member raises `BadRequestError`, so `all(a in {CLIENT} for a
+  in aud)` cannot pass vacuously; other types, or strings with lone
+  surrogates, also raise `BadRequestError`. Convenience only.
+- `http.supports_get_with_headers(client)`: whether a client can send headers
+  on GET (for `rp.fetch_userinfo(method="GET")`), decided without any request
+  and without raising, so an application can fail at startup. Typed as a
+  `TypeGuard`, which removes the need for a `cast`.
+- `rp.ProviderInfo.metadata`: the discovery document a `ProviderInfo` built by
+  `from_metadata` came from, so `ProviderInfo.from_metadata(discover(...))`
+  has it (`None` for a hand-built one); `end_session_endpoint` dropped by
+  `from_metadata` can be compared with `metadata.end_session_endpoint`, and
+  `end_session_url` now says "not advertised", "rejected" or "advertised a
+  non-string value" in its `ConfigError`, from the outcome recorded when the
+  `ProviderInfo` was built. A non-string advertised `end_session_endpoint`
+  (number, object, list ...) now also emits a `UserWarning` and is ignored.
+  Every endpoint on `info.metadata` is UNVALIDATED data from the OP: never
+  send credentials to them; use the validated properties on the
+  `ProviderInfo`.
+- `rp.check_rp_compatibility(provider, *, client, pkce, algorithms, scopes,
+  acr_values, shared_secret_keys)`: advisory, pure comparison of the RP's intent with the OP's
+  advertised metadata (accepts a `ProviderInfo` or the `ProviderMetadata`
+  from `discover`); returns mismatch strings, with `not advertised:`
+  prefixed informational ones. An absent or empty
+  `token_endpoint_auth_methods_supported` assumes the spec default
+  `["client_secret_basic"]` (a real mismatch for other auth methods). Mirrors
+  ADR 0006: `algorithms` containing `none` is always a mismatch, and `HS*` is a
+  mismatch unless `shared_secret_keys=True` (key set derived from the
+  client_secret).
+
+### Security
+
+- **Behaviour change (0.3.0):** `jwt.verify_with_jwks` and `jwt.verify_with_jwk`
+  now apply the same RFC 7518 section 3.2 minimum-key-length gate as `rp.*`.
+  For a token whose header `alg` is `HS256` / `HS384` / `HS512` (and allowed
+  by the `Validation`, or any HMAC `alg` when it sets no allow-list), a
+  `oct` key the token selects (by `kid`; without one, every key jose-rs
+  would try) shorter than 32 / 48 / 64 bytes raises `ConfigError`
+  (`code == "weak_shared_secret"`), `k` that is not strict unpadded base64url
+  is refused the same way, and a selected `oct` key without an `alg` is
+  pinned to the token's `alg`. A weak `oct` key the token does not select does
+  not raise. Previously these two functions were ungated: an unpinned
+  40-byte `oct` key verified an `HS512` token (the spec needs 64), and a
+  16-byte `HS256` key was refused only by jose-rs' key-type heuristic with an
+  unrelated error. Callers using short secrets (or relying on the old
+  accidental behaviour) with `jwt.verify_with_*` must now use a long enough
+  secret; there is no opt-out. A 32-byte unpinned `HS256` key, which the
+  heuristic used to reject, now verifies. Asymmetric tokens are unaffected.
+- **Behaviour change:** `JwksCache.verify_id_token`, and `rp.verify_id_token` /
+  `rp.fetch_userinfo` given a `JwksCache`, now raise `ConfigError`
+  (`code == "shared_secret_algorithm"`) when `allowed_algorithms` contains
+  `HS256`, `HS384` or `HS512`, before any fetch and with no override. OIDC Core
+  section 10.1 derives the MAC key from the `client_secret`, so an OP's
+  published JWK Set never carries it. Verify MAC-signed ID tokens with
+  `rp.verify_id_token` and a key set you build from the `client_secret`
+  (`{"keys": [{"kty": "oct", "k": <base64url(secret)>}]}`); a caller-built key
+  set with `HS*` keeps working unchanged. See ADR 0006.
+- **Behaviour change:** a symmetric (`oct`) key in a JWK Set fetched from a
+  `jwks_uri` is dropped from the result and a `UserWarning` is emitted (once
+  per fetch). This covers `rp.fetch_jwks`, `JwksCache` (so `JwksCache.jwks()`
+  and the cached set) and the federation helpers `federation.entity_metadata_jwks`
+  / `federation.fetch_signed_jwks`. An OP must not publish symmetric keys, so a
+  dict from `rp.fetch_jwks` can no longer verify an `HS*` token.
+  `federation.entity_metadata_jwks` also filters inline `jwks` metadata. The
+  drop is unconditional: a warning filter set to "error" does not stop it.
+- **Security:** federation no longer verifies with a symmetric key. An `oct` key
+  is now dropped (with a `UserWarning`) from every key set that enters
+  federation verification: the `jwks` of `federation.verify` / `verify_typed`,
+  the `trust_anchors` map of `federation.resolve_via_trust_anchors`, the
+  `subject_fed_jwks` of `federation.entity_metadata_jwks` /
+  `federation.fetch_signed_jwks`, and the getters `EntityStatement.jwks()` and
+  `ResolvedEntity.subject_jwks`. Before, an entity that published a public
+  `oct` key could sign a `jwk-set+jwt` or entity statement with `HS256` and
+  have it accepted (injecting an attacker key as the OP's signing key).
+  `federation.verify`, `verify_typed` and `verify_self_signed` also refuse a
+  token whose header `alg` is `HS256` / `HS384` / `HS512` / `none` with
+  `AuthnError` (`code == "symmetric_algorithm"`). See ADR 0006.
+  `kty` is matched case-insensitively.
+- **Behaviour change:** for a caller-built key set and an `HS*` token,
+  `rp.verify_id_token` and `rp.fetch_userinfo` refuse an `oct` key shorter than
+  the hash output (32 / 48 / 64 bytes for `HS256` / `HS384` / `HS512`, RFC 7518
+  section 3.2) with `ConfigError` (`code == "weak_shared_secret"`; the message
+  does not contain the key); only the key the token selects (its `kid`, or
+  the only key of a one-key set) is checked, so keep weak keys out of
+  verifier sets. Previously `HS384` / `HS512` accepted any `oct`
+  key of 33 bytes or more, and a 32-byte `HS256` secret failed with a
+  `JoseError` (jose-rs took the unpinned key for an AES key). Only `oct` keys
+  usable for HMAC verification with the token's algorithm are checked (`alg`
+  absent or equal, `use` absent or `sig`, `key_ops` absent or containing
+  `verify`); `k` must be strict unpadded base64url, otherwise the same
+  `weak_shared_secret` code is raised with "invalid oct key material". The binding now
+  pins the token's `alg` on the selected unpinned `oct` key, so exactly-32-byte `HS256`
+  secrets verify. A short `client_secret` with `HS*` is now refused; use a
+  secret of at least that length. `none` stays refused when the algorithm
+  list is parsed.
+
+### Changed
+
+- Updated to `grindvakt` 0.9.1 (patch release of the 0.9 line; see its changelog).
+- The `examples/flask-rp` callback uses `rp.parse_authorization_response`
+  (duplicate-safe parsing, constant-time `state` compare, `matches_iss` via the
+  explicit `OP_SENDS_ISS` constant, no provider-supplied text on the page) and
+  is now covered by end-to-end tests in `tests/test_frameworks.py`.
+- **Warning (0.3.0):** `federation.build_entity_configuration` emits a
+  `UserWarning` when `public_jwks` contains an `oct` key (OPs and federation
+  entities must not publish symmetric keys, OIDC Core section 10.1). The key
+  is not dropped. `Provider.jwks_document()` cannot contain one (`HS*` signing
+  keys are refused at construction). `rp.fetch_jwks` documents that its `oct`
+  drop warning fires once per call (no global dedup), so the returned dict may
+  differ from the OP's document. See ADR 0006.
+
+- `OAuthError.to_redirect` now raises `BadRequestError` when the base redirect
+  URI contains whitespace/control/bidi/invisible characters or userinfo, is
+  unparsable, or has a fragment (header-injection guard); it still does NOT
+  check that the URI is registered or that the scheme is acceptable — the
+  caller must have exact-matched it against the client's registered URIs first.
+- The Flask RP example and the RP/security guides map a failed login to 503
+  (`retryable`), 401 (`auth_failure`) or 400 instead of a fixed 502.
+- `BadRequestError` and `ConfigError` now also derive from `ValueError` (MRO:
+  the class, `GrindvaktError`, `ValueError`, `Exception`). Configuration faults
+  in `rp` (`RpClient` auth options, JWS algorithm lists, negative seconds,
+  `leeway` range, `JwksCache` constructor, `ProviderInfo` / `RpClient` URLs,
+  `fetch_userinfo` options) and `ProviderMetadata` URL/extra checks raise
+  `ConfigError` (`status_hint` 500, code `config`), not `BadRequestError`;
+  `except ValueError` keeps working, `except GrindvaktError` now catches them.
+  Catch `ConfigError` first, log `e.log_summary` and re-raise: it is a
+  deployment fault, never a user-visible 4xx or 503. `BadRequestError` (400)
+  stays for values that may come from a request (unregistered
+  `redirect_uri` / `post_logout_redirect_uri` overrides, reserved `extra`
+  parameters). Still plain `ValueError` (follow-up):
+  `ProviderMetadata.from_dict`/`from_json` parse failures, rp `extra` and
+  `extra_params`, `parse_oauth_code`/`oauth_error_redirect`, and the `client`,
+  `tokens`, `dpop`, `provider`, `request` and `http` modules.
+- `str(OAuthError)` now escapes control, bidi, invisible-format and tag
+  characters in the description and caps it at 512 characters (behaviour
+  change). `OAuthError.description` remains raw and untrusted; the wire output
+  of `to_response()` / `to_redirect()` is unchanged. `log_summary` now escapes
+  the full invisible-character set of grindvakt (tag characters, variation
+  selectors and more), not just bidi and zero-width characters.
+- `ProviderMetadata(issuer, base)` no longer embeds the nested exception type
+  name in its "invalid endpoint" message.
+
+### Added
+
+- `GrindvaktError.auth_failure` (from `Error::is_auth_failure()`; true for
+  `AuthnError`), `GrindvaktError.retryable` (upstream status >= 500 or 429, or
+  code `transport`, `jwks_fetch_timeout`, `discovery_backoff`) and the
+  `GrindvaktError.log_summary` property (safe to log, not to send to clients).
+  `retryable` is never derived from an upstream-supplied `code`: an IdP
+  answering `error=transport` with HTTP 400/401 stays non-retryable.
+
 ## [0.2.0] - 2026-10-13
 
 ### Breaking

@@ -1,6 +1,6 @@
 """Tests for ``pygrindvakt.rp`` - the relying-party side of OIDC.
 
-An in-process ``Provider`` plays the upstream OP; a ``FakeHttpClient`` routes
+An in-process ``Provider`` plays the upstream OP; a ``testing.ProviderHttpClient`` routes
 the RP's outbound requests straight into it, so the full code flow
 (discovery -> authorization -> code exchange -> id_token -> userinfo) runs
 without any network.
@@ -8,10 +8,16 @@ without any network.
 
 from __future__ import annotations
 
+import base64
+import copy
+import hashlib
+import hmac
 import json
+import os
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit
+import warnings
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import pytest
 from pygrindvakt import (
@@ -21,6 +27,7 @@ from pygrindvakt import (
     CryptoError,
     GrindvaktError,
     InternalError,
+    JoseError,
     OAuthError,
     client,
     jwt,
@@ -33,6 +40,8 @@ from pygrindvakt import (
     tokens,
     util,
 )
+from pygrindvakt import http as pyhttp
+from pygrindvakt.testing import ProviderHttpClient, StaticHttpClient
 
 ISSUER = "https://op.example.com"
 CLIENT_ID = "demo"
@@ -40,81 +49,7 @@ CLIENT_SECRET = "s3cret"
 REDIRECT_URI = "https://rp.example.com/cb"
 
 
-def in_thread(fn, *args, **kwargs):
-    """Run ``fn`` on a fresh thread and return its result (re-raising errors).
-
-    Not required (pygrindvakt runs re-entrant calls on a helper thread itself;
-    see ``tests/test_adapters.py``), but it mirrors the real topology: a real
-    OP runs in its own process, so its endpoints run off the RP's thread here.
-    """
-    box: dict = {}
-
-    def run():
-        try:
-            box["value"] = fn(*args, **kwargs)
-        except BaseException as e:  # noqa: BLE001 - re-raised below
-            box["error"] = e
-
-    t = threading.Thread(target=run)
-    t.start()
-    t.join()
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
-
-
 ALT_REDIRECT_URI = "https://rp.example.com/alt-cb"
-
-
-class FakeHttpClient:
-    """An ``HttpClient`` protocol object that dispatches into an in-process OP."""
-
-    def __init__(self, op):
-        self.op = op
-        self.calls: list[tuple[str, str]] = []
-        self.forms: list[list[tuple[str, str]]] = []
-
-    @staticmethod
-    def _json(value, status=200):
-        return status, json.dumps(value).encode(), "application/json"
-
-    @staticmethod
-    def _oauth_error(e: OAuthError):
-        resp = e.to_response()
-        return resp.status, resp.body, resp.header("content-type")
-
-    def get(self, url):
-        self.calls.append(("GET", url))
-        if url == f"{ISSUER}/.well-known/openid-configuration":
-            return self._json(self.op.discovery_document())
-        if url == f"{ISSUER}/jwks":
-            return self._json(self.op.jwks_document())
-        return 404, b"not found", "text/plain"
-
-    def post_form(self, url, form, headers):
-        self.calls.append(("POST", url))
-        self.forms.append(list(form))
-        hdrs = {k.lower(): v for k, v in headers}
-        if url == f"{ISSUER}/token":
-            try:
-                tr = in_thread(
-                    self.op.handle_token_request,
-                    list(form),
-                    f"{ISSUER}/token",
-                    auth_header=hdrs.get("authorization"),
-                )
-            except OAuthError as e:
-                return self._oauth_error(e)
-            return self._json(tr.to_dict())
-        if url == f"{ISSUER}/userinfo":
-            auth = hdrs.get("authorization", "")
-            if not auth.startswith("Bearer "):
-                return 401, b"", None
-            try:
-                return self._json(in_thread(self.op.userinfo, auth[len("Bearer ") :]))
-            except OAuthError as e:
-                return self._oauth_error(e)
-        return 404, b"not found", "text/plain"
 
 
 class RaisingHttpClient:
@@ -152,7 +87,7 @@ def op(op_key):
 
 @pytest.fixture
 def http(op):
-    return FakeHttpClient(op)
+    return ProviderHttpClient(op, ISSUER)
 
 
 @pytest.fixture
@@ -199,7 +134,7 @@ def test_discover_returns_metadata_for_issuer(http):
     md = rp.discover(http, ISSUER)
     assert isinstance(md, metadata.ProviderMetadata)
     assert md.issuer == ISSUER
-    assert http.calls == [("GET", f"{ISSUER}/.well-known/openid-configuration")]
+    assert [(r.method, r.url) for r in http.calls] == [("GET", f"{ISSUER}/.well-known/openid-configuration")]
 
 
 def test_discover_with_trailing_slash(http):
@@ -229,14 +164,11 @@ def test_discover_fails_closed_when_http_client_raises():
 def test_discover_rejects_issuer_mismatch(op):
     """The issuer in the returned document must match the requested one."""
 
-    class Liar(FakeHttpClient):
-        def get(self, url):
-            doc = self.op.discovery_document()
-            doc["issuer"] = "https://evil.example.com"
-            return self._json(doc)
-
+    doc = op.discovery_document()
+    doc["issuer"] = "https://evil.example.com"
+    liar = StaticHttpClient.from_json({f"{ISSUER}/.well-known/openid-configuration": doc})
     with pytest.raises(AuthnError, match="does not match"):
-        rp.discover(Liar(op), ISSUER)
+        rp.discover(liar, ISSUER)
 
 
 def test_fetch_jwks_returns_one_key(http, prov):
@@ -648,7 +580,7 @@ def test_begin_pkce_false(prov, rpc):
 
 def test_begin_pkce_false_refused_for_public_client(prov):
     public = rp.RpClient("public", REDIRECT_URI, auth_method="none")
-    with pytest.raises(BadRequestError, match="PKCE"):
+    with pytest.raises(ConfigError, match="PKCE"):
         rp.begin(prov, public, pkce=False)
     url, *_ = rp.begin(prov, public)
     assert "code_challenge" in parse_qs(urlsplit(url).query)
@@ -729,7 +661,7 @@ def test_exchange_code_with_client_secret_post(op, prov):
     )
     verifier = util.random_token(48)
     code = run_authorization(op2, prov, rpc, "st", "n", verifier)
-    ts = rp.exchange_code(FakeHttpClient(op2), prov, rpc, code, verifier)
+    ts = rp.exchange_code(ProviderHttpClient(op2, ISSUER), prov, rpc, code, verifier)
     assert ts.id_token
 
 
@@ -1009,7 +941,7 @@ def test_private_key_jwt_client_authenticates(op, http, prov, rp_key):
         tokens.TokenCodec("op-secret"),
         token_use_store=provider.InMemoryTokenUseStore(),
     )
-    http2 = FakeHttpClient(op2)
+    http2 = ProviderHttpClient(op2, ISSUER)
     rpc = rp.RpClient("jwt-client", REDIRECT_URI, auth_method="private_key_jwt", signing_key=rp_key)
     verifier = util.random_token(48)
     code = run_authorization(op2, prov, rpc, "st", "n", verifier)
@@ -1411,7 +1343,7 @@ def test_provider_info_carries_end_session_endpoint_from_discovery(op, op_key):
         tokens.TokenCodec("s"),
         token_use_store=provider.InMemoryTokenUseStore(),
     )
-    discovered = rp.discover(FakeHttpClient(op2), ISSUER)
+    discovered = rp.discover(ProviderHttpClient(op2, ISSUER), ISSUER)
     assert discovered.end_session_endpoint == f"{ISSUER}/logout"
     assert discovered.raw is not None and discovered.raw["end_session_endpoint"] == f"{ISSUER}/logout"
     info = rp.ProviderInfo.from_metadata(discovered)
@@ -1468,8 +1400,9 @@ def test_from_metadata_drops_unsafe_end_session_endpoint():
         info = rp.ProviderInfo.from_metadata(md)
         assert info.end_session_endpoint is None
         assert info.token_endpoint == f"{ISSUER}/token"
-        with pytest.raises(ConfigError, match="different origin than the issuer"):
+        with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata") as ei:
             rp.end_session_url(info)
+        assert bad not in str(ei.value)
 
 
 def _pi(endpoint, issuer=ISSUER, **kw):
@@ -1517,7 +1450,7 @@ def test_end_session_cross_origin_rejected_and_dropped(ep):
         _pi(ep)
     info = rp.ProviderInfo.from_metadata(_raw_md(ep))
     assert info.end_session_endpoint is None
-    with pytest.raises(ConfigError, match="different origin than the issuer"):
+    with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata"):
         rp.end_session_url(info, id_token_hint="tok")
 
 
@@ -1555,7 +1488,7 @@ class _NoEndSession:
 
 
 def test_end_session_constructor_error_says_cross_origin():
-    with pytest.raises(BadRequestError, match="different origin"):
+    with pytest.raises(ConfigError, match="different origin"):
         _pi("https://evil.example/logout")
 
 
@@ -1629,6 +1562,98 @@ def _raw_md(bad):
     return rp.discover(Http(), ISSUER)
 
 
+def _raw_md_value(value):
+    """discover() output whose end_session_endpoint is ``value`` (any JSON)."""
+
+    class Http:
+        def get(self, url):
+            doc = metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": value}
+            return 200, json.dumps(doc).encode(), "application/json"
+
+        def post_form(self, url, form, headers):
+            raise AssertionError
+
+    return rp.discover(Http(), ISSUER)
+
+
+_NOT_ADVERTISED = "does not advertise end_session_endpoint"
+_REJECTED = "advertised value was rejected by ProviderInfo.from_metadata"
+_INVALID_TYPE = "advertised a non-string end_session_endpoint"
+
+
+@pytest.mark.parametrize(
+    ("value", "warn_match", "wording"),
+    [
+        (123, r"non-string value \(number\) and was ignored", _INVALID_TYPE),
+        (True, r"non-string value \(bool\) and was ignored", _INVALID_TYPE),
+        ({"a": 1}, r"non-string value \(object\) and was ignored", _INVALID_TYPE),
+        (["https://op.example.com/l"], r"non-string value \(array\) and was ignored", _INVALID_TYPE),
+        ("", "unsafe", _REJECTED),
+        ("https://evil.example/logout", "different origin", _REJECTED),
+        (None, None, _NOT_ADVERTISED),
+    ],
+)
+def test_end_session_outcome_warning_and_wording(value, warn_match, wording):
+    md = _raw_md_value(value)
+    if warn_match is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            info = rp.ProviderInfo.from_metadata(md)
+    else:
+        with pytest.warns(UserWarning, match=warn_match) as rec:
+            info = rp.ProviderInfo.from_metadata(md)
+        assert len(rec) == 1
+    assert info.end_session_endpoint is None
+    with pytest.raises(ConfigError, match=wording) as ei:
+        rp.end_session_url(info)
+    msg = str(ei.value)
+    # the other two outcome wordings must not leak in
+    for other in {_NOT_ADVERTISED, _REJECTED, _INVALID_TYPE} - {wording}:
+        assert other not in msg
+    if wording != _NOT_ADVERTISED:
+        assert "UNTRUSTED" in msg and "never redirect" in msg
+    assert "evil.example" not in msg and "123" not in msg
+
+
+def test_end_session_absent_is_not_advertised():
+    md = rp.discover(_NoEndSession_with_post(), ISSUER)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        info = rp.ProviderInfo.from_metadata(md)
+    with pytest.raises(ConfigError, match=_NOT_ADVERTISED):
+        rp.end_session_url(info)
+
+
+class _NoEndSession_with_post(_NoEndSession):
+    def post_form(self, url, form, headers):
+        raise AssertionError
+
+
+def test_end_session_invalid_type_warning_is_not_an_error_under_filter():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        info = rp.ProviderInfo.from_metadata(_raw_md_value(123))
+    assert info.end_session_endpoint is None
+
+
+def test_metadata_endpoints_are_unvalidated_but_from_metadata_rejects_unsafe_loudly():
+    """info.metadata.<endpoint> is raw OP data; unsafe userinfo is refused at build time."""
+    for bad in ["http://op.example.com/ui", "https://u:p@op.example.com/ui"]:
+        doc = metadata.ProviderMetadata(ISSUER).to_dict() | {"userinfo_endpoint": bad}
+
+        class Http:
+            def get(self, url, doc=doc):
+                return 200, json.dumps(doc).encode(), "application/json"
+
+            def post_form(self, url, form, headers):
+                raise AssertionError
+
+        with pytest.raises(GrindvaktError):
+            rp.ProviderInfo.from_metadata(rp.discover(Http(), ISSUER))
+    # No way to make info.metadata.userinfo_endpoint differ from
+    # info.userinfo_endpoint: from_metadata raises instead of dropping it.
+
+
 def _logout_client(*uris):
     return rp.RpClient(CLIENT_ID, REDIRECT_URI, post_logout_redirect_uris=list(uris))
 
@@ -1698,12 +1723,17 @@ def test_end_session_url_unregistered_post_logout_rejected(lprov):
         AFTER.replace("rp.", "RP."),
         "HTTPS://rp.example.com/after",
         AFTER + "?next=1",
-        AFTER + " ",
     ],
 )
 def test_end_session_url_near_miss_rejected(lprov, near):
     with pytest.raises(BadRequestError, match="registered on the client"):
         rp.end_session_url(lprov, client=_logout_client(AFTER), post_logout_redirect_uri=near)
+
+
+def test_end_session_url_trailing_space_rejected_as_syntax(lprov):
+    # Whitespace is rejected by the binding's syntax check before the exact-match step.
+    with pytest.raises(BadRequestError, match="whitespace"):
+        rp.end_session_url(lprov, client=_logout_client(AFTER), post_logout_redirect_uri=AFTER + " ")
 
 
 def test_end_session_url_hint_only_post_logout_rejected(lprov):
@@ -1732,9 +1762,9 @@ def test_end_session_url_request_value_cannot_bypass(lprov):
 
 
 def test_end_session_url_post_logout_syntax_still_validated(lprov):
-    with pytest.raises(BadRequestError):
+    with pytest.raises(ConfigError):
         _logout_client(AFTER + "#frag")
-    with pytest.raises(BadRequestError):
+    with pytest.raises(ConfigError):
         _logout_client("relative/path")
     # Without post_logout_redirect_uri nothing changes.
     rp.end_session_url(lprov, client=_logout_client(AFTER), id_token_hint="h")
@@ -1759,7 +1789,7 @@ def test_end_session_url_rejects_reserved_extras_and_empty(lprov):
         f"{ISSUER}/token",
         end_session_endpoint=f"{ISSUER}/logout?state=x",
     )
-    with pytest.raises(BadRequestError, match="library-controlled"):
+    with pytest.raises(ConfigError, match="library-controlled"):
         rp.end_session_url(p)
 
 
@@ -1806,7 +1836,7 @@ def test_verify_strict_hashes(op_key):
     assert _vo(op_key, claims, access_token=at, strict_hashes=True)["sub"] == "alice"
     with pytest.raises(AuthnError, match="c_hash"):
         _vo(op_key, _co(c_hash="x"), strict_hashes=True)
-    # No values and no hash claims: nothing required, no BadRequestError.
+    # No values and no hash claims: nothing required, no ConfigError.
     assert _vo(op_key, _co(), strict_hashes=True)["sub"] == "alice"
     # Default unchanged.
     assert _vo(op_key, claims)["sub"] == "alice"
@@ -1850,7 +1880,7 @@ def test_verify_strict_hashes_requires_claims_when_values_given(op_key):
     assert _vo(op_key, only_at, access_token=at, require_at_hash=True, strict_hashes=True)["sub"] == "alice"
     with pytest.raises(AuthnError, match="missing at_hash"):
         _vo(op_key, _co(), access_token=at, require_at_hash=True, strict_hashes=True)
-    with pytest.raises(BadRequestError, match="require_at_hash needs an access_token"):
+    with pytest.raises(ConfigError, match="require_at_hash needs an access_token"):
         _vo(op_key, _co(), require_at_hash=True, strict_hashes=True)
     # strict_hashes off: absent claim still accepted.
     assert _vo(op_key, _co(), access_token=at, authorization_code=code)["sub"] == "alice"
@@ -1868,7 +1898,7 @@ def test_verify_leeway_makes_expired_token_pass(op_key):
 
 def test_verify_leeway_above_300_rejected(op_key):
     assert _vo(op_key, _co(), leeway=300)["sub"] == "alice"
-    with pytest.raises(BadRequestError, match="leeway"):
+    with pytest.raises(ConfigError, match="leeway"):
         _vo(op_key, _co(), leeway=301)
     with pytest.raises(ValueError, match="negative"):
         _vo(op_key, _co(), leeway=-1)
@@ -1903,7 +1933,7 @@ def test_verify_acr_allow_list(op_key):
         _vo(op_key, _co(acr="pwd"), acr_values=["mfa"])
     with pytest.raises(AuthnError, match="acr"):
         _vo(op_key, _co(), acr_values=["mfa"])
-    with pytest.raises(BadRequestError, match="acr_values"):
+    with pytest.raises(ConfigError, match="acr_values"):
         _vo(op_key, _co(acr="mfa"), acr_values=[])
 
 
@@ -1926,10 +1956,10 @@ def test_verify_require_at_hash(op_key):
     assert _vo(op_key, _co(at_hash=_half_hash(at)), access_token=at, require_at_hash=True)["sub"] == "alice"
 
 
-def test_verify_require_at_hash_without_access_token_is_bad_request(op_key):
-    with pytest.raises(BadRequestError, match="require_at_hash"):
+def test_verify_require_at_hash_without_access_token_is_config_error(op_key):
+    with pytest.raises(ConfigError, match="require_at_hash"):
         _vo(op_key, _co(at_hash="x"), require_at_hash=True)
-    with pytest.raises(BadRequestError, match="require_c_hash"):
+    with pytest.raises(ConfigError, match="require_c_hash"):
         _vo(op_key, _co(c_hash="x"), require_c_hash=True)
 
 
@@ -1974,3 +2004,1619 @@ def test_verify_trusted_additional_audience_keyword(op_key):
     with pytest.raises(AuthnError, match="untrusted audience"):
         _vo(op_key, multi)
     assert _vo(op_key, multi, trusted_additional_audiences=["https://api.example"])["sub"] == "alice"
+
+
+# ---- validators and limits ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "issuer", ["https://op.example.com", "https://op.example.com/tenant", "http://localhost:8080", "http://127.0.0.1"]
+)
+def test_validate_issuer_accepts(issuer):
+    assert rp.validate_issuer(issuer) is None
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "http://op.example.com",
+        "https://op.example.com/?a=b",
+        "https://op.example.com/#frag",
+        "https://user@op.example.com",
+        "op.example.com",
+        "https://op.example.com/\u200b",
+        "https://evil.example\\@op.example.com",
+        "https://op.example.com\\path",
+    ],
+)
+def test_validate_issuer_rejects(issuer):
+    with pytest.raises(ConfigError):
+        rp.validate_issuer(issuer)
+
+
+def test_validate_redirect_uri_syntax_is_syntax_only():
+    assert rp.validate_redirect_uri_syntax("https://rp.example.com/cb") is None
+    assert rp.validate_redirect_uri_syntax("com.example.app:/cb") is None
+    # Documented: the scheme is not checked, so this is NOT a safety check.
+    assert rp.validate_redirect_uri_syntax("javascript:alert(1)") is None
+    assert rp.validate_redirect_uri_syntax("http://attacker.example/cb") is None
+    for bad in ("/relative", "https://rp.example.com/cb#frag", ""):
+        with pytest.raises(BadRequestError):
+            rp.validate_redirect_uri_syntax(bad)
+
+
+BAD_REDIRECT_URIS = [
+    "https://rp.example.com/cb\r\nX: 1",
+    "https://rp.example.com/a\tb",
+    " https://rp.example.com/cb",
+    "https://rp.example.com/cb\n",
+    "https://rp.example.com/\u200b",
+    "https://rp.ex\u00adample.com/cb",
+    "https://good.example@evil.example/cb",
+    "https://u:p@rp.example.com/cb",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_REDIRECT_URIS)
+def test_validate_redirect_uri_syntax_rejects_hostile(bad):
+    with pytest.raises(BadRequestError) as ei:
+        rp.validate_redirect_uri_syntax(bad)
+    assert "evil.example" not in str(ei.value)
+
+
+@pytest.mark.parametrize("ok", ["com.example.app:/cb", "https://rp.example.com/cb?x=1", "http://127.0.0.1:8080/cb"])
+def test_validate_redirect_uri_syntax_accepts(ok):
+    assert rp.validate_redirect_uri_syntax(ok) is None
+
+
+def test_rpclient_rejects_hostile_redirect_uris():
+    bad = "https://rp.example.com/cb\r\nX: 1"
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", redirect_uris=[bad])
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", post_logout_redirect_uris=[bad])
+
+
+def test_per_request_redirect_uri_override_rejects_hostile(prov):
+    bad = "https://rp.example.com/cb\r\nX: 1"
+    for allow in (False, True):
+        c = rp.RpClient(CLIENT_ID, REDIRECT_URI, allow_unregistered_redirect_uri=allow)
+        with pytest.raises(BadRequestError):
+            rp.authorization_url(prov, c, "st", "n", redirect_uri=bad)
+
+
+def test_validate_service_endpoint_with_and_without_issuer():
+    assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/token") is None
+    for bad in ("http://op.example.com/token", "http://localhost/token", "/token"):
+        with pytest.raises(ConfigError, match="token_endpoint"):
+            rp.validate_service_endpoint("token_endpoint", bad)
+    # Not a same-origin check: another https host passes.
+    assert rp.validate_service_endpoint("token_endpoint", "https://other.example/token", ISSUER) is None
+    assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", issuer=ISSUER) is None
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["http://127.0.0.1:9200/_search", "http://[::1]:6379/", "http://LocalHost:25/smtp"]
+)
+def test_validate_service_endpoint_loopback_http_rejected_by_default(endpoint):
+    # Even with a loopback issuer, no opt-in means strict https only.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ConfigError):
+            rp.validate_service_endpoint("token_endpoint", endpoint, "http://localhost")
+        with pytest.raises(ConfigError):
+            rp.validate_service_endpoint("token_endpoint", endpoint, "http://localhost", allow_loopback_http=False)
+        with pytest.raises(ConfigError):
+            rp.validate_service_endpoint("token_endpoint", endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["http://127.0.0.1:9200/_search", "http://[::1]:6379/", "http://LocalHost:25/smtp"]
+)
+def test_validate_service_endpoint_opt_in_loopback_warns(endpoint):
+    # String validation cannot tell an attacker-supplied http://localhost from
+    # a configured one, hence explicit opt-in and a loud warning.
+    with pytest.warns(UserWarning, match="development-only") as rec:
+        assert (
+            rp.validate_service_endpoint("token_endpoint", endpoint, "http://localhost", allow_loopback_http=True)
+            is None
+        )
+    assert "explicitly" in str(rec[0].message)
+
+
+def test_validate_service_endpoint_opt_in_requires_issuer():
+    with pytest.raises(ConfigError, match="requires issuer"):
+        rp.validate_service_endpoint("token_endpoint", "http://localhost:8080/t", allow_loopback_http=True)
+    with pytest.raises(ConfigError, match="requires issuer"):
+        rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", allow_loopback_http=True)
+
+
+@pytest.mark.parametrize(
+    "bad_issuer", ["", "not a url", "https://op.example.com?x=1", "https://u@op.example.com", "/rel"]
+)
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_validate_service_endpoint_rejects_invalid_issuer(bad_issuer, opt_in):
+    with pytest.raises(ConfigError):
+        rp.validate_service_endpoint(
+            "token_endpoint", "https://op.example.com/token", bad_issuer, allow_loopback_http=opt_in
+        )
+
+
+def test_validate_service_endpoint_https_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", ISSUER) is None
+        assert rp.validate_service_endpoint("token_endpoint", "https://x.example/t", "http://localhost") is None
+        assert rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t") is None
+        for issuer in (ISSUER, "http://localhost"):
+            assert (
+                rp.validate_service_endpoint("token_endpoint", "https://x.example/t", issuer, allow_loopback_http=True)
+                is None
+            )
+
+
+def test_validate_service_endpoint_non_loopback_issuer_rejects_http():
+    with pytest.raises(ConfigError):
+        rp.validate_service_endpoint("token_endpoint", "http://127.0.0.1:9200/x", ISSUER)
+    with pytest.raises(ConfigError):
+        rp.validate_service_endpoint("token_endpoint", "http://127.0.0.1:9200/x", ISSUER, allow_loopback_http=True)
+
+
+def test_validate_service_endpoint_allow_loopback_http_is_keyword_only():
+    with pytest.raises(TypeError):
+        rp.validate_service_endpoint("token_endpoint", "https://op.example.com/t", ISSUER, True)  # type: ignore[call-arg]
+
+
+def test_max_id_token_leeway_matches_verify_cap(op_key):
+    assert rp.MAX_ID_TOKEN_LEEWAY == 300
+    assert _vo(op_key, _co(), leeway=rp.MAX_ID_TOKEN_LEEWAY)["sub"] == "alice"
+    with pytest.raises(ConfigError, match="leeway"):
+        _vo(op_key, _co(), leeway=rp.MAX_ID_TOKEN_LEEWAY + 1)
+
+
+def test_asymmetric_algorithms(op_key):
+    algs = rp.asymmetric_algorithms()
+    assert isinstance(algs, list) and algs
+    assert all(isinstance(a, str) for a in algs)
+    assert len(set(algs)) == len(algs)
+    assert not {"HS256", "HS384", "HS512", "none"} & set(algs)
+    assert not any(a.startswith("HS") or a.lower() == "none" for a in algs)
+    assert {"RS256", "PS256", "ES256", "EdDSA"} <= set(algs)
+    for alg in algs:
+        assert isinstance(jwt.supports_oidc_token_hash(alg), bool)
+    # Every name passes the allowed_algorithms parser (a bad name is a ConfigError before the token is read).
+    for alg in algs:
+        with pytest.raises(GrindvaktError) as exc:
+            rp.verify_id_token(op_key.to_public_jwks(), "not.a.jwt", ISSUER, CLIENT_ID, "n", [alg])
+        assert not isinstance(exc.value, ConfigError), alg
+    with pytest.raises(ConfigError):
+        rp.verify_id_token(op_key.to_public_jwks(), "not.a.jwt", ISSUER, CLIENT_ID, "n", ["bogus"])
+
+
+BACKSLASH_URLS = ["https://evil.example\\@op.example.com", "https://op.example.com\\path"]
+
+
+@pytest.mark.parametrize("bad", BACKSLASH_URLS)
+def test_backslash_urls_rejected_everywhere(bad):
+    with pytest.raises(ConfigError) as ei:
+        rp.validate_issuer(bad)
+    assert "backslash" in str(ei.value) and "evil.example" not in str(ei.value)
+    for loopback in (False, True):
+        with pytest.raises(ConfigError) as ei:
+            rp.validate_service_endpoint("token_endpoint", bad, "http://localhost", allow_loopback_http=loopback)
+        assert "backslash" in str(ei.value) and "evil.example" not in str(ei.value)
+    with pytest.raises(BadRequestError) as ei:
+        rp.validate_redirect_uri_syntax(bad)
+    assert "backslash" in str(ei.value) and "evil.example" not in str(ei.value)
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", redirect_uris=[bad])
+    with pytest.raises(ConfigError):
+        rp.RpClient("cid", "https://rp.example.com/cb", post_logout_redirect_uris=[bad])
+    e = OAuthError("invalid_request")
+    for mode in ("query", "fragment"):
+        with pytest.raises(BadRequestError) as ei:
+            e.to_redirect(bad, mode)
+        assert "evil.example" not in str(ei.value)
+
+
+@pytest.mark.parametrize("loopback", [False, True])
+def test_validate_service_endpoint_rejects_backslash_in_issuer_arg(loopback):
+    with pytest.raises(ConfigError, match="backslash"):
+        rp.validate_service_endpoint(
+            "token_endpoint", "https://op.example.com/t", "https://op.example.com\\x", allow_loopback_http=loopback
+        )
+
+
+def test_backslash_gate_leaves_accepted_forms_unchanged():
+    assert rp.validate_issuer("https://op.example.com/path") is None
+    assert rp.validate_service_endpoint("t", "https://op.example.com/path") is None
+    assert rp.validate_redirect_uri_syntax("com.example.app:/cb") is None
+
+
+# --- shared-secret (HS*) algorithms and published JWKS (ADR 0006) ----------------
+
+HS_HASHES = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+HS_MIN = {"HS256": 32, "HS384": 48, "HS512": 64}
+
+
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _mac_token(secret: bytes, alg="HS256", kid="c", claims=None):
+    """Sign an id_token by hand, so secrets shorter than the minimum can be used."""
+    header = {"alg": alg, "typ": "JWT"}
+    if kid is not None:
+        header["kid"] = kid
+    h = _b64u(json.dumps(header).encode())
+    p = _b64u(json.dumps(claims or _co()).encode())
+    sig = hmac.new(secret, f"{h}.{p}".encode(), HS_HASHES[alg]).digest()
+    return f"{h}.{p}.{_b64u(sig)}"
+
+
+def _oct_set(secret: bytes, **extra):
+    return {"keys": [{"kty": "oct", "k": _b64u(secret), "kid": "c", **extra}]}
+
+
+def _verify_hs(jwks, token, alg="HS256"):
+    return rp.verify_id_token(jwks, token, ISSUER, CLIENT_ID, "n", [alg])
+
+
+def _json_response(value, headers=(("cache-control", "max-age=300"),)):
+    return 200, json.dumps(value).encode(), "application/json", list(headers)
+
+
+def _headerless_warnings(record):
+    """Recorded warnings that are the one-time 'reports no response headers' one."""
+    return [w for w in record if "reports no response headers" in str(w.message)]
+
+
+class OctJwksHttp(ProviderHttpClient):
+    """An OP that (wrongly) publishes a symmetric key next to its signing key."""
+
+    secret = b"s" * 64
+
+    def _answer(self, request):
+        if request.method == "GET" and request.url == f"{ISSUER}/jwks":
+            doc = self.op.jwks_document()
+            return _json_response({"keys": [*doc["keys"], *_oct_set(self.secret)["keys"]]})
+        return super()._answer(request)
+
+
+@pytest.mark.parametrize(
+    ("alg", "size"),
+    [("HS256", 32), ("HS256", 33), ("HS256", 64), ("HS384", 48), ("HS512", 64), ("HS512", 100)],
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_hs_id_token_verifies_with_caller_built_oct_set(alg, size, pinned):
+    """OIDC Core 10.1: the caller builds the key set from the client_secret."""
+    secret = os.urandom(size)
+    jwks = _oct_set(secret, **({"alg": alg} if pinned else {}))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        claims = _verify_hs(jwks, _mac_token(secret, alg), alg)
+    assert claims["sub"] == "alice"
+    # A key without kid is used for a token without kid too.
+    del jwks["keys"][0]["kid"]
+    assert _verify_hs(jwks, _mac_token(secret, alg, kid=None), alg)["sub"] == "alice"
+
+
+def test_hs_poc_with_real_signing_key_roundtrip():
+    secret = b"client-secret-with-at-least-32-bytes!"
+    sk = keys.signing_key_from_jwk({"kty": "oct", "k": _b64u(secret)}, alg="HS256", kid="c")
+    token = jwt.sign(sk, _co())
+    assert _verify_hs(_oct_set(secret), token)["sub"] == "alice"
+
+
+def test_hs_wrong_secret_fails_verification():
+    token = _mac_token(b"a" * 40)
+    with pytest.raises(GrindvaktError):
+        _verify_hs(_oct_set(b"b" * 40), token)
+
+
+@pytest.mark.parametrize(
+    ("alg", "size"),
+    [
+        ("HS256", 1),
+        ("HS256", 16),
+        ("HS256", 24),
+        ("HS256", 31),
+        ("HS384", 32),
+        ("HS384", 47),
+        ("HS512", 48),
+        ("HS512", 63),
+    ],
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_hs_weak_shared_secret_refused(alg, size, pinned):
+    """RFC 7518 3.2: a key shorter than the hash output is a ConfigError, key not echoed."""
+    secret = bytes(range(1, size + 1))
+    jwks = _oct_set(secret, **({"alg": alg} if pinned else {}))
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(secret, alg), alg)
+    assert exc.value.code == "weak_shared_secret"
+    assert isinstance(exc.value, ValueError)
+    assert exc.value.status_hint == 500
+    assert f"{alg} needs a shared secret of at least {HS_MIN[alg]} bytes" in str(exc.value)
+    assert _b64u(secret) not in str(exc.value) and _b64u(secret) not in repr(exc.value)
+
+
+def test_hs_weak_check_considers_only_the_key_named_by_kid():
+    good = b"g" * 40
+    jwks = {"keys": [{"kty": "oct", "k": _b64u(b"short"), "kid": "other"}, _oct_set(good)["keys"][0]]}
+    assert _verify_hs(jwks, _mac_token(good))["sub"] == "alice"
+    # F3: no kid on the token and several keys. verify_id_token itself refuses
+    # that (OIDC Core 10.1) with an authn error, so the weak key never raises.
+    with pytest.raises(AuthnError) as exc:
+        _verify_hs(jwks, _mac_token(good, kid=None))
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+
+
+def _ec_plus_weak_oct(op_key, **extra):
+    weak = {"kty": "oct", "k": _b64u(b"short"), "kid": "legacy", **extra}
+    return {"keys": [*op_key.to_public_jwks()["keys"], weak]}
+
+
+def test_hs_weak_oct_not_selected_by_kid_is_not_a_config_error(op_key):
+    """F3 PoC: an anonymous HS256 token naming the OP's EC key must not 500 as weak_shared_secret."""
+    jwks = _ec_plus_weak_oct(op_key)
+    token = _mac_token(b"x" * 40, kid="op-1")
+    with pytest.raises(JoseError) as exc:
+        _verify_hs(jwks, token)
+    assert not isinstance(exc.value, ConfigError)
+    assert exc.value.code == "jose"
+    assert "does not match token header alg" in str(exc.value)
+    with pytest.raises(JoseError) as exc:
+        jwt.verify_with_jwks(jwks, token, jwt.Validation().with_allowed_algorithms(["HS256"]))
+    assert not isinstance(exc.value, ConfigError)
+    assert exc.value.code == "jose"
+    # A kid that names no key fails as an authn error, not a config fault.
+    with pytest.raises(AuthnError) as exc:
+        _verify_hs(jwks, _mac_token(b"x" * 40, kid="nope"))
+    assert exc.value.code == "authn"
+
+
+def test_hs_weak_oct_selected_by_kid_is_still_a_config_error(op_key):
+    """Residual: a weak oct key in a verifier set is selectable by its kid."""
+    jwks = _ec_plus_weak_oct(op_key)
+    token = _mac_token(b"short", kid="legacy")
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, token)
+    assert exc.value.code == "weak_shared_secret"
+    with pytest.raises(ConfigError) as exc:
+        jwt.verify_with_jwks(jwks, token, jwt.Validation().with_allowed_algorithms(["HS256"]))
+    assert exc.value.code == "weak_shared_secret"
+
+
+def test_hs_kidless_token_single_weak_oct_key_is_a_config_error():
+    weak = b"short"
+    jwks = {"keys": [{"kty": "oct", "k": _b64u(weak)}]}
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(weak, kid=None))
+    assert exc.value.code == "weak_shared_secret"
+
+
+def test_hs_kidless_token_multi_key_set_is_not_a_config_error(op_key):
+    jwks = _ec_plus_weak_oct(op_key)
+    with pytest.raises(AuthnError) as exc:
+        _verify_hs(jwks, _mac_token(b"short", kid=None))
+    assert exc.value.code == "authn"
+
+
+def test_hs_good_oct_named_by_kid_in_mixed_set_verifies(op_key):
+    good = b"g" * 32
+    jwks = {"keys": [*_ec_plus_weak_oct(op_key)["keys"], {"kty": "oct", "k": _b64u(good), "kid": "good"}]}
+    before = copy.deepcopy(jwks)
+    assert _verify_hs(jwks, _mac_token(good, kid="good"))["sub"] == "alice"
+    assert jwks == before
+
+
+def test_hs_only_the_allowed_algorithm_is_used():
+    """An HS256 token is not verified when only ES256 is allowed (algorithm confusion)."""
+    secret = b"x" * 40
+    with pytest.raises(GrindvaktError):
+        rp.verify_id_token(_oct_set(secret), _mac_token(secret), ISSUER, CLIENT_ID, "n", ["ES256"])
+    # And the weak-key check does not fire for an algorithm that was not allowed.
+    with pytest.raises(GrindvaktError) as exc:
+        rp.verify_id_token(_oct_set(b"x"), _mac_token(b"x" * 40), ISSUER, CLIENT_ID, "n", ["ES256"])
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+
+
+@pytest.mark.parametrize("alg", ["none", "None", "NONE"])
+def test_none_algorithm_is_refused_at_parse(op_key, alg):
+    token = jwt.sign(op_key, _co())
+    with pytest.raises(ConfigError, match="invalid JWS algorithm") as exc:
+        rp.verify_id_token(op_key.to_public_jwks(), token, ISSUER, CLIENT_ID, "n", [alg])
+    assert exc.value.code == "config"
+    cache = rp.JwksCache(StaticHttpClient({}), f"{ISSUER}/jwks", ISSUER)
+    with pytest.raises(ConfigError, match="invalid JWS algorithm"):
+        cache.verify_id_token(token, CLIENT_ID, "n", [alg])
+
+
+def test_fetch_jwks_drops_oct_keys_and_warns_once(op, op_key):
+    http = OctJwksHttp(op, ISSUER)
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored") as record:
+        jwks = rp.fetch_jwks(http, f"{ISSUER}/jwks", ISSUER)
+    assert len(record) == 1
+    assert [k["kty"] for k in jwks["keys"]] == ["EC"]
+    assert jwks["keys"][0]["kid"] == "op-1"
+    # The published oct key can never vouch for an HS256 token.
+    token = _mac_token(OctJwksHttp.secret, kid="c")
+    with pytest.raises(AuthnError, match="kid"):
+        _verify_hs(jwks, token)
+    with pytest.raises(GrindvaktError):
+        _verify_hs(jwks, _mac_token(OctJwksHttp.secret, kid=None))
+    # RS/ES tokens still verify against the filtered set.
+    es = jwt.sign(op_key, _co())
+    assert rp.verify_id_token(jwks, es, ISSUER, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+
+
+def test_fetch_jwks_clean_set_has_no_warning(http, prov):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        jwks = rp.fetch_jwks(http, prov.jwks_uri, prov.issuer)
+    assert [k["kid"] for k in jwks["keys"]] == ["op-1"]
+
+
+def test_oct_jwks_subclass_keeps_get_with_headers_and_recording(op):
+    http = OctJwksHttp(op, ISSUER)
+    status, body, _, _ = http.get_with_headers(f"{ISSUER}/jwks", [("X-Probe", "1")])
+    assert status == 200 and b'"oct"' in body
+    assert http.get(f"{ISSUER}/jwks")[0] == 200
+    assert [(r.method, r.url) for r in http.calls] == [("GET", f"{ISSUER}/jwks")] * 2
+    assert http.calls[0].header("x-probe") == "1"
+    # Non-overridden URLs still reach the base class.
+    assert http.get_with_headers(f"{ISSUER}/.well-known/openid-configuration", [])[0] == 200
+
+
+def test_fetched_jwks_only_oct_gives_empty_set_that_verifies_nothing(op):
+    only_oct = StaticHttpClient.from_json({f"{ISSUER}/jwks": _oct_set(OctJwksHttp.secret)})
+    with pytest.warns(UserWarning, match="symmetric"):
+        jwks = rp.fetch_jwks(only_oct, f"{ISSUER}/jwks", ISSUER)
+    assert jwks == {"keys": []}
+    with pytest.raises(GrindvaktError):
+        _verify_hs(jwks, _mac_token(OctJwksHttp.secret))
+
+
+def test_jwks_cache_refuses_hs_algorithms_without_fetching(op):
+    http = OctJwksHttp(op, ISSUER)
+    cache = rp.JwksCache(http, f"{ISSUER}/jwks", ISSUER)
+    token = _mac_token(OctJwksHttp.secret)
+    for algs in (["HS256"], ["ES256", "HS384"], ["HS512"]):
+        with pytest.raises(ConfigError) as exc:
+            cache.verify_id_token(token, CLIENT_ID, "n", algs)
+        assert exc.value.code == "shared_secret_algorithm"
+        assert "client_secret" in str(exc.value) and "10.1" in str(exc.value)
+        # The same through rp.verify_id_token with a cache as the key set.
+        with pytest.raises(ConfigError) as exc:
+            rp.verify_id_token(cache, token, ISSUER, CLIENT_ID, "n", algs)
+        assert exc.value.code == "shared_secret_algorithm"
+    assert http.calls == []
+
+
+def test_jwks_cache_fetch_drops_oct_keys_and_warns(op, op_key):
+    http = OctJwksHttp(op, ISSUER)
+    cache = rp.JwksCache(http, f"{ISSUER}/jwks", ISSUER)
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored") as record:
+        jwks = cache.jwks()
+    assert len([w for w in record if "symmetric" in str(w.message)]) == 1
+    assert _headerless_warnings(record) == []
+    assert [k["kty"] for k in jwks["keys"]] == ["EC"]
+    with warnings.catch_warnings(record=True) as again:  # cached: no second fetch, no second warning
+        warnings.simplefilter("always")
+        cache.jwks()
+        es = jwt.sign(op_key, _co())
+        assert cache.verify_id_token(es, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+        assert rp.verify_id_token(cache, es, ISSUER, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+    assert [str(w.message) for w in again] == []
+
+
+def test_userinfo_hs256_with_caller_built_set_and_cache_refusal(op):
+    secret = b"u" * 40
+    sk = keys.signing_key_from_jwk({"kty": "oct", "k": _b64u(secret)}, alg="HS256", kid="c")
+    body = jwt.sign(sk, _jwt_claims()).encode()
+    c = UserinfoRecorder(body=body, ctype="application/jwt")
+    out = ui(
+        c,
+        jwks=_oct_set(secret),
+        client_id=CLIENT_ID,
+        allowed_algorithms=["HS256"],
+        trust="untyped_shared_key_compat",
+    )
+    assert out["sub"] == "alice" and out["name"] == "A"
+    # A weak secret is refused here as well.
+    weak = _mac_token(b"w" * 8, claims=_jwt_claims())
+    with pytest.raises(ConfigError) as exc:
+        ui(
+            UserinfoRecorder(body=weak.encode(), ctype="application/jwt"),
+            jwks=_oct_set(b"w" * 8),
+            client_id=CLIENT_ID,
+            allowed_algorithms=["HS256"],
+            trust="untyped_shared_key_compat",
+        )
+    assert exc.value.code == "weak_shared_secret"
+    # A JwksCache never carries the MAC key: refused before any request.
+    cache = rp.JwksCache(OctJwksHttp(op, ISSUER), f"{ISSUER}/jwks", ISSUER)
+    rec = UserinfoRecorder(body=body, ctype="application/jwt")
+    with pytest.raises(ConfigError) as exc:
+        ui(
+            rec,
+            jwks=cache,
+            client_id=CLIENT_ID,
+            allowed_algorithms=["HS256"],
+            trust="untyped_shared_key_compat",
+        )
+    assert exc.value.code == "shared_secret_algorithm"
+    assert rec.calls == []
+
+
+def test_federation_published_jwks_drops_oct_keys():
+    from pygrindvakt import federation
+
+    class Serves:
+        def get(self, url):
+            return 200, json.dumps(_oct_set(b"f" * 40)).encode(), "application/json"
+
+        def post_form(self, *a):
+            return 404, b"", "text/plain"
+
+    meta = {"jwks_uri": f"{ISSUER}/jwks"}
+    with pytest.warns(UserWarning, match="symmetric"):
+        out = federation.entity_metadata_jwks(Serves(), meta, ISSUER, {"keys": []})
+    assert out == {"keys": []}
+
+
+def test_hs_incompatible_oct_keys_are_not_candidates():
+    """Enc-only / other-alg oct keys are neither length-checked nor pinned."""
+    good = b"g" * 40
+    enc = {"kty": "oct", "k": _b64u(b"e" * 16), "alg": "A128KW"}
+    enc_use = {"kty": "oct", "k": _b64u(b"e" * 16), "use": "enc"}
+    enc_ops = {"kty": "oct", "k": _b64u(b"e" * 16), "key_ops": ["encrypt"]}
+    unpinned_enc = {"kty": "oct", "k": _b64u(b"f" * 40), "use": "enc"}
+    other_alg = {"kty": "oct", "k": _b64u(b"e" * 16), "alg": "HS384"}
+    jwks = {"keys": [enc, enc_use, enc_ops, unpinned_enc, other_alg, _oct_set(good)["keys"][0]]}
+    before = copy.deepcopy(jwks)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _verify_hs(jwks, _mac_token(good))["sub"] == "alice"
+    assert jwks == before
+    # Without a kid jose-rs itself refuses a multi-key set; that is not a weak-secret error.
+    with pytest.raises(GrindvaktError) as exc:
+        _verify_hs(jwks, _mac_token(good, kid=None))
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+    assert jwks == before
+
+
+def test_hs_no_candidate_keys_fails_normally():
+    jwks = {"keys": [{"kty": "oct", "k": _b64u(b"e" * 16), "use": "enc"}]}
+    with pytest.raises(GrindvaktError) as exc:
+        _verify_hs(jwks, _mac_token(b"e" * 40, kid=None))
+    assert getattr(exc.value, "code", None) != "weak_shared_secret"
+
+
+def test_hs_kid_scoped_selection_ignores_incompatible_key_with_other_kid():
+    good = b"g" * 40
+    jwks = {
+        "keys": [
+            {"kty": "oct", "k": _b64u(b"e" * 16), "kid": "c", "use": "enc"},
+            {"kty": "oct", "k": _b64u(good), "kid": "d"},
+        ]
+    }
+    assert _verify_hs(jwks, _mac_token(good, kid="d"))["sub"] == "alice"
+
+
+def test_hs_uppercase_oct_kty_weak_key_refused_deterministically():
+    secret = b"short"
+    jwks = {"keys": [{"kty": "OCT", "k": _b64u(secret), "kid": "c"}]}
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(secret))
+    assert exc.value.code == "weak_shared_secret"
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        lambda k: k + "\n",
+        lambda k: k[:5] + "=" + k[5:],
+        lambda k: k + "==",
+        lambda k: k[:5] + "+" + k[6:],
+        lambda k: k[:5] + "/" + k[6:],
+        lambda k: k[:5] + " " + k[6:],
+        lambda k: k[:-1],  # n % 4 == 1
+    ],
+)
+def test_hs_invalid_oct_key_material_refused(mangle):
+    secret = b"g" * 40
+    k = mangle(_b64u(secret))
+    jwks = {"keys": [{"kty": "oct", "k": k, "kid": "c"}]}
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(jwks, _mac_token(secret))
+    assert exc.value.code == "weak_shared_secret"
+    assert "invalid oct key material" in str(exc.value)
+    assert k not in str(exc.value) and k not in repr(exc.value)
+
+
+def test_hs_31_byte_secret_with_stray_chars_not_counted_as_32():
+    secret = b"g" * 31
+    k = _b64u(secret) + "=="
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs({"keys": [{"kty": "oct", "k": k, "kid": "c"}]}, _mac_token(secret))
+    assert exc.value.code == "weak_shared_secret"
+
+
+@pytest.mark.parametrize(("alg", "n"), [("HS256", 32), ("HS384", 48), ("HS512", 64)])
+def test_hs_exact_boundary(alg, n):
+    ok = b"b" * n
+    assert _verify_hs(_oct_set(ok), _mac_token(ok, alg), alg)["sub"] == "alice"
+    bad = b"b" * (n - 1)
+    with pytest.raises(ConfigError) as exc:
+        _verify_hs(_oct_set(bad), _mac_token(bad, alg), alg)
+    assert exc.value.code == "weak_shared_secret"
+
+
+def test_fetch_jwks_drops_uppercase_oct_kty(op, op_key):
+    class UpperOct(OctJwksHttp):
+        def get(self, url):
+            if url == f"{ISSUER}/jwks":
+                doc = self.op.jwks_document()
+                oct_key = {**_oct_set(self.secret)["keys"][0], "kty": "OCT"}
+                return _json_response({"keys": [*doc["keys"], oct_key]})
+            return super(OctJwksHttp, self).get(url)
+
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored"):
+        jwks = rp.fetch_jwks(UpperOct(op, ISSUER), f"{ISSUER}/jwks", ISSUER)
+    assert all(k["kty"] != "OCT" for k in jwks["keys"])
+
+
+# --- authorization response (callback) parsing ---------------------------------
+
+
+def _parse(pairs, **kw):
+    return rp.parse_authorization_response(pairs, **kw)
+
+
+def test_authorization_response_round_trip_with_provider(op, prov, rpc):
+    """A real OP redirect parses; state round-trips and the code is exchangeable."""
+    state, verifier = "st-123", "v" * 48
+    url = rp.authorization_url(prov, rpc, state, "n-1", pkce.s256_challenge(verifier))
+    req = request.AuthorizationRequest.from_params(parse_qsl(urlsplit(url).query))
+    op.validate_authorization_request(req)
+    resp = op.authorization_redirect(req, "alice", {"email": ["a@b"]})
+    pairs = parse_qsl(urlsplit(resp.header("location")).query, keep_blank_values=True)
+    parsed = rp.parse_authorization_response(pairs)
+    assert not parsed.is_error
+    assert parsed.state == state and parsed.matches_state(state)
+    assert not parsed.matches_state("st-124")
+    assert parsed.code and parsed.error is None
+    assert parsed.response_mode == "query"
+    # This in-process Provider does not emit RFC 9207 `iss`; absent fails
+    # closed unless the caller opts out (OP does not advertise the parameter).
+    assert parsed.iss is None
+    assert not parsed.matches_iss(ISSUER)
+    assert parsed.matches_iss(ISSUER, required=False)
+    with_iss = rp.parse_authorization_response([*pairs, ("iss", ISSUER)])
+    assert with_iss.matches_iss(ISSUER)
+    # The code is usable.
+    ts = rp.exchange_code(ProviderHttpClient(op, ISSUER), prov, rpc, parsed.code, code_verifier=verifier)
+    assert ts.id_token
+
+
+def test_matches_state_equal_and_different():
+    r = _parse([("code", "c"), ("state", "abc123")])
+    assert r.matches_state("abc123") is True
+    assert r.matches_state("abc124") is False
+    assert r.matches_state("ABC123") is False
+    assert r.matches_state("") is False
+
+
+def test_matches_state_different_length():
+    r = _parse([("code", "c"), ("state", "abc123")])
+    assert r.matches_state("abc12") is False
+    assert r.matches_state("abc1234") is False
+    assert r.matches_state("abc123" * 100) is False
+
+
+def test_matches_state_absent_fails_closed():
+    r = _parse([("code", "c")])
+    assert r.state is None
+    assert r.matches_state("abc") is False
+    assert r.matches_state("abc", required=True) is False
+    assert r.matches_state("abc", required=False) is True
+
+
+def test_matches_state_present_ignores_required():
+    r = _parse([("code", "c"), ("state", "abc")])
+    assert r.matches_state("abc", required=False) is True
+    assert r.matches_state("xyz", required=False) is False
+
+
+def test_matches_state_unicode():
+    r = _parse([("code", "c"), ("state", "t\u00e4st-\u2603-\U0001f600")])
+    assert r.matches_state("t\u00e4st-\u2603-\U0001f600")
+    assert not r.matches_state("tast-\u2603-\U0001f600")
+    # NFC vs NFD are different byte strings: no normalisation.
+    assert not r.matches_state("ta\u0308st-\u2603-\U0001f600")
+
+
+def test_matches_state_requires_str():
+    r = _parse([("code", "c"), ("state", "abc")])
+    with pytest.raises(TypeError):
+        r.matches_state(b"abc")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        r.matches_state(None)  # type: ignore[arg-type]
+
+
+def test_matches_state_repr_never_prints_state():
+    r = _parse([("code", "c"), ("state", "sekrit-state")])
+    assert "sekrit-state" not in repr(r)
+    assert "state=<set>" in repr(r)
+
+
+def test_authorization_response_op_error_redirect():
+    e = OAuthError("access_denied", "user said no", "st-1")
+    loc = e.to_redirect(REDIRECT_URI, "query").header("location")
+    parsed = rp.parse_authorization_response(parse_qsl(urlsplit(loc).query))
+    assert parsed.is_error and parsed.error == "access_denied" and parsed.error_known
+    assert parsed.state == "st-1" and parsed.code is None
+    assert parsed.error_description_safe == "user said no"
+
+
+def test_authorization_response_http_request_get():
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "c1"), ("state", "s1"), ("iss", ISSUER)])
+    r = rp.parse_authorization_response(req)
+    assert (r.code, r.state, r.iss, r.response_mode) == ("c1", "s1", ISSUER, "query")
+
+
+def test_authorization_response_http_request_post_form_post():
+    req = pyhttp.HttpRequestData(method="POST", form=[("code", "c1"), ("state", "s1")])
+    r = rp.parse_authorization_response(req)
+    assert r.response_mode == "form_post" and r.code == "c1"
+    # unrelated query parameters are fine
+    req = pyhttp.HttpRequestData(method="POST", query=[("utm", "x")], form=[("code", "c1")])
+    assert rp.parse_authorization_response(req).code == "c1"
+
+
+@pytest.mark.parametrize("name", ["code", "state", "error", "error_description", "error_uri", "iss", "response"])
+def test_authorization_response_post_query_smuggle_rejected(name):
+    req = pyhttp.HttpRequestData(method="POST", query=[(name, "x")], form=[("code", "c1")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req, accept_jarm=True)
+
+
+def test_authorization_response_http_request_mapping_query_refused():
+    # PoC: a dict has already dropped any duplicate `code`.
+    req = pyhttp.HttpRequestData(method="GET", query={"code": "ATTACKER", "state": "S"})
+    with pytest.raises(TypeError, match=r"HttpRequestData\.query was built from a mapping"):
+        rp.parse_authorization_response(req)
+
+
+def test_authorization_response_http_request_mapping_form_refused():
+    req = pyhttp.HttpRequestData(method="POST", form={"code": "c1", "state": "s1"})
+    with pytest.raises(TypeError, match=r"HttpRequestData\.form was built from a mapping"):
+        rp.parse_authorization_response(req)
+
+
+def test_authorization_response_http_request_empty_mapping_not_refused():
+    req = pyhttp.HttpRequestData(method="GET", query={}, form={"utm": "x"})
+    with pytest.raises(BadRequestError) as exc:
+        rp.parse_authorization_response(req)  # neither code nor error
+    assert not isinstance(exc.value, TypeError)
+    post = pyhttp.HttpRequestData(method="POST", query={}, form=[("code", "c1")])
+    assert rp.parse_authorization_response(post).code == "c1"
+    # a non-protocol mapping in the channel that is not read is harmless
+    other = pyhttp.HttpRequestData(method="POST", query={"utm": "x"}, form=[("code", "c1")])
+    assert rp.parse_authorization_response(other).code == "c1"
+
+
+def test_authorization_response_http_request_pairs_duplicates_still_bad_request():
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "a"), ("code", "b")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req)
+    post = pyhttp.HttpRequestData(method="POST", form=[("code", "a"), ("code", "b")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(post)
+
+
+def test_authorization_response_http_request_setter_tracks_mapping():
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "a"), ("code", "b")])
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req)
+    req.query = {"code": "a"}  # the old bypass: now refused, not accepted
+    with pytest.raises(TypeError):
+        rp.parse_authorization_response(req)
+    req.query = [("code", "a"), ("state", "s")]
+    assert rp.parse_authorization_response(req).code == "a"
+    assert req.query_pairs == [("code", "a"), ("state", "s")]
+    req.query = [("code", "a"), ("code", "b")]
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(req)
+    post = pyhttp.HttpRequestData(method="POST", form=[("code", "c")])
+    post.form = {"code": "c"}
+    with pytest.raises(TypeError, match=r"HttpRequestData\.form"):
+        rp.parse_authorization_response(post)
+    post.form = [("code", "c")]
+    assert rp.parse_authorization_response(post).code == "c"
+
+
+def test_authorization_response_http_request_other_method_and_mode_mismatch():
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(pyhttp.HttpRequestData(method="PUT", form=[("code", "c")]))
+    req = pyhttp.HttpRequestData(method="GET", query=[("code", "c")])
+    with pytest.raises(ConfigError):
+        rp.parse_authorization_response(req, response_mode="form_post")
+    assert rp.parse_authorization_response(req, response_mode="query").response_mode == "query"
+
+
+def test_authorization_response_multi_dict_input():
+    r = rp.parse_authorization_response({"code": ["c1"], "state": ["s1"]}, response_mode="fragment")
+    assert (r.code, r.state, r.response_mode) == ("c1", "s1", "fragment")
+    parsed = rp.parse_authorization_response(dict(parse_qs("code=c1&state=s1&iss=https%3A%2F%2Fop.example.com")))
+    assert parsed.iss == ISSUER
+    # duplicates survive flattening and are then rejected
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response({"code": ["a", "b"]})
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response({"code": ["a"], "state": ["x", "y"]})
+
+
+def test_authorization_response_plain_dict_is_type_error():
+    with pytest.raises(TypeError, match=r"non-list value for key 'code'.*plain dict"):
+        rp.parse_authorization_response({"code": "c1", "state": "s1"})
+    with pytest.raises(TypeError):
+        rp.parse_authorization_response("code=c1")
+    with pytest.raises(TypeError):
+        rp.parse_authorization_response({"code": [1]})
+
+
+def test_authorization_response_response_mode_validated():
+    with pytest.raises(ConfigError):
+        _parse([("code", "c")], response_mode="web_message")
+    for m in ("query", "fragment", "form_post"):
+        assert _parse([("code", "c")], response_mode=m).response_mode == m
+
+
+@pytest.mark.parametrize("name", ["code", "state", "error", "error_description", "error_uri", "iss"])
+def test_authorization_response_duplicate_parameter_rejected(name):
+    base = [("code", "c")] if name != "code" else []
+    with pytest.raises(BadRequestError):
+        _parse([*base, (name, "a"), (name, "b")])
+    with pytest.raises(BadRequestError):
+        _parse([*base, (name, "a"), (name, "a")])
+
+
+def test_authorization_response_code_and_error_rules():
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("error", "access_denied")])
+    with pytest.raises(BadRequestError):
+        _parse([("state", "s")])
+    with pytest.raises(BadRequestError):
+        _parse([])
+    for name in ("code", "state", "error"):
+        pairs = [("code", "c"), ("state", "s")] if name != "error" else [("error", "x")]
+        pairs = [(k, v) for k, v in pairs if k != name] + [(name, "")]
+        if name == "state":
+            pairs.append(("code", "c"))
+        with pytest.raises(BadRequestError):
+            _parse(pairs)
+
+
+def test_authorization_response_error_charset_and_length():
+    for bad in ('say "hi"', "a\\b", "caf\u00e9", "a\nb", "x" * 65, "\u202e"):
+        with pytest.raises(BadRequestError):
+            _parse([("error", bad)])
+    assert _parse([("error", "x" * 64)]).error == "x" * 64
+    assert _parse([("error", "weird code!")]).error == "weird code!"
+
+
+def test_authorization_response_error_known_and_unknown_kept():
+    for code in (
+        "access_denied",
+        "invalid_request",
+        "server_error",
+        "login_required",
+        "interaction_required",
+        "invalid_dpop_proof",
+    ):
+        assert _parse([("error", code)]).error_known, code
+    unk = _parse([("error", "totally_new_error"), ("state", "s")])
+    assert unk.error == "totally_new_error" and unk.error_known is False and unk.is_error
+
+
+def test_authorization_response_error_description_escaped_and_capped():
+    desc = "evil\u202e\x1b[31m\ninjected\u200b\u2066"
+    r = _parse([("error", "access_denied"), ("error_description", desc)])
+    safe = r.error_description_safe
+    assert "\u202e" not in safe and "\x1b" not in safe and "\n" not in safe
+    assert "\u200b" not in safe and "\u2066" not in safe
+    assert "\\u{202e}" in safe and "\\n" in safe
+    long = _parse([("error", "x"), ("error_description", "a" * 5000)]).error_description_safe
+    assert len(long) <= 256 and long.endswith("...")
+    assert _parse([("error", "x")]).error_description_safe is None
+    with pytest.raises(AttributeError):
+        _parse([("error", "x"), ("error_description", "d")]).error_description  # noqa: B018
+
+
+def test_authorization_response_error_uri_handling():
+    ok = "https://op.example.com/docs/err?x=1"
+    assert _parse([("error", "x"), ("error_uri", ok)]).error_uri == ok
+    # the NORMALISED form is returned, not the raw string
+    norm = {
+        "https:evil.example/x": "https://evil.example/x",
+        "HTTPS://OP.Example.COM:443/a/../b": "https://op.example.com/b",
+        "http://127.0.0.1:8080/x": "http://127.0.0.1:8080/x",
+        "http://localhost/x": "http://localhost/x",
+    }
+    for raw, expected in norm.items():
+        assert _parse([("error", "x"), ("error_uri", raw)]).error_uri == expected, raw
+    long_ok = "https://op.example.com/" + "a" * (2048 - len("https://op.example.com/"))
+    assert _parse([("error", "x"), ("error_uri", long_ok)]).error_uri == long_ok
+    for bad in (
+        # plain http only for loopback (transport rule); no issuer-origin binding
+        "http://attacker.example/x",
+        "http://op.example.com",
+        "http://op.example.com/e",
+        "https://op.example.com/" + "a" * 2048,
+        long_ok + "a",
+        "http:/\\evil",
+        "http:\\\\evil.example",
+        "https://user:pw@op.example.com/x",
+        "not a url",
+        "/relative",
+        "https://good.example@evil.example/x",
+        "https://op.example.com/a\\b",
+        "https://op.example.com/a\r\nb",
+        "https://op.example.com/a b",
+        "javascript:alert(1)",
+        "https://op.example.com/x#frag",
+        "https://op.example.com/\u202e",
+        "",
+    ):
+        assert _parse([("error", "x"), ("error_uri", bad)]).error_uri is None, bad
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["a\r\nb", "a\nb", "a\x00b", "a\\b", "a\tb", "a\x7fb", "a\u202eb", "a\u200bb", "a\u2066b", "a\ufeffb", "a\u2028b"],
+)
+def test_authorization_response_code_state_iss_control_chars_rejected(bad):
+    with pytest.raises(BadRequestError):
+        _parse([("code", bad)])
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("state", bad)])
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("iss", bad)])
+
+
+@pytest.mark.parametrize("name", ["code", "state", "iss"])
+def test_authorization_response_value_length_caps(name):
+    base = [] if name == "code" else [("code", "c")]
+    ok = "a" * 2048
+    assert getattr(_parse([*base, (name, ok)]), name) == ok
+    secret = "SECRETVALUE" + "a" * 2048
+    with pytest.raises(BadRequestError) as ei:
+        _parse([*base, (name, secret)])
+    assert "SECRETVALUE" not in str(ei.value)
+
+
+class _ListsOnly:
+    """Stand-in for werkzeug's MultiDict: lists() yields (key, [values])."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def lists(self):
+        return iter(self._data.items())
+
+
+class _FirstValueDict(dict):
+    """Stand-in for a dict subclass whose items() yields first values only."""
+
+
+def test_authorization_response_lists_duck_typing():
+    r = rp.parse_authorization_response(_ListsOnly({"code": ["c1"], "state": ["s1"]}))
+    assert (r.code, r.state) == ("c1", "s1")
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(_ListsOnly({"code": ["a", "b"]}))
+    md = _FirstValueDict({"code": "c1"})
+    md.lists = lambda: iter([("code", ["a", "b"])])  # type: ignore[attr-defined]
+    # a dict subclass with lists() is read through lists(), duplicates visible
+    with pytest.raises(BadRequestError):
+        rp.parse_authorization_response(md)
+
+
+def test_authorization_response_mapping_type_error_names_key_and_hint():
+    with pytest.raises(TypeError) as ei:
+        rp.parse_authorization_response(_FirstValueDict({"state": ["s"], "code": "c1"}))
+    msg = str(ei.value)
+    assert "non-list value for key 'code'" in msg
+    assert "_FirstValueDict" in msg and "items(multi=True)" in msg and ".lists()" in msg
+    assert "plain dict" not in msg
+    with pytest.raises(TypeError, match="non-list value for key 'code'") as ei2:
+        rp.parse_authorization_response({"code": "c1"})
+    assert "plain dict" in str(ei2.value)
+
+
+def test_authorization_response_get_with_form_body_params_rejected():
+    for name in ("code", "state", "error", "iss", "response"):
+        req = pyhttp.HttpRequestData(method="GET", query=[("code", "c1")], form=[(name, "x")])
+        with pytest.raises(BadRequestError):
+            rp.parse_authorization_response(req, accept_jarm=True)
+    ok = pyhttp.HttpRequestData(method="GET", query=[("code", "c1")], form=[("utm", "x")])
+    assert rp.parse_authorization_response(ok).code == "c1"
+
+
+def test_authorization_response_post_without_form_body_message():
+    req = pyhttp.HttpRequestData(method="POST", query=[("utm", "x")])
+    with pytest.raises(BadRequestError, match="needs a form body"):
+        rp.parse_authorization_response(req)
+
+
+def test_authorization_response_values_kept_verbatim():
+    r = _parse([("code", " c d "), ("state", "S=/+ ")])
+    assert r.code == " c d " and r.state == "S=/+ "
+
+
+def test_authorization_response_matches_iss():
+    r = _parse([("code", "c"), ("iss", ISSUER)])
+    assert r.matches_iss(ISSUER)
+    assert not r.matches_iss(ISSUER + "/")
+    assert not r.matches_iss(ISSUER.upper())
+    assert not r.matches_iss("https://evil.example")
+    assert not r.matches_iss("")
+    assert not r.matches_iss("", required=False)
+    assert r.matches_iss(ISSUER, required=True) and r.matches_iss(ISSUER, required=False)
+    assert not r.matches_iss("https://evil.example", required=False)
+    absent = _parse([("code", "c")])
+    assert absent.iss is None
+    # fail closed by default (RFC 9207 section 2.4)
+    assert absent.matches_iss(ISSUER) is False
+    assert absent.matches_iss(ISSUER, required=True) is False
+    assert absent.matches_iss(ISSUER, required=False) is True
+    with pytest.raises(TypeError):
+        r.matches_iss(ISSUER, True)  # type: ignore[misc]
+
+
+def test_authorization_response_repr_redacts_secrets():
+    r = _parse([("code", "SECRETCODE"), ("state", "SECRETSTATE"), ("iss", ISSUER)])
+    text = repr(r)
+    assert "SECRETCODE" not in text and "SECRETSTATE" not in text
+    assert text == (
+        "AuthorizationResponse(is_error=False, error=None, code=<set>, state=<set>, "
+        "iss='https://op.example.com', response=None, response_mode='query')"
+    )
+    e = _parse([("error", "access_denied"), ("iss", ISSUER)])
+    assert "state=None" in repr(e) and "error='access_denied'" in repr(e)
+
+
+def test_authorization_response_repr_escapes_quote_in_quoted_fields():
+    import ast
+
+    r = _parse([("error", "it's"), ("iss", "https://op.example.com/it's")])
+    text = repr(r)
+    assert "error='it\\'s'" in text and "it\\'s'" in text
+    assert "error='it's'" not in text
+    token = text.split(", error=", 1)[1].split(", code=", 1)[0]
+    assert ast.literal_eval(token) == "it's"
+    iss_token = text.split("iss=", 1)[1].split(", response=", 1)[0]
+    assert ast.literal_eval(iss_token) == "https://op.example.com/it's"
+
+
+def test_authorization_response_repr_shows_response_set_not_value():
+    jwt = "eyJhbGciOiJub25lIn0.SECRETJARM.sig"
+    r = _parse([("response", jwt)], accept_jarm=True)
+    assert "response=<set>" in repr(r) and "SECRETJARM" not in repr(r)
+    assert r.response == jwt
+    assert "response=None" in repr(_parse([("code", "c")]))
+
+
+def test_authorization_response_jarm_response_cap():
+    ok = "a" * 32768
+    assert _parse([("response", ok)], accept_jarm=True).response == ok
+    with pytest.raises(BadRequestError) as exc:
+        _parse([("response", ok + "a")], accept_jarm=True)
+    assert "aaaa" not in str(exc.value)
+
+
+def test_authorization_response_empty_iss_rejected():
+    with pytest.raises(BadRequestError) as exc:
+        _parse([("code", "c"), ("iss", "")])
+    assert "iss" in str(exc.value)
+
+
+def test_authorization_response_empty_expected_never_matches():
+    both = _parse([("code", "c"), ("state", "s"), ("iss", ISSUER)])
+    absent = _parse([("code", "c")])
+    for r in (both, absent):
+        for required in (True, False):
+            assert r.matches_iss("", required=required) is False
+            assert r.matches_state("", required=required) is False
+
+
+# The 12 codes OAuthError accepts (errors.rs parse_oauth_code).
+_OAUTH_ERROR_CODES = [
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "unsupported_response_type",
+    "invalid_scope",
+    "access_denied",
+    "login_required",
+    "server_error",
+    "temporarily_unavailable",
+    "invalid_dpop_proof",
+]
+_RESPONSE_ONLY_CODES = [
+    "interaction_required",
+    "account_selection_required",
+    "consent_required",
+    "invalid_request_uri",
+    "invalid_request_object",
+    "request_not_supported",
+    "request_uri_not_supported",
+    "registration_not_supported",
+]
+
+
+@pytest.mark.parametrize("code", _OAUTH_ERROR_CODES)
+def test_error_known_is_superset_of_oauth_error_codes(code):
+    assert OAuthError(code).code == code
+    assert _parse([("error", code)]).error_known is True
+
+
+@pytest.mark.parametrize("code", _RESPONSE_ONLY_CODES)
+def test_error_known_wider_than_oauth_error(code):
+    assert _parse([("error", code)]).error_known is True
+    with pytest.raises(ValueError):
+        OAuthError(code)
+
+
+def test_authorization_response_frozen_no_constructor():
+    r = _parse([("code", "c")])
+    with pytest.raises(AttributeError):
+        r.code = "other"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        rp.AuthorizationResponse()  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("code", "c"),
+        ("state", "s"),
+        ("error", "access_denied"),
+        ("error_description", "d"),
+        ("error_uri", "https://op.example.com/e"),
+        ("iss", ISSUER),
+    ],
+)
+def test_authorization_response_jarm_rejects_plaintext_params_alongside(extra):
+    with pytest.raises(BadRequestError, match="alongside"):
+        _parse([("response", "a.b.c"), extra], accept_jarm=True)
+
+
+def test_authorization_response_jarm_refused_by_default_accepted_raw():
+    with pytest.raises(BadRequestError, match="JARM"):
+        _parse([("response", "a.b.c")])
+    with pytest.raises(BadRequestError):
+        _parse([("code", "c"), ("response", "a.b.c")])
+    r = _parse([("response", "a.b.c")], accept_jarm=True)
+    assert r.response == "a.b.c" and r.code is None and not r.is_error
+    # without response the usual rules still apply
+    with pytest.raises(BadRequestError):
+        _parse([("state", "s")], accept_jarm=True)
+    with pytest.raises(BadRequestError):
+        _parse([("response", "a"), ("response", "b")], accept_jarm=True)
+
+
+# --- G6 helpers: BeginResult, TokenSet getters, claims_audiences, metadata ----------------
+
+
+def test_begin_result_is_a_real_namedtuple(prov, rpc):
+    res = rp.begin(prov, rpc)
+    assert isinstance(res, rp.BeginResult)
+    assert isinstance(res, tuple)
+    assert res._fields == ("url", "state", "nonce", "code_verifier")
+    url, state, nonce, verifier = res
+    assert (res.url, res.state, res.nonce, res.code_verifier) == (url, state, nonce, verifier)
+    assert res[0] == url and res[3] == verifier and len(res) == 4
+    assert res == (url, state, nonce, verifier)
+    assert rp.BeginResult.__module__ == "pygrindvakt.rp"
+    assert rp.BeginResult is type(res)
+    assert res._replace(state="x").state == "x"
+
+
+def test_begin_result_pickles(prov, rpc):
+    import pickle
+
+    res = rp.begin(prov, rpc)
+    assert pickle.loads(pickle.dumps(res)) == res
+
+
+def test_begin_result_repr_redacts(prov, rpc):
+    res = rp.begin(prov, rpc)
+    text = repr(res)
+    assert text.startswith("BeginResult(url='https://op.example.com/authorization?")
+    assert "state=<redacted>, nonce=<redacted>, code_verifier=<redacted>)" in text
+    for secret in (res.state, res.nonce, res.code_verifier, res.url):
+        assert secret not in text
+    assert "code_challenge" not in text
+    assert str(res) == text
+    no_pkce = repr(rp.begin(prov, rpc, pkce=False))
+    assert "code_verifier=None" in no_pkce
+
+
+class _TokenHttp:
+    """Serves a canned token-endpoint body."""
+
+    def __init__(self, body):
+        self.body = body
+
+    def get(self, url):
+        return 404, b"", "text/plain"
+
+    def post_form(self, url, form, headers):
+        return 200, json.dumps(self.body).encode(), "application/json"
+
+
+def _token_set(prov, rpc, **extra):
+    body = {"access_token": "AT-secret", "id_token": "a.b.c", "token_type": "Bearer", **extra}
+    return rp.exchange_code(_TokenHttp(body), prov, rpc, "code", "v" * 43)
+
+
+def test_token_set_new_getters(prov, rpc):
+    ts = _token_set(prov, rpc, refresh_token="RT-secret", expires_in=3600, scope="openid email")
+    assert ts.refresh_token == "RT-secret"
+    assert ts.expires_in == 3600
+    assert ts.scope == "openid email"
+    assert ts.raw["refresh_token"] == "RT-secret"
+    assert "RT-secret" not in repr(ts) and "AT-secret" not in repr(ts)
+    assert "refresh_token=<set>" in repr(ts)
+
+
+def test_token_set_getters_missing(prov, rpc):
+    ts = _token_set(prov, rpc)
+    assert ts.refresh_token is None and ts.expires_in is None and ts.scope is None
+    assert "refresh_token=None" in repr(ts)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (3600, 3600),
+        (0, 0),
+        ("3600", 3600),
+        (3600.0, 3600),
+        (-1, None),
+        ("-1", None),
+        (1.5, None),
+        ("1.5", None),
+        ("", None),
+        (" 60", None),
+        ("abc", None),
+        ("١٢", None),
+        (None, None),
+        (True, None),
+        ([60], None),
+        ({"a": 1}, None),
+        (10**30, None),
+        (315_360_000, 315_360_000),
+        (315_360_001, None),
+        (2**64 - 1, None),
+        (2**64, None),
+        ("315360000", 315_360_000),
+        ("315360001", None),
+        (str(2**64 - 1), None),
+        (315_360_000.0, 315_360_000),
+        (315_360_001.0, None),
+    ],
+)
+def test_token_set_expires_in(prov, rpc, value, expected):
+    assert _token_set(prov, rpc, expires_in=value).expires_in == expected
+
+
+def test_token_set_wrong_types_are_none(prov, rpc):
+    ts = _token_set(prov, rpc, refresh_token=5, scope=["a"])
+    assert ts.refresh_token is None and ts.scope is None
+
+
+def test_claims_audiences():
+    assert rp.claims_audiences({"aud": "a"}) == ["a"]
+    assert rp.claims_audiences({"aud": ["a", "b"]}) == ["a", "b"]
+    assert rp.claims_audiences({"aud": "x"}) == ["x"]
+    assert rp.claims_audiences({"aud": ["x", "y"]}) == ["x", "y"]
+    assert rp.claims_audiences({"aud": ("x", "y")}) == ["x", "y"]
+
+
+@pytest.mark.parametrize(
+    "claims, msg",
+    [
+        ({}, "no 'aud'"),
+        ({"sub": "x"}, "no 'aud'"),
+        ({"aud": []}, "empty 'aud'"),
+        ({"aud": ()}, "empty 'aud'"),
+        ({"aud": ""}, "empty 'aud'"),
+        ({"aud": ["a", ""]}, "empty 'aud'"),
+        ({"aud": [""]}, "empty 'aud'"),
+    ],
+)
+def test_claims_audiences_fails_closed(claims, msg):
+    with pytest.raises(BadRequestError, match=msg):
+        rp.claims_audiences(claims)
+
+
+def test_claims_audiences_no_vacuous_audience_check(rp_key):
+    """A verified token without aud must not reach a hand-rolled all(...) check."""
+    jws = jwt.sign(rp_key, {"sub": "s", "iss": ISSUER, "exp": int(time.time()) + 300})
+    v = jwt.Validation().with_issuer(ISSUER).require_exp()
+    claims = jwt.verify_with_jwks(rp_key.to_public_jwks(), jws, v)
+    assert "aud" not in claims
+    with pytest.raises(BadRequestError, match="no 'aud'"):
+        rp.claims_audiences(claims)
+    # control: an aud is returned and checked normally
+    jws = jwt.sign(rp_key, {"sub": "s", "iss": ISSUER, "aud": "other-rp", "exp": int(time.time()) + 300})
+    claims = jwt.verify_with_jwks(rp_key.to_public_jwks(), jws, v)
+    auds = rp.claims_audiences(claims)
+    assert auds == ["other-rp"]
+    assert not all(a in {CLIENT_ID} for a in auds)
+
+
+@pytest.mark.parametrize("aud", ["\ud800", ["ok", "\udc00"], ("\ud800",)])
+def test_claims_audiences_lone_surrogate_is_bad_request(aud):
+    with pytest.raises(BadRequestError) as ei:
+        rp.claims_audiences({"aud": aud})
+    assert not isinstance(ei.value, UnicodeError)
+    assert "ud800" not in str(ei.value) and "udc00" not in str(ei.value)
+
+
+def test_claims_audiences_does_not_mutate():
+    claims = {"aud": ["a", "b"], "sub": "s"}
+    snapshot = copy.deepcopy(claims)
+    out = rp.claims_audiences(claims)
+    out.append("z")
+    assert claims == snapshot
+    single = {"aud": "a"}
+    rp.claims_audiences(single)
+    assert single == {"aud": "a"}
+
+
+@pytest.mark.parametrize("aud", [None, 5, ["a", 1], ["a", None], {"a": 1}, b"a", [["a"]]])
+def test_claims_audiences_bad_types(aud):
+    with pytest.raises(BadRequestError):
+        rp.claims_audiences({"aud": aud})
+
+
+def test_claims_audiences_not_a_mapping():
+    with pytest.raises(TypeError):
+        rp.claims_audiences(["aud"])  # type: ignore[arg-type]
+
+
+def test_provider_info_metadata(prov, op):
+    assert prov.metadata is not None
+    assert prov.metadata.issuer == ISSUER
+    assert prov.metadata.code_challenge_methods_supported == ["S256"]
+    assert "metadata" not in repr(prov)
+    hand = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    assert hand.metadata is None
+
+
+def test_provider_info_metadata_is_a_copy(prov):
+    first = prov.metadata
+    first.scopes_supported = ["changed"]
+    assert prov.metadata.scopes_supported != ["changed"]
+
+
+def test_provider_info_metadata_keeps_rejected_end_session():
+    with pytest.warns(UserWarning, match="different origin than the issuer"):
+        info = rp.ProviderInfo.from_metadata(_raw_md("https://evil.example/logout"))
+    assert info.end_session_endpoint is None
+    assert info.metadata.end_session_endpoint == "https://evil.example/logout"
+    # "not advertised" differs from "rejected"
+    clean = rp.ProviderInfo.from_metadata(rp.discover(_NoEndSession(), ISSUER))
+    assert clean.end_session_endpoint is None and clean.metadata.end_session_endpoint is None
+
+
+def test_end_session_url_error_distinguishes_rejected_from_not_advertised():
+    raw = "https://evil.example/logout"
+    with pytest.warns(UserWarning):
+        rejected = rp.ProviderInfo.from_metadata(_raw_md(raw))
+    with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata") as ei:
+        rp.end_session_url(rejected)
+    assert raw not in str(ei.value) and "does not advertise" not in str(ei.value)
+    clean = rp.ProviderInfo.from_metadata(rp.discover(_NoEndSession(), ISSUER))
+    with pytest.raises(ConfigError, match="does not advertise end_session_endpoint") as ei:
+        rp.end_session_url(clean)
+    assert "rejected" not in str(ei.value)
+    hand = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    with pytest.raises(ConfigError, match="does not advertise"):
+        rp.end_session_url(hand)
+
+
+# --- check_rp_compatibility -----------------------------------------------------------------
+
+
+def _md(**changes):
+    md = metadata.ProviderMetadata(ISSUER)
+    for k, v in changes.items():
+        setattr(md, k, v)
+    return md
+
+
+def test_compat_against_in_process_op(prov, rpc):
+    assert rp.check_rp_compatibility(prov) == []
+    assert (
+        rp.check_rp_compatibility(
+            prov,
+            client=rpc,
+            pkce=True,
+            algorithms=rp.asymmetric_algorithms(),
+            scopes=["openid", "email"],
+        )
+        == []
+    )
+    assert rp.check_rp_compatibility(prov.metadata, pkce=True) == []
+
+
+def test_compat_ok_with_pkce_unset_or_false():
+    md = _md(code_challenge_methods_supported=["plain"])
+    assert rp.check_rp_compatibility(md) == []
+    assert rp.check_rp_compatibility(md, pkce=False) == []
+
+
+def test_compat_response_type_mismatch():
+    out = rp.check_rp_compatibility(_md(response_types_supported=["id_token"]))
+    assert len(out) == 1 and "'code'" in out[0] and not out[0].startswith("not advertised:")
+    out = rp.check_rp_compatibility(_md(response_types_supported=[]))
+    assert len(out) == 1 and out[0].startswith("not advertised: response_types_supported")
+
+
+def test_compat_pkce_mismatch_and_not_advertised():
+    out = rp.check_rp_compatibility(_md(code_challenge_methods_supported=["plain"]), pkce=True)
+    assert len(out) == 1 and "S256" in out[0] and not out[0].startswith("not advertised:")
+    # ORCID-like: nothing advertised
+    out = rp.check_rp_compatibility(_md(code_challenge_methods_supported=[]), pkce=True)
+    assert out == ["not advertised: code_challenge_methods_supported (cannot confirm PKCE S256 support)"]
+
+
+def test_compat_algorithms():
+    md = _md(id_token_signing_alg_values_supported=["RS256"])
+    assert rp.check_rp_compatibility(md, algorithms=["RS256", "ES256"]) == []
+    out = rp.check_rp_compatibility(md, algorithms=["ES256", "EdDSA"])
+    assert len(out) == 1 and "id_token_signing_alg_values_supported" in out[0]
+    assert not out[0].startswith("not advertised:")
+    out = rp.check_rp_compatibility(_md(id_token_signing_alg_values_supported=[]), algorithms=["ES256"])
+    assert len(out) == 1 and out[0].startswith("not advertised: id_token_signing_alg_values_supported")
+    with pytest.raises(ConfigError):
+        rp.check_rp_compatibility(md, algorithms=[])
+
+
+def _hs_none_md(algs=("HS256", "none", "RS256")):
+    return metadata.ProviderMetadata.from_dict(
+        {**metadata.ProviderMetadata(ISSUER).to_dict(), "id_token_signing_alg_values_supported": list(algs)}
+    )
+
+
+def test_compat_hs_refused_by_default():
+    md = _hs_none_md()
+    out = rp.check_rp_compatibility(md, algorithms=["HS256"])
+    assert out != []
+    assert len(out) == 1 and not out[0].startswith("not advertised:")
+    assert "shared_secret_keys=True" in out[0] and "ADR 0006" in out[0]
+    # HS alone against an OP advertising it: only the HS message, no intersection noise
+    out = rp.check_rp_compatibility(_hs_none_md(["HS256"]), algorithms=["HS256"])
+    assert len(out) == 1 and "client_secret" in out[0]
+    # mixed: HS message only, RS256 intersects
+    out = rp.check_rp_compatibility(_hs_none_md(["HS256", "RS256"]), algorithms=["HS256", "RS256"])
+    assert len(out) == 1 and "client_secret" in out[0]
+    assert rp.check_rp_compatibility(md, algorithms=["RS256"]) == []
+    assert rp.check_rp_compatibility(md, algorithms=["RS256"], shared_secret_keys=True) == []
+    out = rp.check_rp_compatibility(md, algorithms=["hs384"])
+    assert len(out) == 1 and "client_secret" in out[0]
+
+
+def test_compat_none_always_refused():
+    md = _hs_none_md()
+    for shared in (False, True):
+        out = rp.check_rp_compatibility(md, algorithms=["none"], shared_secret_keys=shared)
+        assert len(out) == 1 and "'none'" in out[0] and "ADR 0006" in out[0]
+        assert not out[0].startswith("not advertised:")
+        assert "fix the RP config, not the OP" in out[0]
+        out = rp.check_rp_compatibility(md, algorithms=["NONE"], shared_secret_keys=shared)
+        assert len(out) == 1 and "'NONE'" in out[0]
+        # none never counts as an intersection match
+        out = rp.check_rp_compatibility(md, algorithms=["none", "ES256"], shared_secret_keys=shared)
+        assert len(out) == 2 and "always refused" in out[0] and "none of the allowed" in out[1]
+    out = rp.check_rp_compatibility(md, algorithms=["HS512", "none"])
+    assert len(out) == 2
+    assert any("always refused" in m for m in out) and any("client_secret" in m for m in out)
+
+
+def test_compat_shared_secret_keys():
+    md = _hs_none_md()
+    assert rp.check_rp_compatibility(md, algorithms=["HS256"], shared_secret_keys=True) == []
+    out = rp.check_rp_compatibility(_hs_none_md(["RS256"]), algorithms=["HS256"], shared_secret_keys=True)
+    assert len(out) == 1 and out[0].startswith("none of the allowed id_token algorithms")
+    out = rp.check_rp_compatibility(_hs_none_md([]), algorithms=["HS256"], shared_secret_keys=True)
+    assert len(out) == 1 and out[0].startswith("not advertised:")
+    out = rp.check_rp_compatibility(md, algorithms=["HS512", "none"], shared_secret_keys=True)
+    assert len(out) == 2 and "always refused" in out[0] and "none of the allowed" in out[1]
+
+
+def test_compat_alg_messages_escaped():
+    evil = "ES\u202e256\n" + "x" * 100
+    md = _hs_none_md(["RS256"])
+    out = rp.check_rp_compatibility(md, algorithms=[evil, "HS256", "none"])
+    joined = "\n".join(out)
+    assert "\u202e" not in joined and "x" * 65 not in joined
+    assert "\\u{202e}" in joined
+    many = [f"HS{i}" for i in range(30)] + ["HS256"]
+    out = rp.check_rp_compatibility(md, algorithms=many)
+    assert any("more)" in m for m in out)
+
+
+def test_compat_scopes():
+    md = _md(scopes_supported=["openid", "email"])
+    assert rp.check_rp_compatibility(md, scopes=["openid"]) == []
+    out = rp.check_rp_compatibility(md, scopes=["openid", "groups", "phone"])
+    assert len(out) == 1 and "'groups'" in out[0] and "'phone'" in out[0] and "'openid', " not in out[0].split("(")[0]
+    out = rp.check_rp_compatibility(_md(scopes_supported=[]), scopes=["openid"])
+    assert len(out) == 1 and out[0].startswith("not advertised: scopes_supported")
+
+
+def test_compat_acr_values():
+    assert rp.check_rp_compatibility(_md(), acr_values=["urn:x"])[0].startswith("not advertised: acr_values_supported")
+    md = _md(acr_values_supported=["urn:a", "urn:b"])
+    assert rp.check_rp_compatibility(md, acr_values=["urn:a"]) == []
+    out = rp.check_rp_compatibility(md, acr_values=["urn:a", "urn:c"])
+    assert len(out) == 1 and "'urn:c'" in out[0] and not out[0].startswith("not advertised:")
+    # not requested: no message even though nothing is advertised
+    assert rp.check_rp_compatibility(_md()) == []
+
+
+def test_compat_client_auth_method():
+    pk = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret="s")
+    md = _md(token_endpoint_auth_methods_supported=["private_key_jwt"])
+    out = rp.check_rp_compatibility(md, client=pk)
+    assert len(out) == 1 and "client_secret_basic" in out[0] and not out[0].startswith("not advertised:")
+    ok = _md(token_endpoint_auth_methods_supported=["client_secret_basic"])
+    assert rp.check_rp_compatibility(ok, client=pk) == []
+
+
+def test_compat_client_auth_method_absent_assumes_spec_default():
+    # OIDC Discovery 1.0 s3 / RFC 8414 s2: absent means ["client_secret_basic"].
+    basic = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret="s")
+    post = rp.RpClient(CLIENT_ID, REDIRECT_URI, client_secret="s", auth_method="client_secret_post")
+    pub = rp.RpClient(CLIENT_ID, REDIRECT_URI)
+
+    class _NoAuthMethods:
+        def get(self, url):
+            doc = metadata.ProviderMetadata(ISSUER).to_dict()
+            doc.pop("token_endpoint_auth_methods_supported", None)
+            return 200, json.dumps(doc).encode(), "application/json"
+
+        def post_form(self, url, form, headers):
+            raise AssertionError
+
+    absent = rp.discover(_NoAuthMethods(), ISSUER)
+    for md in (absent, _md(token_endpoint_auth_methods_supported=[])):
+        assert rp.check_rp_compatibility(md, client=basic) == []
+        for c, name in ((post, "client_secret_post"), (pub, "none")):
+            out = rp.check_rp_compatibility(md, client=c)
+            assert len(out) == 1 and not out[0].startswith("not advertised:")
+            assert name in out[0] and "absent" in out[0] and "client_secret_basic" in out[0]
+
+
+def test_compat_reports_several_and_escapes_untrusted():
+    md = _md(response_types_supported=["code\u202e\nevil"], code_challenge_methods_supported=["plain"])
+    out = rp.check_rp_compatibility(md, pkce=True)
+    assert len(out) == 2
+    assert all("\n" not in m and "\u202e" not in m for m in out)
+
+
+def test_compat_provider_info_without_metadata():
+    hand = rp.ProviderInfo(ISSUER, f"{ISSUER}/authorization", f"{ISSUER}/token")
+    with pytest.raises(ConfigError, match="no metadata"):
+        rp.check_rp_compatibility(hand)
+    with pytest.raises(TypeError):
+        rp.check_rp_compatibility({"issuer": ISSUER})  # type: ignore[arg-type]

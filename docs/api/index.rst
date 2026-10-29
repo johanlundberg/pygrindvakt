@@ -42,3 +42,4 @@ Conventions that hold across the whole API:
    pkce
    mac
    util
+   testing

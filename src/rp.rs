@@ -18,20 +18,26 @@ use std::time::Instant;
 use async_trait::async_trait;
 use grindvakt::http::{HttpClient, HttpFetchResponse};
 use grindvakt::Error as RsError;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyTuple};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::jose_rs::jwk::JwkSet;
 use grindvakt::jwt as gj;
+use grindvakt::metadata as gm;
 use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
-use crate::convert::{from_py, new_submodule, to_py, warn};
-use crate::errors::{err, with_code, AuthnError, ConfigError, InternalError, UnknownKeyError};
+use crate::convert::{from_py, new_submodule, protocol_parameter_pairs, to_py, warn};
+use crate::errors::{
+    config_err, config_from, err, escape_untrusted_quoted, escape_untrusted_text,
+    is_invisible_format, with_code, with_code_retryable, AuthnError, InternalError,
+    UnknownKeyError,
+};
 use crate::http::extract_http_client;
-use crate::jwt::jwks_from_py;
+use crate::jwt::{drop_oct_keys, is_mac, jwks_from_py, prepare_mac_keys, KeySelection};
 use crate::keys::SigningKey;
 use crate::metadata::ProviderMetadata;
 
@@ -66,6 +72,27 @@ pub struct ProviderInfo {
     /// OIDC RP-Initiated Logout endpoint. Upstream `ProviderInfo` has no slot
     /// for it, so the binding carries it alongside.
     pub end_session_endpoint: Option<String>,
+    /// The discovery document this value was built from
+    /// (`ProviderInfo.from_metadata(discover(...))`). `None` for a hand-built
+    /// `ProviderInfo`.
+    pub metadata: Option<ProviderMetadata>,
+    /// What `from_metadata` decided about the advertised
+    /// `end_session_endpoint`, recorded then so `end_session_url` can explain
+    /// a missing endpoint without re-deriving it. Not in `repr()`.
+    end_session_outcome: EndSessionOutcome,
+}
+
+/// Outcome of the `end_session_endpoint` decision at build time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EndSessionOutcome {
+    /// Absent or JSON null, or a hand-built `ProviderInfo`.
+    NotAdvertised,
+    /// Advertised, valid, carried over.
+    Accepted,
+    /// Advertised as a string but unsafe or cross-origin; dropped.
+    Rejected,
+    /// Advertised with a non-string JSON value; dropped.
+    InvalidType,
 }
 
 /// Same-origin test: scheme, host (the `url` crate lower-cases and IDNA-
@@ -80,6 +107,30 @@ fn same_origin(a: &str, b: &str) -> bool {
         && a.host() == b.host()
         && a.port_or_known_default().is_some()
         && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// JSON type name for diagnostics (never the value itself).
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Best-effort `UserWarning`: a warnings filter of "error" must not make
+/// login depend on logout.
+fn warn_user(py: Python<'_>, text: &str) {
+    let msg = std::ffi::CString::new(text.replace('\0', "?")).expect("NUL removed");
+    let _ = PyErr::warn(
+        py,
+        &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+        &msg,
+        1,
+    );
 }
 
 /// Why an `end_session_endpoint` was refused.
@@ -98,6 +149,10 @@ fn check_end_session_endpoint(
     issuer: &str,
     allow_cross_origin: bool,
 ) -> Result<(), EndSessionReject> {
+    for raw in [endpoint, issuer] {
+        reject_reinterpreted_url_chars("end_session_endpoint", raw)
+            .map_err(EndSessionReject::Unsafe)?;
+    }
     grp::validate_service_endpoint_for_issuer("end_session_endpoint", endpoint, issuer)
         .map_err(EndSessionReject::Unsafe)?;
     if !allow_cross_origin && !same_origin(endpoint, issuer) {
@@ -113,12 +168,12 @@ fn validate_end_session_endpoint(
     allow_cross_origin: bool,
 ) -> PyResult<()> {
     check_end_session_endpoint(endpoint, issuer, allow_cross_origin).map_err(|r| match r {
-        EndSessionReject::Unsafe(e) => err(e),
-        EndSessionReject::CrossOrigin => err(RsError::BadRequest(format!(
+        EndSessionReject::Unsafe(e) => config_from(e),
+        EndSessionReject::CrossOrigin => config_err(format!(
             "end_session_endpoint {endpoint:?} is on a different origin than the issuer \
              {issuer:?}; id_token_hint would be sent to that host. Pass \
              allow_cross_origin_end_session=True only if the OP legitimately logs out there"
-        ))),
+        )),
     })
 }
 
@@ -142,13 +197,19 @@ impl ProviderInfo {
             userinfo_endpoint,
             jwks_uri,
         };
-        inner.validate().map_err(err)?;
+        inner.validate().map_err(config_from)?;
         if let Some(e) = &end_session_endpoint {
             validate_end_session_endpoint(e, &inner.issuer, allow_cross_origin_end_session)?;
         }
         Ok(Self {
             inner,
+            end_session_outcome: if end_session_endpoint.is_some() {
+                EndSessionOutcome::Accepted
+            } else {
+                EndSessionOutcome::NotAdvertised
+            },
             end_session_endpoint,
+            metadata: None,
         })
     }
 
@@ -156,8 +217,12 @@ impl ProviderInfo {
     /// endpoint is `None` if the provider does not advertise one). An
     /// advertised `end_session_endpoint` is carried over; one that is unsafe
     /// or on a different origin than the issuer (unless
-    /// `allow_cross_origin_end_session`) is dropped (`None`) so login never
-    /// depends on logout.
+    /// `allow_cross_origin_end_session`) is dropped (`None`) with a
+    /// `UserWarning`, so login never depends on logout; compare
+    /// `end_session_endpoint` with `metadata.end_session_endpoint` to tell
+    /// "not advertised" from "rejected". A non-string advertised value is
+    /// likewise ignored with a `UserWarning`. The whole document stays
+    /// reachable as `metadata`.
     #[staticmethod]
     #[pyo3(signature = (metadata, *, allow_cross_origin_end_session = false))]
     fn from_metadata(
@@ -166,50 +231,50 @@ impl ProviderInfo {
         allow_cross_origin_end_session: bool,
     ) -> PyResult<Self> {
         let inner = grp::ProviderInfo::from(metadata.inner.clone());
-        inner.validate().map_err(err)?;
-        let end_session_endpoint = metadata
+        inner.validate().map_err(config_from)?;
+        // Login must not depend on logout: an advertised endpoint that fails
+        // validation is dropped (with a UserWarning), never raised.
+        let (end_session_endpoint, end_session_outcome) = match metadata
             .inner
             .extra
             .get("end_session_endpoint")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-        // Login must not depend on logout: an advertised endpoint that fails
-        // issuer validation is dropped rather than raised.
-        let end_session_endpoint = match end_session_endpoint {
-            Some(e) => {
-                match check_end_session_endpoint(&e, &inner.issuer, allow_cross_origin_end_session)
-                {
-                    Ok(()) => Some(e),
+        {
+            None | Some(serde_json::Value::Null) => (None, EndSessionOutcome::NotAdvertised),
+            Some(serde_json::Value::String(e)) => {
+                match check_end_session_endpoint(e, &inner.issuer, allow_cross_origin_end_session) {
+                    Ok(()) => (Some(e.clone()), EndSessionOutcome::Accepted),
                     Err(reject) => {
                         let reason = match reject {
                             EndSessionReject::CrossOrigin => format!(
                                 "end_session_endpoint {e:?} is on a different origin than the \
-                                 issuer and was ignored; pass \
-                                 allow_cross_origin_end_session=True to trust it"
+                                     issuer and was ignored; pass \
+                                     allow_cross_origin_end_session=True to trust it"
                             ),
-                            EndSessionReject::Unsafe(cause) => {
-                                format!("end_session_endpoint {e:?} is unsafe ({cause}) and was ignored")
-                            }
+                            EndSessionReject::Unsafe(cause) => format!(
+                                "end_session_endpoint {e:?} is unsafe ({cause}) and was ignored"
+                            ),
                         };
-                        let msg =
-                            std::ffi::CString::new(reason.replace('\0', "?")).expect("NUL removed");
-                        // Best effort: a warnings filter of "error" must not
-                        // make login depend on logout.
-                        let _ = PyErr::warn(
-                            py,
-                            &py.get_type::<pyo3::exceptions::PyUserWarning>(),
-                            &msg,
-                            1,
-                        );
-                        None
+                        warn_user(py, &reason);
+                        (None, EndSessionOutcome::Rejected)
                     }
                 }
             }
-            None => None,
+            Some(other) => {
+                warn_user(
+                    py,
+                    &format!(
+                        "end_session_endpoint has a non-string value ({}) and was ignored",
+                        json_type_name(other)
+                    ),
+                );
+                (None, EndSessionOutcome::InvalidType)
+            }
         };
         Ok(Self {
             inner,
             end_session_endpoint,
+            end_session_outcome,
+            metadata: Some(metadata.clone()),
         })
     }
 
@@ -237,6 +302,21 @@ impl ProviderInfo {
     #[getter]
     fn end_session_endpoint(&self) -> Option<&str> {
         self.end_session_endpoint.as_deref()
+    }
+    /// The discovery document this value was built from (a copy), or `None`
+    /// for a hand-built `ProviderInfo`.
+    ///
+    /// WARNING: EVERY endpoint on this document (`userinfo_endpoint`,
+    /// `token_endpoint`, `authorization_endpoint`, `jwks_uri`,
+    /// `end_session_endpoint`, ...) is UNVALIDATED data from the OP
+    /// (ADR 0004 section 3 exempts discovery). Never send credentials or
+    /// tokens to them; use the validated properties on the `ProviderInfo`
+    /// itself (`info.userinfo_endpoint`, `info.token_endpoint`, ...). The raw
+    /// `end_session_endpoint` is kept only so you can diagnose a rejection.
+    /// Not part of `repr()`.
+    #[getter]
+    fn metadata(&self) -> Option<ProviderMetadata> {
+        self.metadata.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -276,7 +356,7 @@ fn resolve_client_auth(
     signing_key: Option<SigningKey>,
 ) -> PyResult<ClientAuth> {
     if matches!(client_secret.as_deref(), Some("")) {
-        return Err(PyValueError::new_err("client_secret must not be empty"));
+        return Err(config_err("client_secret must not be empty"));
     }
     let method = match auth_method {
         Some(m) => m,
@@ -286,7 +366,7 @@ fn resolve_client_auth(
     let auth = match method {
         "none" => {
             if client_secret.is_some() {
-                return Err(PyValueError::new_err(
+                return Err(config_err(
                     "auth_method='none' does not take a client_secret",
                 ));
             }
@@ -294,7 +374,7 @@ fn resolve_client_auth(
         }
         "client_secret_basic" | "client_secret_post" => {
             let secret = client_secret.ok_or_else(|| {
-                PyValueError::new_err(format!("auth_method={method:?} requires client_secret"))
+                config_err(format!("auth_method={method:?} requires client_secret"))
             })?;
             if method == "client_secret_basic" {
                 ClientAuth::ClientSecretBasic(secret)
@@ -304,24 +384,24 @@ fn resolve_client_auth(
         }
         "private_key_jwt" => {
             if client_secret.is_some() {
-                return Err(PyValueError::new_err(
+                return Err(config_err(
                     "auth_method='private_key_jwt' does not take a client_secret",
                 ));
             }
-            let key = signing_key.clone().ok_or_else(|| {
-                PyValueError::new_err("auth_method='private_key_jwt' requires signing_key")
-            })?;
+            let key = signing_key
+                .clone()
+                .ok_or_else(|| config_err("auth_method='private_key_jwt' requires signing_key"))?;
             ClientAuth::PrivateKeyJwt(key.inner)
         }
         other => {
-            return Err(PyValueError::new_err(format!(
+            return Err(config_err(format!(
                 "unknown auth_method {other:?}; expected one of \
                  'none', 'client_secret_basic', 'client_secret_post', 'private_key_jwt'"
             )))
         }
     };
     if signing_key.is_some() && !matches!(auth, ClientAuth::PrivateKeyJwt(_)) {
-        return Err(PyValueError::new_err(format!(
+        return Err(config_err(format!(
             "signing_key is only used with auth_method='private_key_jwt' (resolved method: {:?})",
             auth_method_name(&auth)
         )));
@@ -337,7 +417,7 @@ fn resolve_client_auth(
 /// `client_secret_basic` if `client_secret` is given, else `none`.
 /// Inconsistent combinations (a secret method without `client_secret`,
 /// `private_key_jwt` without `signing_key`, a secret or key that the chosen
-/// method would ignore) raise `ValueError`.
+/// method would ignore) raise `ConfigError` (also a `ValueError`).
 ///
 /// SECURITY: `client_secret` is a credential. Load it from a secret store or
 /// environment variable rather than embedding it in source, and note that it
@@ -355,6 +435,48 @@ pub struct RpClient {
     pub redirect_uris: Vec<String>,
     /// Accept any syntactically valid per-call `redirect_uri` override.
     pub allow_unregistered_redirect_uri: bool,
+}
+
+/// Reject a backslash anywhere in a raw URL string. The `url` crate treats `\`
+/// as `/` for special schemes, so `https://evil.example\@op.example.com`
+/// parses with host `evil.example` and an empty username while the raw string
+/// still ends in the trusted host. The message is fixed: the input is never
+/// echoed.
+pub(crate) fn reject_reinterpreted_url_chars(name: &str, raw: &str) -> Result<(), RsError> {
+    if raw.contains('\\') {
+        return Err(RsError::BadRequest(format!(
+            "{name} must not contain a backslash"
+        )));
+    }
+    Ok(())
+}
+
+/// Binding-side redirect URI syntax check; every redirect URI in this module
+/// goes through it. Stricter than core's `validate_redirect_uri_syntax`, which
+/// parses with the `url` crate (that strips tab/CR/LF) while the raw string is
+/// what gets stored and echoed (for example into a `Location` header).
+/// Rejects whitespace, control, bidi and invisible formatting characters,
+/// then userinfo, then applies core's parse + no-fragment rule. The offending
+/// value is never echoed. Custom-scheme URIs without an authority pass.
+pub(crate) fn check_redirect_uri(uri: &str) -> Result<(), RsError> {
+    reject_reinterpreted_url_chars("redirect_uri", uri)?;
+    if uri
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || is_invisible_format(c))
+    {
+        return Err(RsError::BadRequest(
+            "redirect_uri must not contain whitespace, control, bidi or invisible formatting characters"
+                .into(),
+        ));
+    }
+    if let Ok(u) = url::Url::parse(uri) {
+        if !u.username().is_empty() || u.password().is_some() {
+            return Err(RsError::BadRequest(
+                "redirect_uri must not contain userinfo".into(),
+            ));
+        }
+    }
+    grp::validate_redirect_uri_syntax(uri)
 }
 
 /// Reject plain `http` to a non-loopback host. `https`, loopback `http` and
@@ -407,12 +529,12 @@ impl RpClient {
     ) -> PyResult<Self> {
         let redirect_uris = redirect_uris.unwrap_or_default();
         for uri in &redirect_uris {
-            grp::validate_redirect_uri_syntax(uri).map_err(err)?;
-            check_redirect_uri_transport(uri).map_err(err)?;
+            check_redirect_uri(uri).map_err(config_from)?;
+            check_redirect_uri_transport(uri).map_err(config_from)?;
         }
         let post_logout_redirect_uris = post_logout_redirect_uris.unwrap_or_default();
         for uri in &post_logout_redirect_uris {
-            grp::validate_redirect_uri_syntax(uri).map_err(err)?;
+            check_redirect_uri(uri).map_err(config_from)?;
         }
         let auth = resolve_client_auth(auth_method, client_secret, signing_key)?;
         Ok(Self {
@@ -479,9 +601,10 @@ impl RpClient {
 // TokenSet
 // ---------------------------------------------------------------------------
 
-/// The result of a successful code exchange. `access_token`, `id_token` and
-/// `token_type` are pulled out of the response; `raw` is the full JSON body
-/// as a dict (for `refresh_token`, `expires_in`, `scope`, ...).
+/// The result of a successful code exchange. `access_token`, `id_token`,
+/// `token_type`, `refresh_token`, `expires_in` and `scope` are pulled out of
+/// the response; `raw` is the full JSON body as a dict. `repr()` never prints
+/// a token.
 #[pyclass(module = "pygrindvakt.rp", name = "TokenSet", frozen, from_py_object)]
 #[derive(Clone)]
 pub struct TokenSet {
@@ -502,6 +625,41 @@ impl TokenSet {
     fn token_type(&self) -> &str {
         &self.inner.token_type
     }
+    /// The `refresh_token` member, or `None` when absent or not a string.
+    /// SECURITY: a long-lived credential; store it encrypted and never log it.
+    #[getter]
+    fn refresh_token(&self) -> Option<&str> {
+        self.inner.raw.get("refresh_token")?.as_str()
+    }
+    /// The `expires_in` member in seconds: a non-negative JSON integer (or
+    /// an integral float) or a digits-only string, at most 10 years
+    /// (315_360_000 s). `None` means "absent or not acceptable" (missing,
+    /// negative, non-integer, garbage, longer than 10 years), NEVER "no
+    /// expiry": apply your own default lifetime when it is `None` and do not
+    /// treat `None` as unbounded.
+    #[getter]
+    fn expires_in(&self) -> Option<u64> {
+        const MAX_EXPIRES_IN: u64 = 315_360_000;
+        let secs = match self.inner.raw.get("expires_in")? {
+            serde_json::Value::Number(n) => n.as_u64().or_else(|| {
+                n.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0 && *f < 1.8e19)
+                    .map(|f| f as u64)
+            }),
+            serde_json::Value::String(s)
+                if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                s.parse().ok()
+            }
+            _ => None,
+        };
+        secs.filter(|n| *n <= MAX_EXPIRES_IN)
+    }
+    /// The `scope` member, or `None` when absent or not a string.
+    #[getter]
+    fn scope(&self) -> Option<&str> {
+        self.inner.raw.get("scope")?.as_str()
+    }
     /// The complete token-endpoint response as a dict.
     #[getter]
     fn raw<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -510,8 +668,13 @@ impl TokenSet {
 
     fn __repr__(&self) -> String {
         format!(
-            "TokenSet(token_type={:?}, access_token=<set>, id_token=<set>)",
+            "TokenSet(token_type={:?}, access_token=<set>, id_token=<set>, refresh_token={})",
             self.inner.token_type,
+            if self.refresh_token().is_some() {
+                "<set>"
+            } else {
+                "None"
+            },
         )
     }
 }
@@ -567,7 +730,7 @@ fn effective_client(client: &RpClient, redirect_uri: Option<String>) -> PyResult
                             .into(),
                     )));
                 }
-                grp::validate_redirect_uri_syntax(&r).map_err(err)?;
+                check_redirect_uri(&r).map_err(err)?;
                 check_redirect_uri_transport(&r).map_err(err)?;
             }
             inner.redirect_uri = r;
@@ -651,30 +814,31 @@ fn signed_request_object(
 ///
 /// Generates a fresh `state` and `nonce` (32 random bytes each) and, unless
 /// `pkce=False`, a PKCE verifier (48 random bytes, 64 characters) with its
-/// `S256` challenge. Returns `(url, state, nonce, verifier)`; `verifier` is
-/// `None` when `pkce=False`. Store `state`, `nonce` and `verifier` (and
-/// `redirect_uri`, if overridden) in the user's session.
+/// `S256` challenge. Returns a `BeginResult` named tuple
+/// `(url, state, nonce, code_verifier)` (a real `tuple`: unpacking and
+/// indexing work); `code_verifier` is `None` when `pkce=False`. Store `state`,
+/// `nonce` and `code_verifier` (and `redirect_uri`, if overridden) in the
+/// user's session. Its `repr()` redacts them.
 ///
 /// Public clients (`auth_method="none"`) cannot disable PKCE: `pkce=False`
-/// raises `BadRequestError`. When `request_object_key` is given, a signed
+/// raises `ConfigError`. When `request_object_key` is given, a signed
 /// request object (RFC 9101) is added as `extra["request"]`.
 #[pyfunction]
 #[pyo3(signature = (provider, client, *, extra = None, redirect_uri = None, pkce = true, request_object_key = None))]
-fn begin(
+fn begin<'py>(
+    py: Python<'py>,
     provider: &ProviderInfo,
     client: &RpClient,
     extra: Option<&Bound<'_, PyAny>>,
     redirect_uri: Option<String>,
     pkce: bool,
     request_object_key: Option<&SigningKey>,
-) -> PyResult<(String, String, String, Option<String>)> {
+) -> PyResult<Bound<'py, PyAny>> {
     let client = effective_client(client, redirect_uri)?;
     // Refuse before generating anything: a public client must not run the
     // code flow without PKCE (upstream also enforces this; do not depend on it).
     if !pkce && matches!(client.auth, ClientAuth::None) {
-        return Err(err(RsError::BadRequest(
-            "public clients must use S256 PKCE".into(),
-        )));
+        return Err(config_err("public clients must use S256 PKCE"));
     }
     let mut extra = extra_params(extra)?;
     let state = grindvakt::util::random_token(32);
@@ -706,7 +870,144 @@ fn begin(
         &extra_refs,
     )
     .map_err(err)?;
-    Ok((url, state, nonce, verifier))
+    begin_result_type(py)?.call1((url, state, nonce, verifier))
+}
+
+/// `BeginResult`: a `collections.namedtuple` subclass (module
+/// `pygrindvakt.rp`) with a `__repr__` that redacts `state`, `nonce` and
+/// `code_verifier` and strips the query from `url`. The class is defined in
+/// embedded Python below: keep `BeginResult` in `python/pygrindvakt/rp.pyi`
+/// in sync with it.
+static BEGIN_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn begin_result_type<'py>(py: Python<'py>) -> PyResult<&'py Bound<'py, PyAny>> {
+    BEGIN_RESULT
+        .get_or_try_init(py, || {
+            let globals = PyDict::new(py);
+            py.run(
+                cr##"
+import collections
+
+_Base = collections.namedtuple(
+    "BeginResult", ["url", "state", "nonce", "code_verifier"], module="pygrindvakt.rp"
+)
+
+
+class BeginResult(_Base):
+    __slots__ = ()
+    __module__ = "pygrindvakt.rp"
+
+    def __repr__(self):
+        url, _state, _nonce, verifier = self
+        if isinstance(url, str):
+            base = url.split("#", 1)[0]
+            if "?" in base:
+                base = base.split("?", 1)[0] + "?…"
+            url = base
+        return "BeginResult(url=%r, state=<redacted>, nonce=<redacted>, code_verifier=%s)" % (
+            url,
+            "None" if verifier is None else "<redacted>",
+        )
+
+
+BeginResult.__doc__ = (
+    "Result of rp.begin(): a named tuple (url, state, nonce, code_verifier). "
+    "state, nonce and code_verifier are secrets: repr() redacts them and "
+    "strips the query from url. code_verifier is None when pkce=False."
+)
+"##,
+                Some(&globals),
+                None,
+            )?;
+            Ok::<_, PyErr>(
+                globals
+                    .get_item("BeginResult")?
+                    .expect("defined above")
+                    .unbind(),
+            )
+        })
+        .map(|t| t.bind(py))
+}
+
+/// Normalise the `aud` claim of a claims dict to a NON-EMPTY list of
+/// strings: a non-empty string becomes `[string]`, a non-empty list of
+/// non-empty strings is copied. Fails closed: a missing `aud`, `aud: []`,
+/// `aud: ""` or an empty-string list member raises `BadRequestError`, so a
+/// caller's `all(a in {CLIENT} for a in aud)` can never pass vacuously. Also
+/// raises `BadRequestError` when `aud` is neither a string nor a list (or a
+/// list member is not a string). Convenience only: `verify_id_token` returns
+/// `aud` verbatim and the library itself performs the `aud` / `azp` checks;
+/// `claims` is not modified.
+#[pyfunction]
+fn claims_audiences(claims: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let py = claims.py();
+    let claims = claims.cast::<PyMapping>()?;
+    let aud = match claims.get_item("aud") {
+        Ok(v) => v,
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyKeyError>(py) => {
+            return Err(crate::errors::bad_request_err(
+                "claims have no 'aud': an audience check cannot pass".to_string(),
+            ))
+        }
+        Err(e) => return Err(e),
+    };
+    let empty_member = || {
+        crate::errors::bad_request_err(
+            "claims have an empty 'aud': an audience check cannot pass".to_string(),
+        )
+    };
+    let type_name = |o: &Bound<'_, PyAny>| {
+        o.get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+    };
+    // `to_cow` fails for lone surrogates; report a class, never the value.
+    let text = |s: &Bound<'_, pyo3::types::PyString>| -> PyResult<String> {
+        s.to_cow().map(|c| c.into_owned()).map_err(|_| {
+            crate::errors::bad_request_err(
+                "aud claim contains a string that is not valid Unicode (lone surrogate)"
+                    .to_string(),
+            )
+        })
+    };
+    if let Ok(s) = aud.cast::<pyo3::types::PyString>() {
+        let t = text(s)?;
+        if t.is_empty() {
+            return Err(empty_member());
+        }
+        return Ok(vec![t]);
+    }
+    let items: Vec<Bound<'_, PyAny>> = if let Ok(l) = aud.cast::<PyList>() {
+        l.iter().collect()
+    } else if let Ok(t) = aud.cast::<PyTuple>() {
+        t.iter().collect()
+    } else {
+        return Err(crate::errors::bad_request_err(format!(
+            "aud claim must be a string or a list of strings, got {}",
+            escape_untrusted_text(&type_name(&aud), 64)
+        )));
+    };
+    if items.is_empty() {
+        return Err(empty_member());
+    }
+    items
+        .iter()
+        .map(|i| match i.cast::<pyo3::types::PyString>() {
+            Ok(s) => {
+                let t = text(s)?;
+                if t.is_empty() {
+                    Err(empty_member())
+                } else {
+                    Ok(t)
+                }
+            }
+            Err(_) => Err(crate::errors::bad_request_err(format!(
+                "aud claim list members must be strings, got {}",
+                escape_untrusted_text(&type_name(i), 64)
+            ))),
+        })
+        .collect()
 }
 
 /// Discover provider metadata from `issuer` (`/.well-known/openid-configuration`).
@@ -724,26 +1025,47 @@ fn discover(
     issuer: String,
 ) -> PyResult<ProviderMetadata> {
     let (http, failures) = extract_http_client(http)?;
-    // `grp::discover` returns only the parsed struct. Wrap the client so the
-    // body it fetched can be kept as `raw`; all validation stays upstream.
-    let recorder = Arc::new(BodyRecorder {
+    discover_recorded(py, http, &failures, issuer).map(|d| d.metadata)
+}
+
+/// A discovery document together with what the fetch reported about itself.
+struct Discovered {
+    metadata: ProviderMetadata,
+    /// The 200 response the document came from (headers empty when the client
+    /// reports none).
+    response: HttpFetchResponse,
+    /// A response arrived and carried no header at all.
+    headerless: bool,
+}
+
+/// Run `grp::discover_response` and keep the fetched body as `raw` on the
+/// metadata; all validation stays upstream.
+fn discover_recorded(
+    py: Python<'_>,
+    http: Arc<dyn HttpClient>,
+    failures: &crate::http::Failures,
+    issuer: String,
+) -> PyResult<Discovered> {
+    let probe = Arc::new(HeaderProbe {
         inner: http,
-        last_ok_body: Mutex::new(None),
+        saw_response: Default::default(),
+        saw_headers: Default::default(),
     });
-    let client: Arc<dyn HttpClient> = recorder.clone();
-    let r = crate::runtime::block_on(py, async move { grp::discover(&client, &issuer).await })?;
-    let metadata = r.map_err(|e| failures.err(py, e))?;
-    let raw = recorder
-        .last_ok_body
-        .lock()
+    let client: Arc<dyn HttpClient> = probe.clone();
+    let r = crate::runtime::block_on(
+        py,
+        async move { grp::discover_response(&client, &issuer).await },
+    )?;
+    let grp::DiscoveryResponse {
+        metadata, response, ..
+    } = r.map_err(|e| failures.err(py, e))?;
+    let raw = serde_json::from_slice::<serde_json::Value>(&response.body)
         .ok()
-        .and_then(|mut g| g.take())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| match v {
             serde_json::Value::Object(m) => Some(m),
             _ => None,
         });
-    Ok(match raw {
+    let metadata = match raw {
         Some(raw) => ProviderMetadata::wrap_with_raw(metadata, raw),
         // Unreachable in practice (upstream parsed the same body); fall back
         // to the re-serialized document.
@@ -757,43 +1079,12 @@ fn discover(
                 None => ProviderMetadata::wrap(metadata),
             }
         }
+    };
+    Ok(Discovered {
+        metadata,
+        response,
+        headerless: probe.headerless(),
     })
-}
-
-/// `HttpClient` decorator remembering the body of the last 200 GET response.
-struct BodyRecorder {
-    inner: Arc<dyn HttpClient>,
-    last_ok_body: Mutex<Option<Vec<u8>>>,
-}
-
-#[async_trait]
-impl HttpClient for BodyRecorder {
-    async fn get(&self, url: &str) -> grindvakt::Result<HttpFetchResponse> {
-        let resp = self.inner.get(url).await?;
-        if resp.status == 200 {
-            if let Ok(mut g) = self.last_ok_body.lock() {
-                *g = Some(resp.body.clone());
-            }
-        }
-        Ok(resp)
-    }
-
-    async fn post_form(
-        &self,
-        url: &str,
-        form: &[(String, String)],
-        headers: &[(String, String)],
-    ) -> grindvakt::Result<HttpFetchResponse> {
-        self.inner.post_form(url, form, headers).await
-    }
-
-    async fn get_with_headers(
-        &self,
-        url: &str,
-        headers: &[(String, String)],
-    ) -> grindvakt::Result<HttpFetchResponse> {
-        self.inner.get_with_headers(url, headers).await
-    }
 }
 
 /// Library-controlled RP-Initiated Logout parameters.
@@ -827,7 +1118,8 @@ fn non_empty(name: &str, v: Option<&str>) -> PyResult<()> {
 /// without a fragment and registered with the OP.
 /// `extra` (dict or list of pairs) may not contain the parameters controlled
 /// by this function. Raises `ConfigError` if the provider has no
-/// `end_session_endpoint`, `BadRequestError` for unsafe or invalid input.
+/// `end_session_endpoint` or it is unsafe, `BadRequestError` for invalid or
+/// unregistered caller-supplied values.
 #[pyfunction]
 #[pyo3(signature = (provider, *, id_token_hint = None, client = None, post_logout_redirect_uri = None, state = None, logout_hint = None, ui_locales = None, extra = None))]
 #[allow(clippy::too_many_arguments)]
@@ -842,27 +1134,39 @@ fn end_session_url(
     extra: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<String> {
     let endpoint = provider.end_session_endpoint.as_deref().ok_or_else(|| {
-        err(RsError::Config(
-            "provider has no usable end_session_endpoint (the advertised endpoint was missing, \
-             unsafe, or on a different origin than the issuer)"
-                .into(),
-        ))
+        let msg = match provider.end_session_outcome {
+            EndSessionOutcome::Rejected => {
+                "provider has no usable end_session_endpoint: the advertised value was rejected by \
+                 ProviderInfo.from_metadata (cross-origin or unsafe; see the UserWarning emitted \
+                 when the ProviderInfo was built, and info.metadata.end_session_endpoint for the \
+                 raw, UNTRUSTED value (diagnostics only, never redirect to it))"
+            }
+            EndSessionOutcome::InvalidType => {
+                "provider has no usable end_session_endpoint: the provider advertised a \
+                 non-string end_session_endpoint, ignored by ProviderInfo.from_metadata (see the \
+                 UserWarning emitted when the ProviderInfo was built, and \
+                 info.metadata.end_session_endpoint for the raw, UNTRUSTED value (diagnostics \
+                 only, never redirect to it))"
+            }
+            EndSessionOutcome::NotAdvertised | EndSessionOutcome::Accepted => {
+                "provider has no usable end_session_endpoint: the provider does not advertise \
+                 end_session_endpoint"
+            }
+        };
+        err(RsError::Config(msg.into()))
     })?;
     // Origin binding was decided when the ProviderInfo was built (it may have
     // opted in); re-check only the shared safety rules here.
     validate_end_session_endpoint(endpoint, &provider.inner.issuer, true)?;
-    let mut url = url::Url::parse(endpoint).map_err(|e| {
-        err(RsError::BadRequest(format!(
-            "invalid end_session_endpoint: {e}"
-        )))
-    })?;
+    let mut url = url::Url::parse(endpoint)
+        .map_err(|e| config_err(format!("invalid end_session_endpoint: {e}")))?;
     if url
         .query_pairs()
         .any(|(k, _)| END_SESSION_RESERVED.contains(&k.as_ref()))
     {
-        return Err(err(RsError::BadRequest(
-            "end_session_endpoint query contains a library-controlled parameter".into(),
-        )));
+        return Err(config_err(
+            "end_session_endpoint query contains a library-controlled parameter",
+        ));
     }
     for (name, v) in [
         ("id_token_hint", id_token_hint),
@@ -874,7 +1178,7 @@ fn end_session_url(
         non_empty(name, v)?;
     }
     if let Some(uri) = post_logout_redirect_uri {
-        grp::validate_redirect_uri_syntax(uri).map_err(err)?;
+        check_redirect_uri(uri).map_err(err)?;
         // Exact match against the client's registration, never the caller's
         // say-so: otherwise a request-supplied value makes logout an open
         // redirect that also carries `id_token_hint`.
@@ -932,6 +1236,19 @@ fn end_session_url(
 ///
 /// The issuer is required so loopback HTTP is allowed only for an explicitly
 /// loopback HTTP development issuer.
+///
+/// A published JWK Set must not carry symmetric keys (OIDC Core section
+/// 10.1): any `oct` key is dropped from the result and a `UserWarning` is
+/// emitted, so a fetched set can never verify an `HS256` / `HS384` / `HS512`
+/// token. MAC-signed ID tokens are verified with a key set you build from the
+/// `client_secret` instead (see `verify_id_token`).
+///
+/// The warning is emitted once per call (no global dedup): Python's warnings
+/// registry collapses identical messages per location by default, but under
+/// `simplefilter("always")` or `"error"` it fires on every call. The returned
+/// dict may therefore differ from the OP's published document; callers that
+/// cache or diff it should use a warnings filter or `JwksCache`, which caches
+/// the filtered set.
 #[pyfunction]
 #[pyo3(signature = (http, jwks_uri, issuer))]
 fn fetch_jwks<'py>(
@@ -944,7 +1261,7 @@ fn fetch_jwks<'py>(
     let r = crate::runtime::block_on(py, async move {
         grp::fetch_jwks(&http, &jwks_uri, &issuer).await
     })?;
-    let jwks = r.map_err(|e| failures.err(py, e))?;
+    let jwks = drop_published_oct_keys(py, r.map_err(|e| failures.err(py, e))?);
     to_py(py, &jwks)
 }
 
@@ -981,19 +1298,48 @@ fn exchange_code(
 
 /// Convert a Python int option to an unsigned seconds value.
 fn seconds(name: &str, v: Option<i64>) -> PyResult<Option<u64>> {
-    v.map(|v| {
-        u64::try_from(v).map_err(|_| PyValueError::new_err(format!("{name} must not be negative")))
-    })
-    .transpose()
+    v.map(|v| u64::try_from(v).map_err(|_| config_err(format!("{name} must not be negative"))))
+        .transpose()
 }
 
 fn parse_algorithms(algs: &[String]) -> PyResult<Vec<JwsAlgorithm>> {
     algs.iter()
         .map(|alg| {
             JwsAlgorithm::from_str(alg)
-                .map_err(|e| PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}")))
+                .map_err(|e| config_err(format!("invalid JWS algorithm {alg:?}: {e}")))
         })
         .collect()
+}
+
+/// Refuse shared-secret algorithms for a key set that came from a published
+/// JWKS (OIDC Core section 10.1: MAC keys derive from the `client_secret`,
+/// and an OP must not publish symmetric keys). No override.
+fn reject_published_mac(py: Python<'_>, algs: &[JwsAlgorithm]) -> PyResult<()> {
+    if algs.iter().copied().any(is_mac) {
+        return Err(with_code(
+            py,
+            config_err(
+                "HS256/HS384/HS512 are not allowed with a JwksCache: an OP's published JWK Set \
+                 never carries the key for MAC-signed ID tokens (OIDC Core section 10.1: the \
+                 key is derived from the client_secret). Verify with rp.verify_id_token and a \
+                 key set you build from the client_secret instead",
+            ),
+            "shared_secret_algorithm",
+        ));
+    }
+    Ok(())
+}
+
+/// `jwt::drop_oct_keys` for a key set fetched from a published `jwks_uri`.
+/// An OP must not publish symmetric keys (OIDC Core section 10.1), so they
+/// are never used.
+fn drop_published_oct_keys(py: Python<'_>, jwks: JwkSet) -> JwkSet {
+    drop_oct_keys(
+        py,
+        jwks,
+        "published JWKS",
+        "OPs must not publish symmetric keys (OIDC Core section 10.1)",
+    )
 }
 
 /// Enforce the nonce policy shared by `verify_id_token` and
@@ -1063,14 +1409,14 @@ impl IdTokenPolicy {
         // Fail on configuration errors before any key-set fetch; upstream
         // repeats these checks.
         if policy.require_at_hash && policy.access_token.is_none() {
-            return Err(err(RsError::BadRequest(
-                "require_at_hash needs an access_token to check against".into(),
-            )));
+            return Err(config_err(
+                "require_at_hash needs an access_token to check against",
+            ));
         }
         if policy.require_c_hash && policy.authorization_code.is_none() {
-            return Err(err(RsError::BadRequest(
-                "require_c_hash needs an authorization_code to check against".into(),
-            )));
+            return Err(config_err(
+                "require_c_hash needs an authorization_code to check against",
+            ));
         }
         // `strict_hashes` requires the claim whenever the value to bind it to
         // is in hand (blocks token substitution by omission). Applied after
@@ -1078,15 +1424,13 @@ impl IdTokenPolicy {
         policy.require_at_hash |= policy.strict_hashes && policy.access_token.is_some();
         policy.require_c_hash |= policy.strict_hashes && policy.authorization_code.is_some();
         if policy.leeway.is_some_and(|l| l > grp::MAX_ID_TOKEN_LEEWAY) {
-            return Err(err(RsError::BadRequest(format!(
+            return Err(config_err(format!(
                 "id_token leeway must be at most {} seconds",
                 grp::MAX_ID_TOKEN_LEEWAY
-            ))));
+            )));
         }
         if policy.acr_values.as_ref().is_some_and(Vec::is_empty) {
-            return Err(err(RsError::BadRequest(
-                "acr_values must not be empty when set".into(),
-            )));
+            return Err(config_err("acr_values must not be empty when set"));
         }
         Ok(policy)
     }
@@ -1100,6 +1444,7 @@ impl IdTokenPolicy {
         client_id: &str,
         expected_nonce: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
+        let jwks = &*prepare_mac_keys(py, jwks, id_token, &self.algorithms, KeySelection::Named)?;
         let trusted = self
             .trusted_additional_audiences
             .iter()
@@ -1168,10 +1513,19 @@ impl IdTokenPolicy {
 /// nonce (e.g. a pure OAuth 2.0 flow that still returns an id_token). Skipping
 /// it for the standard code flow allows id_token replay.
 ///
+/// `HS256` / `HS384` / `HS512` ID tokens are MAC'd with a key derived from the
+/// `client_secret` (OIDC Core section 10.1), never from the OP's JWK Set.
+/// Verify them with a key set you build yourself, for example
+/// `{"keys": [{"kty": "oct", "k": <base64url(client_secret)>}]}`; the key
+/// must be at least as long as the hash output (32 / 48 / 64 bytes, RFC 7518
+/// section 3.2), else `ConfigError(code="weak_shared_secret")`. A `JwksCache`
+/// as `jwks` with an `HS*` algorithm is refused
+/// (`ConfigError(code="shared_secret_algorithm")`); `none` is never accepted.
+///
 /// Optional extra checks (keyword-only, all off by default):
 ///
 /// * `leeway`: clock-skew tolerance in seconds for `exp` / `nbf` / `iat` and
-///   the future-`auth_time` check (default 60; above 300 is `BadRequestError`).
+///   the future-`auth_time` check (default 60; above 300 is `ConfigError`).
 /// * `max_age`: requires a numeric `auth_time` claim no older than `max_age`
 ///   seconds (`iat` is not used; a missing or non-numeric `auth_time` is an
 ///   `AuthnError`; leeway is not added).
@@ -1179,7 +1533,7 @@ impl IdTokenPolicy {
 /// * `access_token` / `authorization_code`: validate `at_hash` / `c_hash`
 ///   when the id_token carries one. `require_at_hash` / `require_c_hash`
 ///   additionally reject tokens without the claim (they need the matching
-///   value, else `BadRequestError`). An `EdDSA` token carrying a hash claim
+///   value, else `ConfigError`). An `EdDSA` token carrying a hash claim
 ///   cannot be checked (`CryptoError`).
 /// * `strict_hashes`: reject (`AuthnError`) an id_token carrying `at_hash` /
 ///   `c_hash` that cannot be checked (no matching `access_token` /
@@ -1233,6 +1587,7 @@ fn verify_id_token<'py>(
     );
     let set = JwksSource::from_py(jwks)?;
     let policy = policy?;
+    set.check_algorithms(py, &policy.algorithms)?;
     let set = set.resolve(py, id_token, issuer)?;
     Ok(policy
         .verify(py, &set, id_token, issuer, client_id, expected_nonce)?
@@ -1263,10 +1618,19 @@ impl<'py> JwksSource<'py> {
     /// before any network request.
     fn check_issuer(&self, issuer: &str) -> PyResult<()> {
         match self {
-            Self::Cache(cache) if cache.get().issuer != issuer => Err(err(RsError::BadRequest(
-                "JwksCache issuer does not match the issuer argument".into(),
-            ))),
+            Self::Cache(cache) if cache.get().issuer != issuer => Err(config_err(
+                "JwksCache issuer does not match the issuer argument",
+            )),
             _ => Ok(()),
+        }
+    }
+
+    /// A cache is a published JWKS: shared-secret algorithms are refused for
+    /// it. Call this before any network request.
+    fn check_algorithms(&self, py: Python<'_>, algs: &[JwsAlgorithm]) -> PyResult<()> {
+        match self {
+            Self::Cache(_) => reject_published_mac(py, algs),
+            Self::Set(_) => Ok(()),
         }
     }
 
@@ -1356,18 +1720,101 @@ impl HttpClient for HeaderProbe {
     }
 }
 
-/// RAII token for the single in-flight fetch; see `JwksCache::begin_flight`.
+/// RAII token for the single in-flight fetch; see `begin_flight`. Shared by
+/// `JwksCache` and `DiscoveryCache`.
 struct Flight<'a> {
-    cache: &'a JwksCache,
+    busy: &'a Mutex<bool>,
+    done: &'a Condvar,
 }
 
 impl Drop for Flight<'_> {
     fn drop(&mut self) {
-        let mut busy = self.cache.flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         *busy = false;
-        self.cache.flight_done.notify_one();
+        self.done.notify_one();
     }
 }
+
+/// Clock reading: the injected `_now` hook, else the monotonic clock. A hook
+/// that raises or returns a non-float falls back to the monotonic clock.
+fn clock_now(clock: &Option<Py<PyAny>>) -> f64 {
+    match clock {
+        Some(clock) => Python::attach(|py| clock.call0(py).and_then(|v| v.extract::<f64>(py)))
+            .unwrap_or_else(|_| monotonic_now()),
+        None => monotonic_now(),
+    }
+}
+
+/// Wait (with the GIL released, because the holder needs the GIL to run a
+/// Python HTTP adapter) until no other thread is fetching, then become the
+/// fetching thread. The wait is bounded by `timeout` (real time, not the
+/// injected test clock); on expiry it raises `InternalError(code=timeout_code)`
+/// whose message names `what`. The holder is never interrupted and still clears
+/// the flight when it finishes.
+fn begin_flight<'a>(
+    py: Python<'_>,
+    busy: &'a Mutex<bool>,
+    done: &'a Condvar,
+    timeout: std::time::Duration,
+    what: &str,
+    timeout_code: &str,
+) -> PyResult<Flight<'a>> {
+    let acquired = py.detach(|| {
+        // `None`: the timeout is too large to represent; wait unbounded.
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let mut guard = busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *guard {
+            let wait = match deadline {
+                None => std::time::Duration::from_secs(3600),
+                Some(d) => {
+                    let left = d.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    left
+                }
+            };
+            guard = done
+                .wait_timeout(guard, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *guard = true;
+        true
+    });
+    if !acquired {
+        let msg = format!(
+            "timed out after {}s waiting for another thread's {what}",
+            timeout.as_secs_f64()
+        );
+        return Err(with_code(py, InternalError::new_err(msg), timeout_code));
+    }
+    Ok(Flight { busy, done })
+}
+
+/// Validate and convert a `fetch_timeout` argument (seconds).
+fn parse_fetch_timeout(fetch_timeout: f64) -> PyResult<std::time::Duration> {
+    const MSG: &str = "fetch_timeout must be a finite number of seconds, at least 1e-9";
+    if !(fetch_timeout.is_finite() && fetch_timeout > 0.0) {
+        return Err(config_err(MSG));
+    }
+    // Absurdly large values saturate instead of panicking.
+    let d =
+        std::time::Duration::try_from_secs_f64(fetch_timeout).unwrap_or(std::time::Duration::MAX);
+    if d.is_zero() {
+        return Err(config_err(MSG));
+    }
+    Ok(d)
+}
+
+/// Defaults of the `JwksCache` constructor, defined once: the pyo3 signature
+/// and `DiscoveryCache::jwks` (which builds its `JwksCache` with them) both use
+/// these, so they cannot drift.
+const JWKS_DEFAULT_TTL: i64 = 3600;
+const JWKS_MIN_TTL: i64 = 60;
+const JWKS_MAX_TTL: i64 = 86400;
+const JWKS_MIN_REFRESH_INTERVAL: i64 = 30;
+const JWKS_FETCH_TIMEOUT: f64 = 45.0;
 
 /// A caching JWK Set fetcher for one issuer.
 ///
@@ -1390,6 +1837,13 @@ impl Drop for Flight<'_> {
 /// network timeouts, and a stalled adapter still stalls its own caller (the
 /// built-in `ReqwestClient` has a 30s request timeout). The fetch carries on
 /// and its result is cached when it finishes.
+///
+/// Symmetric (`oct`) keys in the fetched document are dropped with a
+/// `UserWarning` (once per fetch): an OP must not publish them (OIDC Core
+/// section 10.1). `verify_id_token` refuses `HS256` / `HS384` / `HS512` in
+/// `allowed_algorithms` with `ConfigError(code="shared_secret_algorithm")`
+/// and no override: use `rp.verify_id_token` with a key set built from the
+/// `client_secret` for those.
 ///
 /// `verify_id_token` refreshes the set at most once when the token's `kid` is
 /// not in it (key rotation), but no more often than `min_refresh_interval`
@@ -1419,12 +1873,56 @@ pub struct JwksCache {
 }
 
 impl JwksCache {
-    fn now(&self) -> f64 {
-        match &self.clock {
-            Some(clock) => Python::attach(|py| clock.call0(py).and_then(|v| v.extract::<f64>(py)))
-                .unwrap_or_else(|_| monotonic_now()),
-            None => monotonic_now(),
+    /// Validate the arguments and build a cache. Shared by the Python
+    /// constructor and `DiscoveryCache::jwks`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        http: Option<&Bound<'_, PyAny>>,
+        jwks_uri: String,
+        issuer: String,
+        default_ttl: i64,
+        min_ttl: i64,
+        max_ttl: i64,
+        min_refresh_interval: i64,
+        fetch_timeout: f64,
+        clock: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        // Validate the client and the URLs now rather than on first use.
+        extract_http_client(http)?;
+        reject_reinterpreted_url_chars("issuer", &issuer).map_err(config_from)?;
+        reject_reinterpreted_url_chars("jwks_uri", &jwks_uri).map_err(config_from)?;
+        grp::validate_issuer(&issuer).map_err(config_from)?;
+        grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer)
+            .map_err(config_from)?;
+        let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
+        let (default_ttl, min_ttl, max_ttl) = (
+            get("default_ttl", default_ttl)?,
+            get("min_ttl", min_ttl)?,
+            get("max_ttl", max_ttl)?,
+        );
+        if min_ttl > max_ttl {
+            return Err(config_err("min_ttl must not exceed max_ttl"));
         }
+        let fetch_timeout = parse_fetch_timeout(fetch_timeout)?;
+        Ok(Self {
+            http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
+            jwks_uri,
+            issuer,
+            default_ttl,
+            min_ttl,
+            max_ttl,
+            min_refresh_interval: get("min_refresh_interval", min_refresh_interval)?,
+            fetch_timeout,
+            clock,
+            state: RwLock::default(),
+            flight: Mutex::new(false),
+            flight_done: Condvar::new(),
+            warned_no_headers: Default::default(),
+        })
+    }
+
+    fn now(&self) -> f64 {
+        clock_now(&self.clock)
     }
 
     fn snapshot(&self) -> Option<Arc<CacheEntry>> {
@@ -1439,49 +1937,17 @@ impl JwksCache {
         self.snapshot().filter(|e| now < e.expires_at)
     }
 
-    /// Wait (with the GIL released, because the holder needs the GIL to run a
-    /// Python HTTP adapter) until no other thread is fetching, then become the
-    /// fetching thread. The wait is bounded by `fetch_timeout` (real time,
-    /// not the injected test clock); on expiry it raises
-    /// `InternalError(code="jwks_fetch_timeout")`. The holder is never
-    /// interrupted and still clears the flight when it finishes.
+    /// Become the fetching thread; see the free `begin_flight`. A waiter that
+    /// times out raises `InternalError(code="jwks_fetch_timeout")`.
     fn begin_flight(&self, py: Python<'_>) -> PyResult<Flight<'_>> {
-        let acquired = py.detach(|| {
-            // `None`: the timeout is too large to represent; wait unbounded.
-            let deadline = std::time::Instant::now().checked_add(self.fetch_timeout);
-            let mut busy = self.flight.lock().unwrap_or_else(|e| e.into_inner());
-            while *busy {
-                let wait = match deadline {
-                    None => std::time::Duration::from_secs(3600),
-                    Some(d) => {
-                        let left = d.saturating_duration_since(std::time::Instant::now());
-                        if left.is_zero() {
-                            return false;
-                        }
-                        left
-                    }
-                };
-                busy = self
-                    .flight_done
-                    .wait_timeout(busy, wait)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-            }
-            *busy = true;
-            true
-        });
-        if !acquired {
-            let msg = format!(
-                "timed out after {}s waiting for another thread's JWKS fetch",
-                self.fetch_timeout.as_secs_f64()
-            );
-            return Err(with_code(
-                py,
-                InternalError::new_err(msg),
-                "jwks_fetch_timeout",
-            ));
-        }
-        Ok(Flight { cache: self })
+        begin_flight(
+            py,
+            &self.flight,
+            &self.flight_done,
+            self.fetch_timeout,
+            "JWKS fetch",
+            "jwks_fetch_timeout",
+        )
     }
 
     fn rate_limited(&self, now: f64) -> bool {
@@ -1534,7 +2000,7 @@ impl JwksCache {
             .unwrap_or(self.default_ttl)
             .clamp(self.min_ttl, self.max_ttl);
         let entry = Arc::new(CacheEntry {
-            jwks: Arc::new(resp.jwks),
+            jwks: Arc::new(drop_published_oct_keys(py, resp.jwks)),
             expires_at: self.now() + ttl as f64,
         });
         self.state.write().unwrap_or_else(|e| e.into_inner()).entry = Some(entry.clone());
@@ -1593,9 +2059,10 @@ fn kid_unknown(jwks: &JwkSet, kid: &str) -> bool {
 #[pymethods]
 impl JwksCache {
     #[new]
-    #[pyo3(signature = (http, jwks_uri, issuer, *, default_ttl = 3600, min_ttl = 60,
-                        max_ttl = 86400, min_refresh_interval = 30, fetch_timeout = 45.0,
-                        _now = None))]
+    #[pyo3(signature = (http, jwks_uri, issuer, *, default_ttl = JWKS_DEFAULT_TTL,
+                        min_ttl = JWKS_MIN_TTL, max_ttl = JWKS_MAX_TTL,
+                        min_refresh_interval = JWKS_MIN_REFRESH_INTERVAL,
+                        fetch_timeout = JWKS_FETCH_TIMEOUT, _now = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         http: Option<&Bound<'_, PyAny>>,
@@ -1608,49 +2075,18 @@ impl JwksCache {
         fetch_timeout: f64,
         _now: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        // Validate the client and the URLs now rather than on first use.
-        extract_http_client(http)?;
-        grp::validate_issuer(&issuer).map_err(err)?;
-        grp::validate_service_endpoint_for_issuer("jwks_uri", &jwks_uri, &issuer).map_err(err)?;
-        let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
-        let (default_ttl, min_ttl, max_ttl) = (
-            get("default_ttl", default_ttl)?,
-            get("min_ttl", min_ttl)?,
-            get("max_ttl", max_ttl)?,
-        );
-        if min_ttl > max_ttl {
-            return Err(PyValueError::new_err("min_ttl must not exceed max_ttl"));
-        }
-        if !(fetch_timeout.is_finite() && fetch_timeout > 0.0) {
-            return Err(PyValueError::new_err(
-                "fetch_timeout must be a finite number of seconds, at least 1e-9",
-            ));
-        }
-        // Absurdly large values saturate instead of panicking.
-        let fetch_timeout = std::time::Duration::try_from_secs_f64(fetch_timeout)
-            .unwrap_or(std::time::Duration::MAX);
-        if fetch_timeout.is_zero() {
-            return Err(PyValueError::new_err(
-                "fetch_timeout must be a finite number of seconds, at least 1e-9",
-            ));
-        }
-        Ok(Self {
-            http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
+        Self::build(
+            http,
             jwks_uri,
             issuer,
             default_ttl,
             min_ttl,
             max_ttl,
-            min_refresh_interval: get("min_refresh_interval", min_refresh_interval)?,
+            min_refresh_interval,
             fetch_timeout,
-            clock: _now,
-            state: RwLock::default(),
-            flight: Mutex::new(false),
-            flight_done: Condvar::new(),
-            warned_no_headers: Default::default(),
-        })
+            _now,
+        )
     }
-
     #[getter]
     fn jwks_uri(&self) -> &str {
         &self.jwks_uri
@@ -1740,10 +2176,572 @@ impl JwksCache {
             require_c_hash,
             strict_hashes,
         )?;
+        reject_published_mac(py, &policy.algorithms)?;
         let set = self.resolve_for_token(py, id_token)?;
         Ok(policy
             .verify(py, &set, id_token, &self.issuer, client_id, expected_nonce)?
             .into_bound(py))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DiscoveryCache
+// ---------------------------------------------------------------------------
+
+/// One successful discovery fetch.
+struct DiscoveryEntry {
+    metadata: ProviderMetadata,
+    /// `ProviderInfo.from_metadata(metadata)`, built once per fetch so its
+    /// `UserWarning`s fire once per fetch.
+    info: ProviderInfo,
+    expires_at: f64,
+    /// Monotonically increasing, assigned when a fetched entry is installed
+    /// (fetches are serialised by the flight). Orders entries for `jwks()`.
+    generation: u64,
+}
+
+#[derive(Default)]
+struct DiscoveryState {
+    entry: Option<Arc<DiscoveryEntry>>,
+    /// The latest failed fetch (a traceback-free copy of the error and the
+    /// clock reading when it finished); cleared by a successful fetch. Drives
+    /// `failure_backoff`; see `DiscoveryCache::record_failure`.
+    failure: Option<(PyErr, f64)>,
+}
+
+/// A copy of `e` without traceback or implicit context, with its `__cause__`
+/// chain copied the same way (at most `depth` links, then cut). `copy.copy` of
+/// an exception keeps the type, args and instance attributes (`code`,
+/// `retryable`, `upstream_*`, ...) and drops `__traceback__`. If copying fails
+/// the traceback of `e` itself is cleared instead (it is already the caller's
+/// by then; losing it beats pinning frames).
+fn detached_copy(py: Python<'_>, e: &PyErr, depth: usize) -> PyErr {
+    let value = e.value(py);
+    let copied = py
+        .import("copy")
+        .and_then(|m| m.call_method1("copy", (value,)))
+        .ok()
+        .and_then(|c| c.cast_into::<pyo3::exceptions::PyBaseException>().ok());
+    let Some(copy) = copied else {
+        let kept = e.clone_ref(py);
+        kept.set_traceback(py, None);
+        return kept;
+    };
+    let _ = copy.setattr("__traceback__", py.None());
+    let cause = value
+        .getattr("__cause__")
+        .ok()
+        .filter(|c| !c.is_none() && depth > 0)
+        .map(|c| detached_copy(py, &PyErr::from_value(c), depth - 1));
+    let out = PyErr::from_value(copy.into_any());
+    out.set_cause(py, cause);
+    out
+}
+
+/// What `DiscoveryCache::backoff_outcome` decided for a call inside the
+/// back-off window of a failed fetch.
+enum Backoff {
+    Stale(Arc<DiscoveryEntry>),
+    Refused(PyErr),
+}
+
+/// A caching OpenID Provider discovery client for one issuer.
+///
+/// `metadata()` returns the provider's discovery document and `info()` the
+/// matching `ProviderInfo` (built once per fetch, so the `UserWarning`s of
+/// `ProviderInfo.from_metadata` fire once per fetch); `jwks()` returns a
+/// `JwksCache` bound to the advertised `jwks_uri` and issuer. The document is
+/// refetched when it expires. The lifetime is the response's
+/// `Cache-Control: max-age` minus `Age` when present, else `default_ttl`,
+/// clamped to `[min_ttl, max_ttl]` (so `no-store` / `no-cache` / `max-age=0`
+/// are floored to `min_ttl`). Cache-Control is honoured only when the
+/// `HttpClient` reports response headers (the built-in client does; a Python
+/// adapter must return them, see `HttpFetchResponse`); otherwise `default_ttl`
+/// applies and a `UserWarning` is emitted on the first fetch. The discovery
+/// issuer check of `rp.discover` applies on every fetch: a document whose
+/// `issuer` differs from the configured one raises and is neither cached nor
+/// served.
+///
+/// Concurrent callers share a single fetch. `fetch_timeout` (seconds, at least
+/// 1e-9, default 45) bounds how long a thread WAITS for another thread's
+/// in-flight fetch; on expiry the waiter raises
+/// `InternalError(code="discovery_fetch_timeout")`. The fetch carries on and
+/// its result is cached when it finishes; before raising, the waiter applies
+/// the stale policy below and is served the previous document if allowed. The
+/// `JwksCache` built by `jwks()` uses the same `fetch_timeout`, `http` client
+/// and clock, and the `JwksCache` constructor defaults for its TTL parameters.
+///
+/// After a failed fetch no new network call is made for `failure_backoff`
+/// seconds. In that window, and also when a fetch of an expired entry fails,
+/// the previous document is served ONLY if `stale_on_error` is true and the
+/// entry expired less than `max_stale` seconds ago (a one-time `UserWarning`
+/// is emitted when stale metadata is first served after a failure). Otherwise
+/// the original error is raised, or inside the window
+/// `InternalError(code="discovery_backoff")` chained to a traceback-free copy
+/// of it (`__cause__`); its `retryable` is the cause's.
+/// This differs from `JwksCache`, which never serves an expired key set:
+/// metadata changes rarely and an outage of the well-known endpoint should
+/// not break login, while keys stay never-stale through the `JwksCache` that
+/// `jwks()` returns.
+///
+/// The cache is plain in-process memory: it stays valid in a forked child, but
+/// fork only while no other thread is inside a cache call.
+///
+/// `_now` is a private test hook: a zero-argument callable returning the
+/// clock in seconds.
+#[pyclass(module = "pygrindvakt.rp", name = "DiscoveryCache", frozen)]
+pub struct DiscoveryCache {
+    http: Option<Py<PyAny>>,
+    issuer: String,
+    default_ttl: u64,
+    min_ttl: u64,
+    max_ttl: u64,
+    failure_backoff: u64,
+    stale_on_error: bool,
+    max_stale: u64,
+    fetch_timeout: std::time::Duration,
+    allow_cross_origin_end_session: bool,
+    clock: Option<Py<PyAny>>,
+    state: RwLock<DiscoveryState>,
+    /// The `JwksCache` handed out by `jwks()` and the generation of the
+    /// metadata entry it was built for.
+    jwks_slot: Mutex<Option<(u64, Py<JwksCache>)>>,
+    /// Source of `DiscoveryEntry::generation`.
+    generation: std::sync::atomic::AtomicU64,
+    flight: Mutex<bool>,
+    flight_done: Condvar,
+    /// The no-response-headers warning is emitted once per cache.
+    warned_no_headers: std::sync::atomic::AtomicBool,
+    /// The stale-served warning is emitted once per outage (re-armed by a
+    /// successful fetch).
+    warned_stale: std::sync::atomic::AtomicBool,
+}
+
+impl DiscoveryCache {
+    fn now(&self) -> f64 {
+        clock_now(&self.clock)
+    }
+
+    fn snapshot(&self) -> Option<Arc<DiscoveryEntry>> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry
+            .clone()
+    }
+
+    fn valid_entry(&self, now: f64) -> Option<Arc<DiscoveryEntry>> {
+        self.snapshot().filter(|e| now < e.expires_at)
+    }
+
+    /// An expired entry may be served: opted in and not expired for longer
+    /// than `max_stale`.
+    fn stale_entry(&self, now: f64) -> Option<Arc<DiscoveryEntry>> {
+        if !self.stale_on_error {
+            return None;
+        }
+        self.snapshot()
+            .filter(|e| now < e.expires_at + self.max_stale as f64)
+    }
+
+    fn begin_flight(&self, py: Python<'_>) -> PyResult<Flight<'_>> {
+        begin_flight(
+            py,
+            &self.flight,
+            &self.flight_done,
+            self.fetch_timeout,
+            "discovery fetch",
+            "discovery_fetch_timeout",
+        )
+    }
+
+    /// Seconds left of the back-off window of the latest failed fetch, if any.
+    fn backoff_remaining(&self, now: f64) -> Option<f64> {
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let (_, failed_at) = st.failure.as_ref()?;
+        let left = self.failure_backoff as f64 - (now - failed_at);
+        (left > 0.0).then_some(left)
+    }
+
+    fn warn_stale(&self, py: Python<'_>) {
+        if !self
+            .warned_stale
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn(
+                py,
+                "serving stale discovery metadata after a failed or timed-out fetch \
+                 (stale_on_error=True, bounded by max_stale); a failure is the __cause__ of \
+                 discovery_backoff errors and the document is refetched once the provider \
+                 recovers",
+            );
+        }
+    }
+
+    /// Inside the back-off window of a failed fetch: serve the stale entry or
+    /// refuse with `discovery_backoff` chained to the stored error. `None`
+    /// when no window is open.
+    fn backoff_outcome(&self, py: Python<'_>, now: f64) -> Option<Backoff> {
+        let left = self.backoff_remaining(now)?;
+        if let Some(stale) = self.stale_entry(now) {
+            self.warn_stale(py);
+            return Some(Backoff::Stale(stale));
+        }
+        let cause = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .as_ref()
+            .map(|(e, _)| e.clone_ref(py));
+        // `retryable` follows the stored cause (itself derived by
+        // `is_retryable`); no cause readable means not retryable.
+        let retryable = cause.as_ref().is_some_and(|c| {
+            c.value(py)
+                .getattr("retryable")
+                .and_then(|v| v.extract::<bool>())
+                .unwrap_or(false)
+        });
+        let msg = format!(
+            "the last discovery fetch failed; not retrying for another {:.0}s \
+             (failure_backoff={}s, no usable cached metadata)",
+            left.ceil(),
+            self.failure_backoff
+        );
+        let e = with_code_retryable(
+            py,
+            InternalError::new_err(msg),
+            "discovery_backoff",
+            retryable,
+        );
+        e.set_cause(py, cause);
+        Some(Backoff::Refused(e))
+    }
+
+    /// Record a failed fetch for the back-off window. A traceback-free copy is
+    /// stored (the original, with its frames, locals and HTTP requests, goes
+    /// to the caller only), so the failure does not pin that memory for the
+    /// window and `discovery_backoff` errors chained to it add nothing to it.
+    /// Returns the clock reading of the failure.
+    fn record_failure(&self, py: Python<'_>, e: &PyErr) -> f64 {
+        let now = self.now();
+        let stored = detached_copy(py, e, 4);
+        let old = self
+            .state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .replace((stored, now));
+        // Dropping a PyErr may run Python code: not under the lock.
+        drop(old);
+        now
+    }
+
+    /// Record a failed fetch; serve stale metadata if allowed, else give the
+    /// error back.
+    fn on_failure(&self, py: Python<'_>, e: PyErr) -> PyResult<Arc<DiscoveryEntry>> {
+        let now = self.record_failure(py, &e);
+        match self.stale_entry(now) {
+            Some(stale) => {
+                self.warn_stale(py);
+                Ok(stale)
+            }
+            None => Err(e),
+        }
+    }
+
+    /// Fetch, validate and store the document. The caller holds the flight.
+    fn fetch(&self, py: Python<'_>) -> PyResult<Arc<DiscoveryEntry>> {
+        // A fresh client (and `Failures` slot) per fetch, so a transport
+        // error is chained to this call's failure only.
+        let (http, failures) = extract_http_client(self.http.as_ref().map(|h| h.bind(py)))?;
+        let d = discover_recorded(py, http, &failures, self.issuer.clone())?;
+        if d.headerless
+            && !self
+                .warned_no_headers
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn(
+                py,
+                &format!(
+                    "this HttpClient reports no response headers; Cache-Control is ignored and \
+                     default_ttl ({}s) applies to discovery; return headers from your HttpClient \
+                     or lower default_ttl/max_ttl",
+                    self.default_ttl
+                ),
+            );
+        }
+        // `Cache-Control` / `Age` are parsed by the upstream quote-aware
+        // parser: remaining freshness, capped at `max_ttl`.
+        let ttl = d
+            .response
+            .cache_ttl_secs_max(self.max_ttl)
+            .unwrap_or(self.default_ttl)
+            .clamp(self.min_ttl, self.max_ttl);
+        let info =
+            ProviderInfo::from_metadata(py, &d.metadata, self.allow_cross_origin_end_session)?;
+        let entry = Arc::new(DiscoveryEntry {
+            metadata: d.metadata,
+            info,
+            expires_at: self.now() + ttl as f64,
+            generation: self
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
+        });
+        let old = {
+            let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let failure = st.failure.take();
+            st.entry = Some(entry.clone());
+            failure
+        };
+        drop(old);
+        self.warned_stale
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(entry)
+    }
+
+    /// The current entry, fetching first if there is none or it expired.
+    fn current(&self, py: Python<'_>) -> PyResult<Arc<DiscoveryEntry>> {
+        let now = self.now();
+        if let Some(e) = self.valid_entry(now) {
+            return Ok(e);
+        }
+        match self.backoff_outcome(py, now) {
+            Some(Backoff::Stale(e)) => return Ok(e),
+            Some(Backoff::Refused(e)) => return Err(e),
+            None => {}
+        }
+        let _flight = match self.begin_flight(py) {
+            Ok(f) => f,
+            Err(timeout) => {
+                // Timed out waiting for the fetching thread: the stale policy
+                // applies as it does to a failed fetch. The timeout is not
+                // recorded as a failure (the fetch is still running).
+                let now = self.now();
+                if let Some(e) = self.valid_entry(now) {
+                    return Ok(e);
+                }
+                return match self.stale_entry(now) {
+                    Some(stale) => {
+                        self.warn_stale(py);
+                        Ok(stale)
+                    }
+                    None => Err(timeout),
+                };
+            }
+        };
+        // Another thread may have fetched (or failed) while we waited.
+        let now = self.now();
+        if let Some(e) = self.valid_entry(now) {
+            return Ok(e);
+        }
+        match self.backoff_outcome(py, now) {
+            Some(Backoff::Stale(e)) => return Ok(e),
+            Some(Backoff::Refused(e)) => return Err(e),
+            None => {}
+        }
+        match self.fetch(py) {
+            Ok(e) => Ok(e),
+            Err(e) => self.on_failure(py, e),
+        }
+    }
+}
+
+#[pymethods]
+impl DiscoveryCache {
+    #[new]
+    #[pyo3(signature = (http, issuer, *, default_ttl = 3600, min_ttl = 60, max_ttl = 86400,
+                        failure_backoff = 10, stale_on_error = true, max_stale = 86400,
+                        fetch_timeout = 45.0, allow_cross_origin_end_session = false,
+                        _now = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        http: Option<&Bound<'_, PyAny>>,
+        issuer: String,
+        default_ttl: i64,
+        min_ttl: i64,
+        max_ttl: i64,
+        failure_backoff: i64,
+        stale_on_error: bool,
+        max_stale: i64,
+        fetch_timeout: f64,
+        allow_cross_origin_end_session: bool,
+        _now: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        // Validate the client and the issuer now rather than on first use.
+        extract_http_client(http)?;
+        reject_reinterpreted_url_chars("issuer", &issuer).map_err(config_from)?;
+        grp::validate_issuer(&issuer).map_err(config_from)?;
+        let get = |n: &str, v: i64| seconds(n, Some(v)).map(Option::unwrap_or_default);
+        let (default_ttl, min_ttl, max_ttl) = (
+            get("default_ttl", default_ttl)?,
+            get("min_ttl", min_ttl)?,
+            get("max_ttl", max_ttl)?,
+        );
+        if min_ttl > max_ttl {
+            return Err(config_err("min_ttl must not exceed max_ttl"));
+        }
+        let failure_backoff = get("failure_backoff", failure_backoff)?;
+        let max_stale = get("max_stale", max_stale)?;
+        let fetch_timeout = parse_fetch_timeout(fetch_timeout)?;
+        Ok(Self {
+            http: http.filter(|h| !h.is_none()).map(|h| h.clone().unbind()),
+            issuer,
+            default_ttl,
+            min_ttl,
+            max_ttl,
+            failure_backoff,
+            stale_on_error,
+            max_stale,
+            fetch_timeout,
+            allow_cross_origin_end_session,
+            clock: _now,
+            state: RwLock::default(),
+            jwks_slot: Mutex::new(None),
+            generation: Default::default(),
+            flight: Mutex::new(false),
+            flight_done: Condvar::new(),
+            warned_no_headers: Default::default(),
+            warned_stale: Default::default(),
+        })
+    }
+
+    /// The issuer this cache discovers.
+    #[getter]
+    fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Seconds after a failed fetch during which no new fetch is attempted.
+    #[getter]
+    fn failure_backoff(&self) -> u64 {
+        self.failure_backoff
+    }
+
+    /// Seconds a thread waits for another thread's in-flight fetch.
+    #[getter]
+    fn fetch_timeout(&self) -> f64 {
+        self.fetch_timeout.as_secs_f64()
+    }
+
+    fn __repr__(&self) -> String {
+        let (jwks_uri, expires_in) = match self.snapshot() {
+            Some(e) => {
+                let left = (e.expires_at - self.now()).max(0.0) as u64;
+                (e.info.inner.jwks_uri.clone(), Some(left))
+            }
+            None => (None, None),
+        };
+        let quoted = |s: &str| format!("'{}'", escape_untrusted_quoted(s, 256));
+        format!(
+            "DiscoveryCache(issuer={}, jwks_uri={}, expires_in={})",
+            quoted(&self.issuer),
+            jwks_uri.as_deref().map_or("None".to_string(), quoted),
+            expires_in.map_or("None".to_string(), |n| n.to_string()),
+        )
+    }
+
+    /// The provider's discovery document (a `ProviderMetadata`), fetching it
+    /// first if none is cached or it expired. See the class documentation for
+    /// the failure, back-off and stale policy.
+    fn metadata(&self, py: Python<'_>) -> PyResult<ProviderMetadata> {
+        Ok(self.current(py)?.metadata.clone())
+    }
+
+    /// `ProviderInfo.from_metadata(metadata())`, built once per fetch.
+    fn info(&self, py: Python<'_>) -> PyResult<ProviderInfo> {
+        Ok(self.current(py)?.info.clone())
+    }
+
+    /// A `JwksCache` bound to the advertised `jwks_uri` and issuer. The SAME
+    /// object is returned across metadata refreshes (so its cached keys
+    /// survive); it is replaced only when the new document advertises a
+    /// different `jwks_uri` or issuer, and the old object is then never
+    /// returned again. Do not keep the object across calls if the provider may
+    /// move its keys: call `jwks()` each time. Raises `ConfigError` when the
+    /// provider advertises no `jwks_uri`.
+    fn jwks(&self, py: Python<'_>) -> PyResult<Py<JwksCache>> {
+        let entry = self.current(py)?;
+        let Some(uri) = entry.info.inner.jwks_uri.clone() else {
+            return Err(config_err(
+                "the provider's discovery document advertises no jwks_uri",
+            ));
+        };
+        let issuer = entry.info.inner.issuer.clone();
+        let generation = entry.generation;
+        // What the slot says for a caller holding the entry of `generation`:
+        // reuse a matching cache (bumping the slot generation so an older
+        // entry can never replace it), serve the cache of a NEWER entry (the
+        // caller's entry is stale), or nothing: build and install.
+        let decide = |slot: &mut Option<(u64, Py<JwksCache>)>| {
+            let (slot_gen, cache) = slot.as_mut()?;
+            let c = cache.get();
+            if c.jwks_uri == uri && c.issuer == issuer {
+                *slot_gen = (*slot_gen).max(generation);
+                Some(cache.clone_ref(py))
+            } else if *slot_gen > generation {
+                Some(cache.clone_ref(py))
+            } else {
+                None
+            }
+        };
+        // The lock is never held across anything that can run Python code
+        // (which might release the GIL): a thread holding it while another
+        // thread waits for it with the GIL would deadlock.
+        if let Some(c) = decide(&mut self.jwks_slot.lock().unwrap_or_else(|e| e.into_inner())) {
+            return Ok(c);
+        }
+        let http = self.http.as_ref().map(|h| h.bind(py).clone());
+        let built = Py::new(
+            py,
+            JwksCache::build(
+                http.as_ref(),
+                uri.clone(),
+                issuer.clone(),
+                JWKS_DEFAULT_TTL,
+                JWKS_MIN_TTL,
+                JWKS_MAX_TTL,
+                JWKS_MIN_REFRESH_INTERVAL,
+                self.fetch_timeout.as_secs_f64(),
+                self.clock.as_ref().map(|c| c.clone_ref(py)),
+            )?,
+        )?;
+        let (result, old) = {
+            let mut slot = self.jwks_slot.lock().unwrap_or_else(|e| e.into_inner());
+            match decide(&mut slot) {
+                // Another thread installed a matching or newer one meanwhile.
+                Some(c) => (c, None),
+                None => (
+                    built.clone_ref(py),
+                    slot.replace((generation, built)).map(|(_, c)| c),
+                ),
+            }
+        };
+        drop(old);
+        Ok(result)
+    }
+
+    /// Force a refetch. A call within `failure_backoff` seconds of a failed
+    /// fetch is a silent no-op. A failed fetch raises the original error and
+    /// keeps the cached document (it is not served from here; `metadata()`
+    /// applies the stale policy).
+    fn refresh(&self, py: Python<'_>) -> PyResult<()> {
+        if self.backoff_remaining(self.now()).is_some() {
+            return Ok(());
+        }
+        let _flight = self.begin_flight(py)?;
+        // Another thread's fetch may have failed while we waited.
+        if self.backoff_remaining(self.now()).is_some() {
+            return Ok(());
+        }
+        match self.fetch(py) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.record_failure(py, &e);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1763,6 +2761,11 @@ impl JwksCache {
 /// `"untyped_shared_key_compat"` (weakest). `max_age` bounds the token age
 /// from `iat` (default 300 s); `None` removes the bound, leaving replay
 /// unbounded. Encrypted (JWE) responses are not supported.
+///
+/// `allowed_algorithms` containing `HS*` works with a caller-built `jwks`
+/// (an `oct` key from the `client_secret`, at least 32 / 48 / 64 bytes, else
+/// `ConfigError(code="weak_shared_secret")`); with a `JwksCache` it raises
+/// `ConfigError(code="shared_secret_algorithm")`.
 #[pyfunction]
 #[pyo3(signature = (http, userinfo_endpoint, access_token, expected_sub, issuer, *,
                     method = "POST", jwks = None, client_id = None,
@@ -1789,7 +2792,7 @@ fn fetch_userinfo<'py>(
         "POST" => grp::UserinfoMethod::Post,
         "GET" => grp::UserinfoMethod::Get,
         other => {
-            return Err(PyValueError::new_err(format!(
+            return Err(config_err(format!(
                 "method must be \"POST\" or \"GET\", got {other:?}"
             )))
         }
@@ -1797,36 +2800,29 @@ fn fetch_userinfo<'py>(
     if let Some(other) =
         trust.filter(|t| !matches!(*t, "typed" | "dedicated_keys" | "untyped_shared_key_compat"))
     {
-        return Err(PyValueError::new_err(format!(
+        return Err(config_err(format!(
             "trust must be \"typed\", \"dedicated_keys\" or \"untyped_shared_key_compat\", \
              got {other:?}"
         )));
     }
     if trust == Some("typed") && typ.is_none() {
-        return Err(PyValueError::new_err("trust=\"typed\" requires typ"));
+        return Err(config_err("trust=\"typed\" requires typ"));
     }
     if typ.is_some() && trust != Some("typed") {
-        return Err(PyValueError::new_err(
-            "typ is only used with trust=\"typed\"",
-        ));
+        return Err(config_err("typ is only used with trust=\"typed\""));
     }
     let jwks = jwks.map(JwksSource::from_py).transpose()?;
     if let Some(jwks) = &jwks {
         jwks.check_issuer(&issuer)?;
     }
     let algs = allowed_algorithms
-        .map(|algs| {
-            algs.iter()
-                .map(|alg| {
-                    JwsAlgorithm::from_str(alg).map_err(|e| {
-                        PyValueError::new_err(format!("invalid JWS algorithm {alg:?}: {e}"))
-                    })
-                })
-                .collect::<PyResult<Vec<_>>>()
-        })
+        .map(|algs| parse_algorithms(&algs))
         .transpose()?;
+    if let (Some(jwks), Some(algs)) = (&jwks, &algs) {
+        jwks.check_algorithms(py, algs)?;
+    }
     let Some(userinfo_endpoint) = userinfo_endpoint else {
-        return Err(ConfigError::new_err(
+        return Err(config_err(
             "provider does not advertise a userinfo_endpoint",
         ));
     };
@@ -1893,6 +2889,7 @@ fn fetch_userinfo<'py>(
         }
         // A cache refreshes once if the response's `kid` is unknown.
         let jwks = jwks.resolve(py, resp.text().trim(), &issuer)?;
+        let jwks = prepare_mac_keys(py, &jwks, resp.text().trim(), &algs, KeySelection::Named)?;
         grp::userinfo_signed_claims(
             &jwks,
             &resp,
@@ -1925,15 +2922,912 @@ fn claims_to_attributes(claims: &Bound<'_, PyAny>) -> PyResult<BTreeMap<String, 
     Ok(grp::claims_to_attributes(&v))
 }
 
+/// Largest `leeway` (seconds) `verify_id_token` accepts; a larger value raises
+/// `ConfigError`. A cap on skew tolerance, not a recommended value.
+const MAX_ID_TOKEN_LEEWAY: u64 = grp::MAX_ID_TOKEN_LEEWAY;
+
+/// Check the syntax of an issuer identifier.
+///
+/// Requires an absolute `https` URL (`http` only for loopback hosts) with no
+/// userinfo, query, fragment, whitespace, control or invisible characters.
+/// Raises `ConfigError` (a `ValueError`, `status_hint` 500) otherwise: the
+/// issuer is integrator configuration or provider metadata, not request
+/// input. It checks syntax only: it does NOT establish that the issuer is
+/// trusted, nor that it matches any discovery metadata. Backslashes are
+/// rejected: the URL parser would reinterpret them as `/`, so the parsed
+/// authority would differ from the raw string. Compare issuers byte-for-byte
+/// (exact string match); never suffix/substring checks.
+#[pyfunction]
+fn validate_issuer(issuer: &str) -> PyResult<()> {
+    reject_reinterpreted_url_chars("issuer", issuer).map_err(config_from)?;
+    grp::validate_issuer(issuer).map_err(config_from)
+}
+
+/// Check the syntax of a redirect URI.
+///
+/// Requires an absolute URL without a fragment (upstream's rule) and, as
+/// binding-side hardening stricter than core 0.9, rejects whitespace,
+/// control, bidi and invisible formatting characters and userinfo
+/// (`https://good.example@evil.example/cb`). Raises `BadRequestError`
+/// otherwise (not `ConfigError`: a redirect URI can come from a request).
+/// This checks syntax only. The scheme is NOT checked, so custom/native-app
+/// schemes such as `com.example.app:/cb` pass, and so do `javascript:`,
+/// `file:` and `http://attacker.example/cb`.
+///
+/// It is the syntax step of `RpClient`'s redirect URI handling, which also
+/// requires registration, exact-string comparison and a transport check
+/// (ADR 0004). It is NOT a registration policy and does NOT make a URI safe
+/// to register or redirect to. Do not use it to vet client registrations on
+/// an OP: this library provides no OP-side registration policy, so apply an
+/// https or scheme allow-list and compare by EXACT match yourself.
+///
+/// Backslashes are rejected: the URL parser would reinterpret them as `/`,
+/// making the parsed authority differ from the raw string.
+#[pyfunction]
+fn validate_redirect_uri_syntax(redirect_uri: &str) -> PyResult<()> {
+    check_redirect_uri(redirect_uri).map_err(err)
+}
+
+/// The loopback `http` development exception is opt-in: pass
+/// `allow_loopback_http=True` AND `issuer`, which must be the authenticated,
+/// locally configured issuer, never a value taken from the document being
+/// validated. A loopback `http` issuer then permits loopback `http` endpoints
+/// on ANY port.
+///
+/// Checks that a metadata endpoint is an absolute `https` URL. `name` appears
+/// in the error message. By default (`allow_loopback_http=False`) only `https`
+/// passes; if `issuer` is given it is still validated first (as
+/// `validate_issuer`, so an invalid issuer fails closed) but never enables
+/// loopback `http`. With `allow_loopback_http=True`, `issuer` is required
+/// (`ConfigError` otherwise), and loopback `http` is also allowed when the
+/// issuer is itself a loopback `http` origin; a `UserWarning` is emitted
+/// whenever a plain `http` endpoint is accepted that way. Raises
+/// `ConfigError` (a `ValueError`, `status_hint` 500) otherwise: endpoints come
+/// from integrator configuration or provider metadata, not request input. It
+/// does NOT check same-origin with the issuer (it never compares hosts) or
+/// establish trust. Backslashes in `endpoint` or `issuer` are rejected: the
+/// URL parser would reinterpret them as `/`, making the parsed authority
+/// differ from the raw string. Compare issuers byte-for-byte (exact string
+/// match); never suffix/substring checks.
+#[pyfunction]
+#[pyo3(signature = (name, endpoint, issuer = None, *, allow_loopback_http = false))]
+fn validate_service_endpoint(
+    py: Python<'_>,
+    name: &str,
+    endpoint: &str,
+    issuer: Option<&str>,
+    allow_loopback_http: bool,
+) -> PyResult<()> {
+    reject_reinterpreted_url_chars(name, endpoint).map_err(config_from)?;
+    if let Some(issuer) = issuer {
+        reject_reinterpreted_url_chars("issuer", issuer).map_err(config_from)?;
+        grp::validate_issuer(issuer).map_err(config_from)?;
+    }
+    if !allow_loopback_http {
+        return grp::validate_service_endpoint(name, endpoint).map_err(config_from);
+    }
+    let Some(issuer) = issuer else {
+        return Err(config_err(
+            "validate_service_endpoint: allow_loopback_http=True requires issuer",
+        ));
+    };
+    grp::validate_service_endpoint_for_issuer(name, endpoint, issuer).map_err(config_from)?;
+    let is_http = endpoint
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http:"));
+    if is_http {
+        warn(
+            py,
+            &format!(
+                "validate_service_endpoint: plain http {name} accepted only because \
+                 allow_loopback_http=True was requested explicitly and the issuer is a \
+                 loopback http origin; this is a development-only exception that allows \
+                 loopback endpoints on any port. The issuer must be the one you configured \
+                 and authenticated, never the `issuer` field of an unauthenticated document"
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// A FIXED list of the classical asymmetric JWS algorithm names the library
+/// parses: `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `ES256K` and
+/// `EdDSA`. `HS*` and `none` are never included. Post-quantum names (ML-DSA,
+/// feature-gated in jose-rs) are NOT included even if this build parses them.
+///
+/// It is a parser probe, not a recommended allowlist, not a list an OP
+/// advertises, and not what is appropriate for your deployment; pass an
+/// explicit allowlist to `verify_id_token`. It includes `EdDSA`, for which
+/// `jwt.supports_oidc_token_hash` is False, so
+/// `allowed_algorithms=rp.asymmetric_algorithms()` with `strict_hashes=True`
+/// on a flow that needs `at_hash` / `c_hash` is unsatisfiable for EdDSA
+/// tokens: filter with `jwt.supports_oidc_token_hash` or pass an explicit
+/// allowlist.
+#[pyfunction]
+fn asymmetric_algorithms() -> Vec<&'static str> {
+    // Fixed candidate list (RFC 7518 / RFC 8037 / RFC 8812 names). No `HS*` or
+    // `none` name is in it. Each candidate is probed through the library's own
+    // parser, so a name this build cannot parse is dropped.
+    const CANDIDATES: [&str; 11] = [
+        "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "ES256K",
+        "EdDSA",
+    ];
+    CANDIDATES
+        .into_iter()
+        .filter(|name| JwsAlgorithm::from_str(name).is_ok())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Authorization response (callback) parsing
+// ---------------------------------------------------------------------------
+
+/// Parameters this parser owns; each may appear at most once, and none may
+/// ride in the query string of a `form_post` callback.
+const RESPONSE_PARAMS: [&str; 7] = [
+    "code",
+    "state",
+    "error",
+    "error_description",
+    "error_uri",
+    "iss",
+    "response",
+];
+
+/// Every `error` code `AuthorizationResponse.error_known` treats as known: the
+/// union of RFC 6749 sections 4.1.2.1 and 5.2, OIDC Core 1.0 section 3.1.2.6,
+/// the JAR / registration codes an authorization endpoint may return, and
+/// every code `parse_oauth_code` (errors.rs) recognises (`login_required`,
+/// `invalid_dpop_proof`). Keep it a SUPERSET of `parse_oauth_code`.
+///
+/// "Known" here is WIDER than what `OAuthError(...)` accepts: `parse_oauth_code`
+/// knows only 12 codes, so e.g. `consent_required` is known but
+/// `OAuthError("consent_required")` raises `ValueError`. Never build an
+/// `OAuthError` from a callback value without catching `ValueError`.
+const KNOWN_ERROR_CODES: [&str; 20] = [
+    // RFC 6749 sections 4.1.2.1 and 5.2.
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "unsupported_response_type",
+    "invalid_scope",
+    "access_denied",
+    "server_error",
+    "temporarily_unavailable",
+    // OIDC Core section 3.1.2.6 and JAR / registration.
+    "login_required",
+    "interaction_required",
+    "account_selection_required",
+    "consent_required",
+    "invalid_request_uri",
+    "invalid_request_object",
+    "request_not_supported",
+    "request_uri_not_supported",
+    "registration_not_supported",
+    // RFC 9449 (DPoP).
+    "invalid_dpop_proof",
+];
+
+/// Cap (characters) of `code`, `state` and `iss`, and the raw `error_uri`.
+const RESPONSE_VALUE_MAX: usize = 2048;
+
+/// Cap (characters) of the JARM `response` JWT.
+const RESPONSE_JARM_MAX: usize = 32768;
+
+/// Cap (characters) of `AuthorizationResponse.error_description_safe`.
+const ERROR_DESCRIPTION_SAFE_MAX: usize = 256;
+
+fn bad_response(msg: impl Into<String>) -> PyErr {
+    err(RsError::BadRequest(msg.into()))
+}
+
+/// The callback of an authorization request, parsed and shape-checked.
+///
+/// Built by `parse_authorization_response`; there is no public constructor.
+/// Nothing in it is trusted: the response proves nothing until the caller has
+/// checked `state` with `matches_state` (constant time), compared `iss`
+/// with `matches_iss` (RFC 9207) and exchanged the code. The raw
+/// `error_description` is not available by design (it is provider-controlled
+/// text); only `error_description_safe` is. `error_uri` is exposed only when
+/// it is a safe absolute https URL (http only for loopback) and must never be followed or rendered as
+/// a link without your own validation. `repr()` never prints `code` or
+/// `state`.
+#[pyclass(
+    module = "pygrindvakt.rp",
+    name = "AuthorizationResponse",
+    frozen,
+    from_py_object
+)]
+#[derive(Clone)]
+pub struct AuthorizationResponse {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description_safe: Option<String>,
+    error_uri: Option<String>,
+    iss: Option<String>,
+    response: Option<String>,
+    response_mode: &'static str,
+    error_known: bool,
+}
+
+#[pymethods]
+impl AuthorizationResponse {
+    /// The authorization code, verbatim, or `None` for an error response.
+    #[getter]
+    fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+    /// The `state` echoed by the OP, verbatim. Check it with `matches_state`
+    /// (constant time) before anything else.
+    #[getter]
+    fn state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+    /// The OAuth error code (RFC 6749 charset, at most 64 characters), or
+    /// `None`. Unknown codes are kept; see `error_known`.
+    #[getter]
+    fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    /// `error_description` escaped (control, bidi and invisible characters)
+    /// and capped at 256 characters. The raw value is not exposed.
+    #[getter]
+    fn error_description_safe(&self) -> Option<&str> {
+        self.error_description_safe.as_deref()
+    }
+    /// `error_uri` if it is an absolute https URL (plain http only for
+    /// loopback hosts) with a host and no whitespace, control characters,
+    /// backslash or userinfo, at most 2048 characters; returned in its normalised form (what was validated).
+    /// Otherwise `None`. Untrusted.
+    #[getter]
+    fn error_uri(&self) -> Option<&str> {
+        self.error_uri.as_deref()
+    }
+    /// The RFC 9207 `iss` parameter, verbatim, or `None`. Compare it with
+    /// `matches_iss`.
+    #[getter]
+    fn iss(&self) -> Option<&str> {
+        self.iss.as_deref()
+    }
+    /// The raw JARM `response` JWT, at most 32768 characters. UNVERIFIED and
+    /// untrusted: the binding has no JARM support. Only set when
+    /// `accept_jarm=True` was passed.
+    #[getter]
+    fn response(&self) -> Option<&str> {
+        self.response.as_deref()
+    }
+    /// How the response arrived: `"query"`, `"fragment"` or `"form_post"`.
+    #[getter]
+    fn response_mode(&self) -> &str {
+        self.response_mode
+    }
+    /// True when the response carries an OAuth `error`.
+    #[getter]
+    fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+    /// True when `error` is a code the binding knows (RFC 6749, OIDC Core,
+    /// DPoP). Unknown codes are kept, never rejected. "Known" is WIDER than
+    /// what `OAuthError` accepts (8 response-only codes such as
+    /// `consent_required` are known but `OAuthError(...)` raises
+    /// `ValueError` for them): never construct `OAuthError(resp.error)` from a
+    /// callback value without catching `ValueError`; branch on the `error`
+    /// string instead.
+    #[getter]
+    fn error_known(&self) -> bool {
+        self.error_known
+    }
+
+    /// RFC 9207 issuer check, fail closed: exact, byte-for-byte comparison of
+    /// `iss` with `expected`. When the response has no `iss` the result is
+    /// `not required`, so False by default. Pass `required=False` ONLY when
+    /// the OP does not advertise `authorization_response_iss_parameter_supported`
+    /// (RFC 9207 section 2.4). An empty `expected` is a configuration fault
+    /// and always returns False, regardless of `required`. Never raises. The
+    /// caller MUST call it; parsing does not.
+    #[pyo3(signature = (expected, *, required = true))]
+    fn matches_iss(&self, expected: &str, required: bool) -> bool {
+        if expected.is_empty() {
+            return false;
+        }
+        match self.iss.as_deref() {
+            Some(iss) => iss == expected,
+            None => !required,
+        }
+    }
+
+    /// `state` check, fail closed: constant-time comparison of the UTF-8
+    /// bytes of the response `state` with `expected` (the value stored in the
+    /// session; RFC 6749 sections 4.1.2.3 and 10.12). When the response has
+    /// no `state` the result is `not required`, so False by default.
+    /// `rp.authorization_url` and `rp.begin` always send `state`, so keep
+    /// `required=True`; pass `required=False` only for a request deliberately
+    /// built without `state`. Never raises for a mismatch. The caller MUST
+    /// call it before exchanging the code; parsing does not. An empty
+    /// `expected` (no state stored in the session) always returns False,
+    /// regardless of `required`.
+    #[pyo3(signature = (expected, *, required = true))]
+    fn matches_state(&self, expected: &str, required: bool) -> bool {
+        if expected.is_empty() {
+            return false;
+        }
+        match self.state.as_deref() {
+            Some(state) => grindvakt::mac::constant_time_eq(state.as_bytes(), expected.as_bytes()),
+            None => !required,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        let quoted = |v: &Option<String>| match v {
+            Some(s) => format!("'{}'", escape_untrusted_quoted(s, 128)),
+            None => "None".to_string(),
+        };
+        let set = |v: &Option<String>| if v.is_some() { "<set>" } else { "None" };
+        format!(
+            "AuthorizationResponse(is_error={}, error={}, code={}, state={}, iss={}, response={}, response_mode='{}')",
+            if self.error.is_some() { "True" } else { "False" },
+            quoted(&self.error),
+            set(&self.code),
+            set(&self.state),
+            quoted(&self.iss),
+            set(&self.response),
+            self.response_mode,
+        )
+    }
+}
+
+fn response_mode_name(mode: &str) -> PyResult<&'static str> {
+    match mode {
+        "query" => Ok("query"),
+        "fragment" => Ok("fragment"),
+        "form_post" => Ok("form_post"),
+        other => Err(config_err(format!(
+            "response_mode must be \"query\", \"fragment\" or \"form_post\", got {:?}",
+            escape_untrusted_text(other, 32)
+        ))),
+    }
+}
+
+const SHAPES: &str = "an http.HttpRequestData, a list of (str, str) pairs, a \
+multi-dict mapping of str to list[str] (the urllib.parse.parse_qs shape), or an \
+object with a .lists() method such as a werkzeug MultiDict";
+
+/// Flatten `(name, [values])` items, keeping duplicates. A non-list value
+/// names its key in the `TypeError`.
+fn flatten_multi<'py>(
+    items: impl Iterator<Item = PyResult<Bound<'py, PyAny>>>,
+    owner: &Bound<'py, PyAny>,
+) -> PyResult<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for item in items {
+        let item = item?;
+        let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
+        let key: String = k.extract().map_err(|_| {
+            PyTypeError::new_err("authorization response parameter names must be str")
+        })?;
+        if !(v.is_instance_of::<PyList>() || v.is_instance_of::<PyTuple>()) {
+            let subclass = !owner.is_exact_instance_of::<PyDict>();
+            let hint = if subclass {
+                format!(
+                    " ({} is a dict subclass whose items() yields one value per key; pass \
+                     request.args.items(multi=True) (a list of pairs) or request.args.lists())",
+                    owner.get_type().name()?
+                )
+            } else {
+                " (a plain dict discards duplicate parameters)".to_string()
+            };
+            return Err(PyTypeError::new_err(format!(
+                "params is a mapping with a non-list value for key '{}'{hint}; params must be {SHAPES}",
+                escape_untrusted_text(&key, 64)
+            )));
+        }
+        for value in v.try_iter()? {
+            let value: String = value?.extract().map_err(|_| {
+                PyTypeError::new_err("authorization response parameter values must be str")
+            })?;
+            pairs.push((key.clone(), value));
+        }
+    }
+    Ok(pairs)
+}
+
+/// Collect the ordered parameter pairs and the response mode of `params`.
+fn response_pairs(
+    params: &Bound<'_, PyAny>,
+    response_mode: Option<&str>,
+) -> PyResult<(Vec<(String, String)>, &'static str)> {
+    let requested = response_mode.map(response_mode_name).transpose()?;
+    if params.is_instance_of::<crate::http::HttpRequestData>() {
+        let request = params.extract::<PyRef<'_, crate::http::HttpRequestData>>()?;
+        let lossy = |name: &str| {
+            PyTypeError::new_err(format!(
+                "HttpRequestData.{name} was built from a mapping, which discards duplicate \
+                 authorization-response parameters; build it from a list of (str, str) pairs \
+                 (request.args.items(multi=True), request.GET.lists() flattened)"
+            ))
+        };
+        let method: String = params.getattr("method")?.extract()?;
+        let query: Vec<(String, String)> = params.getattr("query_pairs")?.extract()?;
+        let form: Vec<(String, String)> = params.getattr("form_pairs")?.extract()?;
+        let has_protocol =
+            |v: &[(String, String)]| v.iter().any(|(k, _)| RESPONSE_PARAMS.contains(&k.as_str()));
+        let (pairs, mode) = if method.eq_ignore_ascii_case("GET") {
+            if request.query_is_lossy() {
+                return Err(lossy("query"));
+            }
+            if has_protocol(&form) {
+                return Err(bad_response(
+                    "authorization response parameters must not appear in the body of a query callback",
+                ));
+            }
+            (query, "query")
+        } else if method.eq_ignore_ascii_case("POST") {
+            if request.form_is_lossy() {
+                return Err(lossy("form"));
+            }
+            if has_protocol(&query) {
+                return Err(bad_response(
+                    "authorization response parameters must not appear in the query string of a form_post callback",
+                ));
+            }
+            if form.is_empty() {
+                return Err(bad_response(
+                    "a form_post callback needs a form body: parse the form before building \
+                     the HttpRequestData (no form parameters were found)",
+                ));
+            }
+            (form, "form_post")
+        } else {
+            return Err(bad_response(
+                "an authorization response arrives by GET or POST",
+            ));
+        };
+        if let Some(r) = requested {
+            if r != mode {
+                return Err(config_err(format!(
+                    "response_mode {r:?} does not match the request ({method} is {mode:?}); \
+                     omit response_mode for an HttpRequestData"
+                )));
+            }
+        }
+        return Ok((pairs, mode));
+    }
+    let mode = requested.unwrap_or("query");
+    // Duck-typed multi-dict (werkzeug MultiDict): lists() yields (key, [values]).
+    if let Ok(lists) = params.getattr("lists") {
+        if lists.is_callable() {
+            let pairs = flatten_multi(lists.call0()?.try_iter()?, params)?;
+            return Ok((pairs, mode));
+        }
+    }
+    if let Ok(mapping) = params.cast::<PyMapping>() {
+        let pairs = flatten_multi(mapping.items()?.try_iter()?, params)?;
+        return Ok((pairs, mode));
+    }
+    let pairs = protocol_parameter_pairs(params, "params").map_err(|e| {
+        if e.is_instance_of::<PyTypeError>(params.py()) {
+            PyTypeError::new_err(format!("params must be {SHAPES}"))
+        } else {
+            e
+        }
+    })?;
+    Ok((pairs, mode))
+}
+
+/// Cap the length and reject control, backslash and bidi / invisible
+/// formatting characters in a value kept verbatim. The message never echoes
+/// the value.
+fn check_response_value(name: &str, v: &str) -> PyResult<()> {
+    if v.chars().count() > RESPONSE_VALUE_MAX {
+        return Err(bad_response(format!(
+            "{name} must be at most {RESPONSE_VALUE_MAX} characters"
+        )));
+    }
+    if v.chars()
+        .any(|c| c.is_control() || c == '\\' || is_invisible_format(c))
+    {
+        return Err(bad_response(format!(
+            "{name} must not contain control, bidi or invisible formatting characters or backslashes"
+        )));
+    }
+    Ok(())
+}
+
+/// RFC 6749 section 5.2: `error` is %x20-21 / %x23-5B / %x5D-7E.
+fn check_error_code(v: &str) -> PyResult<()> {
+    if v.chars().count() > 64
+        || !v
+            .bytes()
+            .all(|b| matches!(b, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+    {
+        return Err(bad_response(
+            "error must be at most 64 characters from the RFC 6749 section 5.2 set",
+        ));
+    }
+    Ok(())
+}
+
+/// `error_uri` survives only as a safe absolute http(s) URL.
+/// Returns the NORMALISED URL (`Url::as_str`), so what the caller sees is
+/// what was validated (`https:evil.example/x` becomes `https://evil.example/x`).
+fn safe_error_uri(uri: &str) -> Option<String> {
+    if uri.chars().count() > RESPONSE_VALUE_MAX {
+        return None;
+    }
+    check_redirect_uri(uri).ok()?;
+    let u = url::Url::parse(uri).ok()?;
+    let ok = matches!(u.scheme(), "http" | "https")
+        && check_redirect_uri_transport(u.as_str()).is_ok()
+        && u.host().is_some()
+        && u.username().is_empty()
+        && u.password().is_none();
+    ok.then(|| u.as_str().to_string())
+}
+
+/// Parse the authorization response (the callback) of an authorization
+/// request, fail closed.
+///
+/// `params` is an `http.HttpRequestData` (GET uses `query_pairs`, POST uses
+/// `form_pairs` with mode `form_post`; a protocol parameter in the other
+/// channel, the query string of a POST or the body of a GET, raises), an
+/// ordered list of `(str, str)` pairs, a multi-dict `{name: [values]}` like
+/// `urllib.parse.parse_qs` returns, or an object with a `.lists()` method
+/// (werkzeug `MultiDict`). A plain `dict[str, str]` raises `TypeError`
+/// because a mapping discards duplicate parameters. `response_mode` (`"query"`, `"fragment"` or
+/// `"form_post"`) labels list and multi-dict input; default `"query"`.
+///
+/// Raises `BadRequestError` for a repeated parameter, both or neither of
+/// `code` and `error`, an empty `code` / `state` / `error` / `iss`, control, bidi or
+/// invisible characters or backslashes in `code` / `state` / `iss`, a `code` /
+/// `state` / `iss` over 2048 characters (a JARM `response` over 32768), an `error` outside RFC 6749 section
+/// 5.2, and a JARM `response` unless `accept_jarm=True` (then it is exposed
+/// raw and UNVERIFIED, and must be the only protocol parameter; this binding
+/// has no JARM support, so verify the JWT yourself). Unknown error codes are
+/// kept.
+///
+/// The result proves nothing by itself: compare `state` with the session,
+/// check `iss` with `matches_iss`, then exchange the code.
+#[pyfunction]
+#[pyo3(signature = (params, *, response_mode = None, accept_jarm = false))]
+fn parse_authorization_response(
+    params: &Bound<'_, PyAny>,
+    response_mode: Option<&str>,
+    accept_jarm: bool,
+) -> PyResult<AuthorizationResponse> {
+    let (pairs, mode) = response_pairs(params, response_mode)?;
+    let mut found: BTreeMap<&str, String> = BTreeMap::new();
+    for (k, v) in pairs {
+        if let Some(name) = RESPONSE_PARAMS.iter().find(|n| **n == k) {
+            if found.insert(name, v).is_some() {
+                return Err(bad_response(format!("{name} must not be repeated")));
+            }
+        }
+    }
+    let mut take = |n: &str| found.remove(n);
+    let (code, state, error) = (take("code"), take("state"), take("error"));
+    let (description, uri) = (take("error_description"), take("error_uri"));
+    let (iss, response) = (take("iss"), take("response"));
+
+    if response.is_some() && !accept_jarm {
+        return Err(bad_response(
+            "JARM response parameter is not supported; pass accept_jarm=True only if you \
+             verify the JWT yourself",
+        ));
+    }
+    if response.is_some()
+        && [&code, &state, &error, &description, &uri, &iss]
+            .iter()
+            .any(|v| v.is_some())
+    {
+        return Err(bad_response(
+            "a JARM response carries every parameter inside the JWT: code, state, error, \
+             error_description, error_uri and iss must not appear alongside response",
+        ));
+    }
+    if code.is_some() && error.is_some() {
+        return Err(bad_response("code and error must not both be present"));
+    }
+    if code.is_none() && error.is_none() && response.is_none() {
+        return Err(bad_response("response has neither code nor error"));
+    }
+    for (name, v) in [
+        ("code", &code),
+        ("state", &state),
+        ("error", &error),
+        ("iss", &iss),
+    ] {
+        if v.as_deref() == Some("") {
+            return Err(bad_response(format!("{name} must not be empty")));
+        }
+    }
+    for (name, v) in [("code", &code), ("state", &state), ("iss", &iss)] {
+        if let Some(v) = v {
+            check_response_value(name, v)?;
+        }
+    }
+    if response
+        .as_deref()
+        .is_some_and(|r| r.chars().count() > RESPONSE_JARM_MAX)
+    {
+        return Err(bad_response(format!(
+            "response must be at most {RESPONSE_JARM_MAX} characters"
+        )));
+    }
+    if let Some(e) = &error {
+        check_error_code(e)?;
+    }
+    let error_known = error
+        .as_deref()
+        .is_some_and(|e| KNOWN_ERROR_CODES.contains(&e));
+    Ok(AuthorizationResponse {
+        code,
+        state,
+        error,
+        error_description_safe: description
+            .map(|d| escape_untrusted_text(&d, ERROR_DESCRIPTION_SAFE_MAX)),
+        error_uri: uri.and_then(|u| safe_error_uri(&u)),
+        iss,
+        response,
+        response_mode: mode,
+        error_known,
+    })
+}
+
+/// Render untrusted OP-advertised values for a message: each escaped and
+/// capped, at most 20 shown.
+fn show_list(items: &[String]) -> String {
+    let mut parts: Vec<String> = items
+        .iter()
+        .take(20)
+        .map(|i| format!("'{}'", escape_untrusted_quoted(i, 64)))
+        .collect();
+    if items.len() > 20 {
+        parts.push(format!("... ({} more)", items.len() - 20));
+    }
+    format!("[{}]", parts.join(", "))
+}
+
+/// Compare what the RP intends to use with what the OP's discovery document
+/// advertises. Pure and advisory: no I/O, nothing is enforced, and the
+/// metadata is untrusted, unauthenticated data from the OP.
+///
+/// `provider` is a `ProviderInfo` built by `discover` /
+/// `ProviderInfo.from_metadata` (one without metadata raises `ConfigError`)
+/// or a `ProviderMetadata`. Always checked: `"code"` in
+/// `response_types_supported`. Checked when given: `pkce=True` (RP will send
+/// an S256 challenge; `None`/`False` skip it) against
+/// `code_challenge_methods_supported`; `algorithms` (the RP's allowed
+/// id_token algorithms, must intersect `id_token_signing_alg_values_supported`);
+/// `scopes` against `scopes_supported`; `acr_values` against
+/// `acr_values_supported`; `client.auth_method` against
+/// `token_endpoint_auth_methods_supported`.
+///
+/// Two `algorithms` rules mirror ADR 0006 (the function stays advisory):
+/// `none` (case-insensitive) is always a mismatch ("fix the RP config, not
+/// the OP") and never counts as an intersection match; `HS256/384/512` are a
+/// mismatch unless `shared_secret_keys=True` (the RP verifies with a key set
+/// derived from the client_secret, OIDC Core 10.1; they are refused with
+/// `JwksCache` / published JWKS) and are ignored by the intersection check in
+/// that case. With `shared_secret_keys=True` HS* takes part in the normal
+/// intersection. If no other algorithm remains, the intersection check is
+/// skipped.
+///
+/// Not checked: `grant_types_supported`, `response_modes_supported`,
+/// `pkce=False`/`None`, DPoP, request-object, claims or any other metadata.
+///
+/// Returns human-readable strings, empty when nothing contradicts the
+/// document. A string starting with `"not advertised:"` is informational: the
+/// OP lists no values (absent or empty) for a check that was performed, so it
+/// can be neither confirmed nor refuted. No default is assumed for those
+/// lists (in particular not `RS256` for `id_token_signing_alg_values_supported`).
+/// Any other string is a mismatch.
+///
+/// Exception: when `token_endpoint_auth_methods_supported` is absent or empty
+/// (indistinguishable after parsing, so both count as absent) the spec default
+/// `["client_secret_basic"]` (OIDC Discovery 1.0 section 3, RFC 8414 section
+/// 2) is assumed: any other `client.auth_method` is a real mismatch.
+#[pyfunction]
+#[pyo3(signature = (provider, *, client = None, pkce = None, algorithms = None, scopes = None, acr_values = None, shared_secret_keys = false))]
+fn check_rp_compatibility(
+    provider: &Bound<'_, PyAny>,
+    client: Option<&RpClient>,
+    pkce: Option<bool>,
+    algorithms: Option<Vec<String>>,
+    scopes: Option<Vec<String>>,
+    acr_values: Option<Vec<String>>,
+    shared_secret_keys: bool,
+) -> PyResult<Vec<String>> {
+    let md: gm::ProviderMetadata = if let Ok(info) = provider.cast::<ProviderInfo>() {
+        match &info.get().metadata {
+            Some(m) => m.inner.clone(),
+            None => {
+                return Err(config_err(
+                    "ProviderInfo has no metadata; build it with rp.discover / \
+                     ProviderInfo.from_metadata",
+                ))
+            }
+        }
+    } else if let Ok(m) = provider.cast::<ProviderMetadata>() {
+        m.borrow().inner.clone()
+    } else {
+        return Err(PyTypeError::new_err(
+            "provider must be a ProviderInfo or a ProviderMetadata",
+        ));
+    };
+    if matches!(&algorithms, Some(a) if a.is_empty()) {
+        return Err(config_err("algorithms must not be empty"));
+    }
+    let acr_supported: Vec<String> = md
+        .extra
+        .get("acr_values_supported")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    let na = |field: &str, why: &str| format!("not advertised: {field} ({why})");
+
+    if md.response_types_supported.is_empty() {
+        out.push(na(
+            "response_types_supported",
+            "cannot confirm the authorization code flow",
+        ));
+    } else if !md.response_types_supported.iter().any(|t| t == "code") {
+        out.push(format!(
+            "response_types_supported does not include 'code' (OP advertises {})",
+            show_list(&md.response_types_supported)
+        ));
+    }
+    if pkce == Some(true) {
+        let m = &md.code_challenge_methods_supported;
+        if m.is_empty() {
+            out.push(na(
+                "code_challenge_methods_supported",
+                "cannot confirm PKCE S256 support",
+            ));
+        } else if !m.iter().any(|x| x == "S256") {
+            out.push(format!(
+                "code_challenge_methods_supported does not include 'S256' (OP advertises {})",
+                show_list(m)
+            ));
+        }
+    }
+    if let Some(algs) = &algorithms {
+        // ADR 0006: `none` is always refused; HS* only works with a key set
+        // derived from the client_secret, which this function cannot see.
+        let is_none = |a: &String| a.eq_ignore_ascii_case("none");
+        let is_hs = |a: &String| {
+            ["HS256", "HS384", "HS512"]
+                .iter()
+                .any(|h| a.eq_ignore_ascii_case(h))
+        };
+        for a in algs.iter().filter(|a| is_none(a)) {
+            out.push(format!(
+                "allowed id_token algorithm '{}' is always refused by this library \
+                 (ADR 0006): fix the RP config, not the OP",
+                escape_untrusted_quoted(a, 64)
+            ));
+        }
+        if !shared_secret_keys {
+            let hs: Vec<String> = algs.iter().filter(|a| is_hs(a)).cloned().collect();
+            if !hs.is_empty() {
+                out.push(format!(
+                    "allowed id_token algorithms {} are only usable with a key set derived \
+                     from the client_secret (OIDC Core 10.1) and are refused with JwksCache / \
+                     published JWKS (ADR 0006); pass shared_secret_keys=True if that is how \
+                     you verify, otherwise remove them",
+                    show_list(&hs)
+                ));
+            }
+        }
+        let relevant: Vec<String> = algs
+            .iter()
+            .filter(|a| !is_none(a) && (shared_secret_keys || !is_hs(a)))
+            .cloned()
+            .collect();
+        if !relevant.is_empty() {
+            let sup = &md.id_token_signing_alg_values_supported;
+            if sup.is_empty() {
+                out.push(na(
+                    "id_token_signing_alg_values_supported",
+                    "cannot confirm a usable id_token signing algorithm",
+                ));
+            } else if !relevant.iter().any(|a| sup.contains(a)) {
+                out.push(format!(
+                    "none of the allowed id_token algorithms {} is in \
+                     id_token_signing_alg_values_supported (OP advertises {})",
+                    show_list(&relevant),
+                    show_list(sup)
+                ));
+            }
+        }
+    }
+    if let Some(wanted) = &scopes {
+        let sup = &md.scopes_supported;
+        if sup.is_empty() {
+            out.push(na(
+                "scopes_supported",
+                "cannot confirm the requested scopes",
+            ));
+        } else {
+            let missing: Vec<String> = wanted
+                .iter()
+                .filter(|w| !sup.contains(w))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                out.push(format!(
+                    "scopes not in scopes_supported: {} (OP advertises {})",
+                    show_list(&missing),
+                    show_list(sup)
+                ));
+            }
+        }
+    }
+    if let Some(wanted) = &acr_values {
+        if acr_supported.is_empty() {
+            out.push(na(
+                "acr_values_supported",
+                "cannot confirm the requested acr_values",
+            ));
+        } else {
+            let missing: Vec<String> = wanted
+                .iter()
+                .filter(|w| !acr_supported.contains(w))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                out.push(format!(
+                    "acr_values not in acr_values_supported: {} (OP advertises {})",
+                    show_list(&missing),
+                    show_list(&acr_supported)
+                ));
+            }
+        }
+    }
+    if let Some(client) = client {
+        let method = auth_method_name(&client.inner.auth);
+        let sup = &md.token_endpoint_auth_methods_supported;
+        if sup.is_empty() {
+            if method != "client_secret_basic" {
+                out.push(format!(
+                    "client auth_method '{method}' is not usable: \
+                     token_endpoint_auth_methods_supported is absent, so the spec default \
+                     ['client_secret_basic'] was assumed"
+                ));
+            }
+        } else if !sup.iter().any(|s| s == method) {
+            out.push(format!(
+                "client auth_method '{method}' is not in token_endpoint_auth_methods_supported \
+                 (OP advertises {})",
+                show_list(sup)
+            ));
+        }
+    }
+    Ok(out)
+}
+
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = new_submodule(py, parent, "rp")?;
     m.add_class::<ProviderInfo>()?;
     m.add_class::<RpClient>()?;
     m.add_class::<TokenSet>()?;
+    m.add_class::<AuthorizationResponse>()?;
     m.add_class::<JwksCache>()?;
+    m.add_class::<DiscoveryCache>()?;
     m.add_function(wrap_pyfunction!(authorization_url, &m)?)?;
     m.add_function(wrap_pyfunction!(signed_request_object, &m)?)?;
     m.add_function(wrap_pyfunction!(begin, &m)?)?;
+    m.add("BeginResult", begin_result_type(py)?)?;
+    m.add_function(wrap_pyfunction!(claims_audiences, &m)?)?;
+    m.add_function(wrap_pyfunction!(check_rp_compatibility, &m)?)?;
     m.add_function(wrap_pyfunction!(discover, &m)?)?;
     m.add_function(wrap_pyfunction!(end_session_url, &m)?)?;
     m.add_function(wrap_pyfunction!(fetch_jwks, &m)?)?;
@@ -1942,5 +3836,11 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fetch_userinfo, &m)?)?;
     m.add_function(wrap_pyfunction!(build_client_assertion, &m)?)?;
     m.add_function(wrap_pyfunction!(claims_to_attributes, &m)?)?;
+    m.add_function(wrap_pyfunction!(validate_issuer, &m)?)?;
+    m.add_function(wrap_pyfunction!(validate_redirect_uri_syntax, &m)?)?;
+    m.add_function(wrap_pyfunction!(validate_service_endpoint, &m)?)?;
+    m.add_function(wrap_pyfunction!(asymmetric_algorithms, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_authorization_response, &m)?)?;
+    m.add("MAX_ID_TOKEN_LEEWAY", MAX_ID_TOKEN_LEEWAY)?;
     Ok(())
 }

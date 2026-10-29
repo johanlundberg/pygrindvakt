@@ -15,10 +15,10 @@ The hierarchy mirrors grindvakt's ``Error`` and ``DpopError`` enums:
 .. code-block:: text
 
    GrindvaktError(Exception)            status_hint
-   ├── BadRequestError                  400
+   ├── BadRequestError                  400  (also a ValueError)
    ├── AuthnError                       401
    ├── StateError                       500
-   ├── ConfigError                      500
+   ├── ConfigError                      500  (also a ValueError)
    ├── CryptoError                      500
    ├── AttributeMappingError            500
    ├── JoseError                        500
@@ -41,6 +41,70 @@ The hierarchy mirrors grindvakt's ``Error`` and ``DpopError`` enums:
    other exception (``str(exc)``) is an operator-facing diagnostic: it may
    name internal hosts, quote upstream error bodies, or describe which
    cryptographic check failed. Log it; never put it in an HTTP response.
+
+.. important::
+
+   A :class:`ConfigError` is a deployment fault, not a failed login or a bad
+   request from the user. Do not turn it into a user-visible 4xx or 503 and do
+   not show it as "login failed": log it with
+   :attr:`~GrindvaktError.log_summary` and re-raise (a 500 and an alert), so a
+   broken configuration cannot hide among ordinary failures. Catch
+   :class:`ConfigError` before :class:`GrindvaktError`.
+
+.. versionchanged:: 0.3.0
+
+   ``str(OAuthError)`` now escapes control, bidi, invisible-format and tag
+   characters (and backslash) in the description and caps it at 512
+   characters. This is a behaviour change: the result used to be the raw
+   ``"{code}: {description}"``. ``OAuthError.description`` is unchanged: it is
+   the raw, untrusted value, so escape it yourself before logging it directly.
+   The wire output of :meth:`OAuthError.to_response` and
+   :meth:`OAuthError.to_redirect` is unchanged.
+
+Argument validation
+-------------------
+
+:class:`BadRequestError` and :class:`ConfigError` both derive from
+:class:`GrindvaktError` and the built-in ``ValueError`` (MRO: the class,
+``GrindvaktError``, ``ValueError``, ``Exception``). Existing
+``except ValueError`` handlers keep working, and ``except GrindvaktError``
+catches both.
+
+The rule: a fault in *configuration or wiring*, fixed by changing the
+integrator's code or settings, is a :class:`ConfigError` (``status_hint``
+500). A malformed value that arrived with a *request* is a
+:class:`BadRequestError` (``status_hint`` 400). Configuration faults are
+log-only: they are never a client error.
+
+* :class:`ConfigError`: an unknown ``auth_method`` or an inconsistent
+  ``client_secret`` / ``signing_key`` combination, an unknown JWS algorithm
+  name, a negative ``seconds`` value or a ``leeway`` outside 0 to 300,
+  :class:`~pygrindvakt.rp.JwksCache` numeric arguments (``min_ttl`` above
+  ``max_ttl``, a bad ``fetch_timeout``), an issuer mismatch between a cache
+  and its caller, invalid :class:`~pygrindvakt.rp.ProviderInfo` /
+  :class:`~pygrindvakt.rp.RpClient` URLs, :class:`~pygrindvakt.metadata.ProviderMetadata`
+  URL and extra-field validation, and invalid ``fetch_userinfo`` options.
+* :class:`BadRequestError`: values that may come from a request, such as a
+  ``redirect_uri`` override that is not registered, a
+  ``post_logout_redirect_uri`` that is not registered, reserved or empty
+  ``end_session_url`` parameters, plus the malformed-request reports of
+  grindvakt itself (and the standalone validators in
+  :mod:`pygrindvakt.discovery` and :mod:`pygrindvakt.federation`).
+
+.. versionchanged:: 0.3.0
+   :class:`ConfigError` is also a ``ValueError`` (it was a plain
+   :class:`GrindvaktError` subclass), and configuration faults in
+   :mod:`pygrindvakt.rp` and :class:`pygrindvakt.metadata.ProviderMetadata`
+   raise it instead of :class:`BadRequestError` or a plain ``ValueError``.
+   :class:`BadRequestError` is also a ``ValueError``. These sites still raise a
+   plain ``ValueError`` and are follow-up work: ``ProviderMetadata.from_dict`` /
+   ``from_json`` parse failures, the ``extra`` and ``extra_params`` arguments of
+   :mod:`pygrindvakt.rp`, OAuth error-code parsing and
+   ``oauth_error_redirect``, and the ``client``, ``tokens``, ``dpop``,
+   ``provider``, ``request`` and ``http`` modules. Until those modules migrate,
+   ``except ValueError`` is the catch-all for argument errors;
+   ``except BadRequestError`` and ``except ConfigError`` only cover
+   :mod:`pygrindvakt.rp` and :class:`~pygrindvakt.metadata.ProviderMetadata`.
 
 Base class
 ----------
@@ -84,6 +148,55 @@ Base class
 
       The upstream response body, else ``None``. Control and bidirectional
       characters are escaped and the length is capped.
+
+   .. py:attribute:: auth_failure
+      :type: bool
+
+      ``True`` when the failure happened in an authentication step: every
+      :class:`AuthnError`, and an upstream token or UserInfo request that was
+      rejected. ``False`` for metadata fetches (discovery, JWKS, federation)
+      and all other errors. It tells apart a rejected token or UserInfo
+      exchange from an unreachable or misbehaving metadata endpoint, and
+      nothing more.
+
+      It is **not** a general "authentication failed" flag. It is ``False``
+      on :class:`UnknownKeyError` (unknown ``kid`` on a signed JWT), on every
+      :class:`DpopError` subclass (including :class:`DpopReplayError`, a
+      replay is an attack signal) and on :class:`BadRequestError`. Branch on
+      the class for those: do not rely on ``auth_failure`` alone to decide on
+      session teardown, alerting or rate-limiting.
+
+      .. versionadded:: 0.3.0
+
+   .. py:attribute:: retryable
+      :type: bool
+
+      ``True`` when retrying the same call later may succeed: the upstream
+      answered with HTTP status 500 or above or 429, or ``code`` is
+      ``transport``, ``jwks_fetch_timeout``, ``discovery_backoff`` or
+      ``discovery_fetch_timeout`` (except that ``discovery_backoff`` takes the
+      ``retryable`` of the failure it is chained to, see below). This is
+      defined by pygrindvakt, not by grindvakt. ``False`` otherwise,
+      including for a 4xx answer from the upstream and for every error
+      raised for invalid arguments. It says nothing about idempotency or
+      backoff; apply your own. In particular it does not make an RP callback
+      safe to replay: the pending session is gone and the authorization code
+      may be consumed, so start a new login instead (see :doc:`guides/rp`).
+
+      .. versionadded:: 0.3.0
+
+   .. py:attribute:: log_summary
+      :type: str
+
+      A one-line description for logs, formatted as
+      ``"{ClassName}(code={code!r}, status_hint={n}): {str(exc)}"``. It is
+      safe to *log*, not safe to send to clients. ``code`` can be controlled
+      by the upstream, but it is escaped and at most 64 characters, and
+      ``str(exc)`` is escaped, length-capped and never embeds an upstream
+      body. Only :attr:`upstream_error_description` and
+      :attr:`upstream_body` are unsafe to log.
+
+      .. versionadded:: 0.3.0
 
    .. danger::
 
@@ -158,7 +271,9 @@ Instance-level overrides:
   characters). Branching on ``exc.code == "invalid_grant"`` is fine, but never
   put it into a log line, redirect, template or query string without the same
   care you would give any other untrusted input, and do not treat an unknown
-  value as trustworthy.
+  value as trustworthy. Because of this, never use ``code`` to decide whether
+  to retry: use ``retryable``, which is not derived from upstream text (an
+  upstream sending ``error=transport`` does not make the failure retryable).
 * ``userinfo_unverifiable`` (``AuthnError``): :func:`pygrindvakt.rp.fetch_userinfo`
   received a signed (``application/jwt``) UserInfo response but was not given
   everything needed to verify it (``jwks``, ``client_id``,
@@ -168,16 +283,71 @@ Instance-level overrides:
 * ``transport`` (``InternalError``): an outbound request failed before a
   response was obtained (connection refused, timeout, a Python ``HttpClient``
   that raised). The original failure is chained as ``__cause__``.
+  ``retryable`` is ``True``.
 * ``response_too_large`` (``InternalError``): an outbound response exceeded the
   client's size cap.
 * ``jwks_fetch_timeout`` (``InternalError``): a :class:`pygrindvakt.rp.JwksCache`
   call waited longer than ``fetch_timeout`` seconds for another thread's
   in-flight JWKS fetch. The fetching thread is not interrupted and the cache
-  stays usable.
+  stays usable. ``retryable`` is ``True``.
+* ``discovery_fetch_timeout`` (``InternalError``): a
+  :class:`pygrindvakt.rp.DiscoveryCache` call waited longer than
+  ``fetch_timeout`` seconds for another thread's in-flight discovery fetch.
+  The fetching thread is not interrupted and its result is cached.
+  ``retryable`` is ``True``.
+* ``discovery_backoff`` (``InternalError``): a
+  :class:`pygrindvakt.rp.DiscoveryCache` call made no request because the
+  last discovery fetch failed less than ``failure_backoff`` seconds ago and no
+  stale document may be served (``stale_on_error=False``, none cached, or it
+  is older than ``max_stale``). The original failure is chained as
+  ``__cause__`` (a copy without traceback, so it holds no frames).
+  ``retryable`` is the ``retryable`` of that cause: ``True`` after a
+  transport error, an upstream 5xx or 429, ``False`` after a permanent
+  failure such as an issuer mismatch or a malformed document.
+* ``shared_secret_algorithm`` (``ConfigError``): ``HS256``, ``HS384`` or
+  ``HS512`` in ``allowed_algorithms`` together with a
+  :class:`pygrindvakt.rp.JwksCache`. A published JWK Set never carries the
+  key for MAC-signed ID tokens (OIDC Core section 10.1: it derives from the
+  ``client_secret``). Raised before any fetch; there is no override. Verify
+  with :func:`pygrindvakt.rp.verify_id_token` and a key set built from the
+  ``client_secret`` instead.
+* ``weak_shared_secret`` (``ConfigError``): an ``HS*`` token is verified
+  against a caller-built key set whose ``oct`` key is shorter than the hash
+  output (32, 48 or 64 bytes for ``HS256``, ``HS384``, ``HS512``; RFC 7518
+  section 3.2), or whose ``k`` is not strict unpadded base64url. Only the key
+  the token selects is checked (its ``kid``, or the only key of a one-key
+  set): a weak key elsewhere in the set does not raise, but one selected by
+  its ``kid`` does, so keep weak keys out of verifier sets. Raised by
+  :mod:`pygrindvakt.rp` verification and, since 0.3.0, also by
+  :func:`pygrindvakt.jwt.verify_with_jwks` and
+  :func:`pygrindvakt.jwt.verify_with_jwk`. The message never contains the
+  key.
+* ``symmetric_algorithm`` (``AuthnError``): a federation document passed to
+  :func:`pygrindvakt.federation.verify`, ``verify_typed`` or
+  ``verify_self_signed`` has a header ``alg`` of ``HS256``, ``HS384``,
+  ``HS512`` or ``none``. Entity statements are signed with asymmetric keys.
 * ``upstream_http`` (``InternalError``): a discovery, JWKS or federation
   fetch got a failing status. Always this value for such non-auth failures,
   even if the upstream sent an OAuth ``error`` (that stays in
-  ``upstream_error``).
+  ``upstream_error``). ``retryable`` is ``True`` for an upstream status of
+  500 or above or 429.
+
+.. note::
+
+   ``status_hint`` is a class attribute. For a metadata fetch failure the
+   core library suggests 502 (an upstream fault), while the binding keeps
+   these on :class:`InternalError`, whose ``status_hint`` is 500. Use
+   ``upstream_status`` and ``retryable`` for decisions about the upstream.
+
+.. versionchanged:: 0.3.0
+   The stable codes ``jwks_fetch_timeout`` and ``discovery_backoff`` are
+   listed above together with the ``retryable`` attribute.
+.. versionadded:: 0.3.0
+   The codes ``discovery_fetch_timeout`` (and, raised by
+   :class:`pygrindvakt.rp.DiscoveryCache`, ``discovery_backoff``).
+.. versionadded:: 0.3.0
+   The codes ``shared_secret_algorithm``, ``weak_shared_secret`` and
+   ``symmetric_algorithm``.
 
 Transport causes
 ----------------
@@ -203,10 +373,15 @@ One subclass per ``grindvakt::Error`` variant.
 
 .. py:exception:: BadRequestError
 
-   The request was malformed (``status_hint`` 400). Raised, for example, by
+   The request was malformed (``status_hint`` 400); also a ``ValueError``.
+   Raised, for example, by
    the federation and discovery parsers on an invalid entity identifier or a
-   malformed policy, and by :meth:`pygrindvakt.federation.EntityStatement.jwks`
-   when the statement carries no keys.
+   malformed policy, by :meth:`pygrindvakt.federation.EntityStatement.jwks`
+   when the statement carries no keys, and by the :mod:`pygrindvakt.rp`
+   checks on values that may come from a request (an unregistered
+   ``redirect_uri`` or ``post_logout_redirect_uri``, reserved ``extra``
+   parameters). It is not used for configuration faults: see
+   :class:`ConfigError`.
 
 .. py:exception:: AuthnError
 
@@ -223,8 +398,16 @@ One subclass per ``grindvakt::Error`` variant.
 
 .. py:exception:: ConfigError
 
-   Configuration is invalid (``status_hint`` 500). Raised, for instance, when
-   :class:`pygrindvakt.provider.RedisStore` cannot parse its URL.
+   Configuration is invalid (``status_hint`` 500); also a ``ValueError``.
+   Raised, for instance, when :class:`pygrindvakt.provider.RedisStore` cannot
+   parse its URL, for an unknown ``auth_method`` or JWS algorithm name, invalid
+   :class:`~pygrindvakt.rp.JwksCache` arguments, or an invalid
+   :class:`~pygrindvakt.metadata.ProviderMetadata` URL. It is never a client
+   error: log ``exc.log_summary`` and re-raise instead of answering the user
+   with a 4xx or 503 (catch it before :class:`GrindvaktError`).
+
+   .. versionchanged:: 0.3.0
+      Also derives from ``ValueError``.
 
 .. py:exception:: CryptoError
 
@@ -352,6 +535,17 @@ OAuthError
       :meth:`pygrindvakt.provider.Provider.validate_authorization_request`
       succeeded for that request. Redirecting to an unvalidated URI turns
       your OP into an open redirector.
+
+      As a header-injection guard the base ``redirect_uri`` is syntax-checked
+      before the response is built. :class:`BadRequestError` is raised if it
+      contains whitespace, control, bidi or invisible formatting characters or
+      userinfo, is unparsable, or has a fragment; the message never echoes the
+      value. This does **not** check that the URI is registered or that its
+      scheme is acceptable: exact-match it against the client's registered
+      URIs first.
+
+      .. versionchanged:: 0.3.0
+         Raises :class:`BadRequestError` for an invalid base ``redirect_uri``.
 
 DPoP errors
 -----------

@@ -431,3 +431,118 @@ def test_flask_rp_rejects_state_mismatch(flask_op, monkeypatch):
     r = browser.get("/callback?code=abc&state=forged")
     assert r.status_code == 400
     assert not any(url.endswith("/token") for url in bridge.calls)
+
+
+# --- RP example: callback parsing ----------------------------------------------
+
+
+@pytest.fixture
+def rp_login(flask_op, monkeypatch):
+    """A Flask RP test client that has started /login, plus the OP's own
+    callback query for alice and the bridge that records outbound calls."""
+    pytest.importorskip("flask")
+    rp_mod = load_module("flask_rp_app", EXAMPLES / "flask-rp" / "app.py")
+    bridge = OpBridge(flask_op)
+    monkeypatch.setattr(rp_mod, "HTTP_CLIENT", bridge)
+    browser = rp_mod.create_app().test_client()
+    authz_url = browser.get("/login").headers["Location"]
+    params = dict(parse_qsl(urlsplit(authz_url).query))
+    assert flask_op.get("/authorization", params).status == 200
+    login = flask_op.post("/authorization", {"username": "alice", "password": "alice"})
+    query = urlsplit(login.location).query
+
+    class Ctx(NamedTuple):
+        mod: object
+        browser: object
+        bridge: OpBridge
+        query: str
+        state: str
+
+    return Ctx(rp_mod, browser, bridge, query, params["state"])
+
+
+RLO = chr(0x202E)  # U+202E RIGHT-TO-LEFT OVERRIDE
+
+
+def _no_exchange(ctx) -> bool:
+    return not any(url.endswith("/token") for url in ctx.bridge.calls)
+
+
+def test_flask_rp_callback_happy_path(rp_login):
+    """The OP's real redirect is accepted (the demo OP sends no ``iss``)."""
+    assert rp_login.mod.OP_SENDS_ISS is False
+    assert "iss" not in dict(parse_qsl(rp_login.query))  # documents why the flag is False
+    r = rp_login.browser.get("/callback?" + rp_login.query)
+    assert r.status_code == 200, r.data
+    assert "Signed in as alice" in r.data.decode()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "&code=second",  # duplicate code
+        "&error=access_denied",  # code and error together
+    ],
+)
+def test_flask_rp_callback_rejects_ambiguous_response(rp_login, extra):
+    r = rp_login.browser.get("/callback?" + rp_login.query + extra)
+    assert r.status_code == 400 and "malformed callback" in r.data.decode()
+    assert _no_exchange(rp_login)
+
+
+def test_flask_rp_callback_rejects_neither_code_nor_error(rp_login):
+    r = rp_login.browser.get(f"/callback?state={rp_login.state}")
+    assert r.status_code == 400 and "malformed callback" in r.data.decode()
+    assert _no_exchange(rp_login)
+
+
+def test_flask_rp_callback_error_description_is_not_echoed(rp_login, caplog):
+    """Hostile ``error_description`` text reaches neither the page nor the log raw."""
+    hostile = f"bad{RLO}txt\x1b[31mred\nforged log line"
+    q = urlencode({"error": "access_denied", "error_description": hostile, "state": rp_login.state})
+    with caplog.at_level("WARNING"):
+        r = rp_login.browser.get("/callback?" + q)
+    assert r.status_code == 403
+    page = r.data.decode()
+    assert "The OP refused the login" in page
+    for bad in (RLO, "\x1b", "\n" + "forged", "bad", "red"):
+        assert bad not in page
+    logged = caplog.text
+    assert "OP refused login: access_denied" in logged
+    for bad in (RLO, "\x1b", "\nforged log line"):
+        assert bad not in logged
+    assert _no_exchange(rp_login)
+
+
+@pytest.mark.parametrize("state", ["forged", None])
+def test_flask_rp_callback_rejects_wrong_or_missing_state(rp_login, state):
+    pairs = [(k, v) for k, v in parse_qsl(rp_login.query) if k != "state"]
+    if state is not None:
+        pairs.append(("state", state))
+    r = rp_login.browser.get("/callback?" + urlencode(pairs))
+    assert r.status_code == 400 and "state mismatch" in r.data.decode()
+    assert _no_exchange(rp_login)
+
+
+def test_flask_rp_callback_rejects_wrong_iss(rp_login):
+    r = rp_login.browser.get("/callback?" + rp_login.query + "&iss=http://evil.example")
+    assert r.status_code == 400 and "wrong issuer" in r.data.decode()
+    assert _no_exchange(rp_login)
+
+
+def test_flask_rp_callback_accepts_matching_iss(rp_login):
+    r = rp_login.browser.get("/callback?" + rp_login.query + "&iss=" + OP_ISSUER)
+    assert r.status_code == 200, r.data
+
+
+def test_flask_rp_callback_requires_iss_when_op_sends_it(rp_login, monkeypatch):
+    monkeypatch.setattr(rp_login.mod, "OP_SENDS_ISS", True)
+    r = rp_login.browser.get("/callback?" + rp_login.query)
+    assert r.status_code == 400 and "wrong issuer" in r.data.decode()
+
+
+def test_flask_rp_callback_session_is_single_use(rp_login):
+    """Even a malformed callback consumes the pending session entry."""
+    assert rp_login.browser.get("/callback?code=a&code=b").status_code == 400
+    r = rp_login.browser.get("/callback?" + rp_login.query)
+    assert r.status_code == 400 and "state mismatch" in r.data.decode()

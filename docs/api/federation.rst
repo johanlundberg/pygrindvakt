@@ -58,7 +58,12 @@ Classes
 
       The ``jwks`` carried in the statement (the subject's federation keys)
       as a ``{"keys": [...]}`` dict. Raises
-      :class:`pygrindvakt.BadRequestError` if absent.
+      :class:`pygrindvakt.BadRequestError` if absent. Symmetric (``oct``)
+      keys are dropped with a ``UserWarning``: federation entities sign with
+      asymmetric keys; symmetric keys cannot be published.
+
+      .. versionchanged:: 0.3.0
+         ``oct`` keys are dropped with a ``UserWarning``.
 
    .. py:method:: metadata(kind: str) -> dict[str, Any] | None
 
@@ -96,7 +101,12 @@ Classes
 
       The subject's federation signing keys from the entity configuration
       at the start of the returned trust chain, as a ``{"keys": [...]}``
-      dict.
+      dict. Symmetric (``oct``) keys are dropped with a ``UserWarning``
+      (federation entities sign with asymmetric keys), so the set is safe to
+      pass on to :func:`entity_metadata_jwks`.
+
+      .. versionchanged:: 0.3.0
+         ``oct`` keys are dropped with a ``UserWarning``.
 
    .. py:property:: exp
       :type: int | None
@@ -143,6 +153,17 @@ Entity statements: build, decode, verify
    result at ``<entity_id>/.well-known/openid-federation`` with content type
    ``application/entity-statement+jwt``.
 
+   A symmetric (``oct``) key in ``public_jwks`` emits a ``UserWarning``
+   ("federation.build_entity_configuration() is publishing a symmetric (oct)
+   key") and is still included: the call does not filter what you configured,
+   but federation verifiers drop ``oct`` keys, so the statement is not
+   verifiable by them against that key. Only ``public_jwks`` is checked
+   (``SigningKey.to_public_jwks()`` of an ``HS*`` key yields an ``oct`` entry
+   without ``k``).
+
+   .. versionchanged:: 0.3.0
+      Warns when ``public_jwks`` contains an ``oct`` key.
+
    .. code-block:: python
 
       ec = federation.build_entity_configuration(
@@ -168,19 +189,32 @@ Entity statements: build, decode, verify
    ``typ = entity-statement+jwt`` and a present ``exp``. Use it for
    subordinate statements, with the issuer's federation keys.
 
+   A token whose header ``alg`` is ``HS256``, ``HS384``, ``HS512`` or
+   ``none`` is refused with :class:`pygrindvakt.AuthnError`
+   (``code == "symmetric_algorithm"``) before any key is consulted, and any
+   ``oct`` key in ``jwks`` is dropped with a ``UserWarning``. Federation
+   entities sign with asymmetric keys; symmetric keys cannot be published.
+
+   .. versionchanged:: 0.3.0
+      MAC-signed and unsigned statements are refused; ``oct`` keys are
+      dropped from ``jwks``.
+
 .. py:function:: verify_typed(token: str, jwks: dict[str, Any], typ: str) -> EntityStatement
 
    Verify a trust-anchor-signed JWT against a JWKS dict, requiring the given
    ``typ`` header (e.g. :data:`RESOLVE_RESPONSE_TYP`) and a present ``exp``.
    A statement with the wrong ``typ`` is rejected even if the signature is
-   valid.
+   valid. The same ``alg`` refusal and ``oct`` drop as :func:`verify`
+   apply.
 
 .. py:function:: verify_self_signed(token: str) -> EntityStatement
 
    Verify a self-issued Entity Configuration using the keys it carries:
    ``iss`` must equal ``sub`` and the signature must validate against the
    embedded ``jwks``. A statement issued by someone else, or without
-   ``jwks``, is rejected.
+   ``jwks``, is rejected. A token signed with ``HS256`` / ``HS384`` /
+   ``HS512`` or ``none`` is refused with ``AuthnError``
+   (``code == "symmetric_algorithm"``), as in :func:`verify`.
 
 Networked: fetch, resolve, keys, collection
 -------------------------------------------
@@ -212,6 +246,13 @@ Networked: fetch, resolve, keys, collection
    not validate, :class:`pygrindvakt.InternalError` for transport failures,
    :class:`pygrindvakt.ConfigError` when ``trust_anchors`` is empty).
 
+   Any ``oct`` (symmetric) key in a ``trust_anchors`` JWKS is dropped with a
+   ``UserWarning`` before use, so a trust anchor cannot be verified with a
+   shared secret.
+
+   .. versionchanged:: 0.3.0
+      ``oct`` keys in ``trust_anchors`` are dropped with a ``UserWarning``.
+
    .. code-block:: python
 
       TRUST_ANCHORS = {"https://ta.example.org": json.load(open("ta.jwks.json"))}
@@ -228,12 +269,37 @@ Networked: fetch, resolve, keys, collection
    fallback. Returns a ``{"keys": [...]}`` dict. ``metadata`` is one entity
    type's object, e.g. ``entity.metadata["openid_provider"]``.
 
+   ``subject_fed_jwks`` is the verifier key set for ``signed_jwks_uri``. Any
+   ``oct`` key in it is dropped with a ``UserWarning`` before verification,
+   so a symmetric-keyed (``HS*``) signed JWK Set is never accepted: federation
+   entities sign with asymmetric keys, and symmetric keys cannot be published.
+
+   Published key sets must not carry symmetric keys (OIDC Core 10.1). Every
+   ``oct`` key in the returned set is dropped, whether it came from inline
+   ``jwks``, ``signed_jwks_uri`` or ``jwks_uri``, and a ``UserWarning``
+   ("published JWKS contains a symmetric (oct) key, ignored") is emitted. The
+   drop is unconditional: a warning filter can hide the warning, and one that
+   turns it into an error has the error discarded, but the key is dropped
+   either way.
+
+   .. versionchanged:: 0.3.0
+      ``oct`` keys are dropped with a ``UserWarning``, from the result and
+      from ``subject_fed_jwks``.
+
 .. py:function:: fetch_signed_jwks(http: HttpClientProtocol | None, signed_jwks_uri: str, subject_entity_id: str, subject_fed_jwks: dict[str, Any]) -> dict[str, Any]
 
    Fetch and verify a signed JWK Set document (``typ = jwk-set+jwt``) from
    ``signed_jwks_uri``. The signature must validate against
    ``subject_fed_jwks`` and the ``sub`` must equal ``subject_entity_id``.
-   Returns a ``{"keys": [...]}`` dict.
+   Returns a ``{"keys": [...]}`` dict. Every ``oct`` (symmetric) key is
+   dropped from the result with a ``UserWarning``, as in
+   :func:`entity_metadata_jwks`. Any ``oct`` key in ``subject_fed_jwks`` is
+   dropped as well, before verification, so a document signed with
+   ``HS256`` / ``HS384`` / ``HS512`` fails verification.
+
+   .. versionchanged:: 0.3.0
+      ``oct`` keys are dropped with a ``UserWarning``, from the result and
+      from ``subject_fed_jwks``.
 
 .. py:function:: fetch_collection(http: HttpClientProtocol | None, collection_endpoint: str, entity_type: str) -> list[CollectionEntity]
 

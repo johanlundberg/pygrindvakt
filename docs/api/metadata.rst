@@ -91,7 +91,7 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
          properties (``acr_values_supported``, ``end_session_endpoint``, ...)
          instead. A malformed member from discovery reads back ``None`` from
          its typed getter, is re-emitted verbatim by ``to_dict()``, and then
-         makes ``from_dict()`` raise ``ValueError``; this asymmetry is pinned
+         makes ``from_dict()`` raise :class:`~pygrindvakt.ConfigError`; this asymmetry is pinned
          by ``test_discovered_malformed_known_extra_getter_none_roundtrip_raises``
          in ``tests/test_metadata.py``.
 
@@ -101,7 +101,7 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       :type: str
 
       Setting it re-validates every URL-typed member already in ``extra``
-      (see below) against the new issuer; on failure ``ValueError`` names the
+      (see below) against the new issuer; on failure :class:`~pygrindvakt.ConfigError` names the
       member and the old issuer is kept.
 
    .. py:attribute:: authorization_endpoint
@@ -156,14 +156,14 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
       Extension fields (anything not modelled above) as a dict. Assigning
       replaces the whole set. Modelled protocol members cannot be duplicated
       through ``extra``. Known extension members (below) must have their
-      documented JSON type; a wrong type raises ``ValueError`` from
+      documented JSON type; a wrong type raises :class:`~pygrindvakt.ConfigError` from
       ``from_dict``, ``extra`` and ``set_extra_field``.
 
    .. py:method:: set_extra_field(key: str, value: Any) -> None
 
       Set one non-protocol extension field. ``value`` may be any
       JSON-serializable object (known extension members must have the right
-      type); reserved names raise ``ValueError``.
+      type); reserved names raise :class:`~pygrindvakt.ConfigError`.
 
    Known extension members are **type-checked** on every write path
    (``from_dict``, the ``extra`` setter, ``set_extra_field`` and the typed
@@ -176,9 +176,10 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
    ``pushed_authorization_request_endpoint``, ...) and
    ``check_session_iframe``. The check is: an absolute https URL (http only
    for a loopback URL under a loopback issuer), no userinfo, no fragment, no
-   control characters. A bad value raises ``ValueError`` naming the member.
+   control characters. A bad value raises :class:`~pygrindvakt.ConfigError` (also a
+   ``ValueError``) naming the member.
    The ``issuer`` itself is validated too (constructor, ``from_dict`` and
-   the setter; ``ValueError``), since it decides whether loopback http is
+   the setter; ``ConfigError``), since it decides whether loopback http is
    allowed. ``authorization_endpoint`` query parameters are not checked by
    ``ProviderMetadata`` (the upstream query check is not public). Strictness
    note: an empty-string optional endpoint (``"registration_endpoint": ""``
@@ -220,12 +221,12 @@ returned by :func:`pygrindvakt.rp.discover` on the RP side.
    malformed member, e.g. ``acr_values_supported: "urn:x"``, the typed getter
    returns ``None`` while :attr:`raw` and ``to_dict()`` still carry the original
    value, and ``from_dict(md.to_dict())`` of such a document raises
-   ``ValueError``.
+   :class:`~pygrindvakt.ConfigError`.
 
    Known extension members live in ``extra`` but have typed accessors.
    Getters return ``None`` when the member is absent (distinct from ``[]`` /
    ``False``); setters take the value or ``None`` to remove it, and raise
-   ``ValueError`` for a wrong type.
+   :class:`~pygrindvakt.ConfigError` for a wrong type.
 
    .. py:attribute:: end_session_endpoint
       :type: str | None

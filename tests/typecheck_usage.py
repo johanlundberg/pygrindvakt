@@ -6,6 +6,8 @@ the built-in ``ReqwestClient``, ``None`` and a custom protocol client.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pygrindvakt.http
 from pygrindvakt import (
     AuthnError,
@@ -14,8 +16,16 @@ from pygrindvakt import (
     OAuthError,
     discovery,
     federation,
+    jwt,
+    keys,
+    metadata,
+    provider,
     rp,
+    testing,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class TupleClient:
@@ -141,6 +151,27 @@ def use_all() -> None:
         fetch_timeout=5.0,
     )
     rp.JwksCache(None, "https://op.example.com/jwks", "https://op.example.com")
+    dcache = rp.DiscoveryCache(
+        reqwest,
+        "https://op.example.com",
+        default_ttl=600,
+        min_ttl=30,
+        max_ttl=3600,
+        failure_backoff=5,
+        stale_on_error=False,
+        max_stale=120,
+        fetch_timeout=5.0,
+        allow_cross_origin_end_session=True,
+    )
+    rp.DiscoveryCache(None, "https://op.example.com")
+    dmeta: metadata.ProviderMetadata = dcache.metadata()
+    dinfo: rp.ProviderInfo = dcache.info()
+    dkeys: rp.JwksCache = dcache.jwks()
+    dcache.refresh()
+    dissuer: str = dcache.issuer
+    dbackoff: int = dcache.failure_backoff
+    dtimeout: float = dcache.fetch_timeout
+    del dmeta, dinfo, dkeys, dissuer, dbackoff, dtimeout
     keyset: dict[str, object] = cache.jwks()
     cache.refresh()
     cached_claims: dict[str, object] = cache.verify_id_token(
@@ -234,6 +265,188 @@ def use_errors() -> None:
         description: str | None = e.upstream_error_description
         body: str | None = e.upstream_body
         cause: BaseException | None = e.__cause__
+        auth_failure: bool = e.auth_failure
+        retryable: bool = e.retryable
+        summary: str = e.log_summary
         del code, status, upstream_error, description, body, cause
+        del auth_failure, retryable, summary
     except (AuthnError, InternalError, OAuthError) as e:
         print(e.code)
+
+
+def use_bad_request() -> None:
+    try:
+        rp.RpClient("c", "https://x/cb", auth_method="x")
+    # BadRequestError is also a ValueError: its clause must come first or the
+    # ValueError clause shadows it.
+    except pygrindvakt.BadRequestError as bre:
+        as_value_error: ValueError = bre
+        as_base: GrindvaktError = bre
+        del as_value_error, as_base
+    except ValueError as ve:
+        other: ValueError = ve
+        del other
+
+
+def use_config_error() -> None:
+    try:
+        rp.RpClient("c", "https://x/cb", auth_method="x")
+    except pygrindvakt.ConfigError as ce:
+        as_value_error: ValueError = ce
+        as_base: GrindvaktError = ce
+        hint: int = ce.status_hint
+        summary: str = ce.log_summary
+        del as_value_error, as_base, hint, summary
+        raise
+    except GrindvaktError as ge:
+        print(ge.log_summary)
+
+
+def use_validators() -> None:
+    # validate_issuer / validate_service_endpoint raise ConfigError;
+    # validate_redirect_uri_syntax raises BadRequestError.
+    rp.validate_issuer("https://op.example")
+    rp.validate_redirect_uri_syntax("https://rp.example/cb")
+    rp.validate_service_endpoint("token_endpoint", "https://op.example/token")
+    rp.validate_service_endpoint("token_endpoint", "https://op.example/token", issuer="https://op.example")
+    rp.validate_service_endpoint(
+        "token_endpoint", "http://localhost:8080/token", "http://localhost:8080", allow_loopback_http=True
+    )
+    cap: int = rp.MAX_ID_TOKEN_LEEWAY
+    algs: list[str] = rp.asymmetric_algorithms()
+    digest: str = jwt.oidc_token_hash("RS256", "token")
+    supported: bool = jwt.supports_oidc_token_hash("RS256")
+    del cap, algs, digest, supported
+
+
+def use_authorization_response(req: pygrindvakt.http.HttpRequestData) -> None:
+    r: rp.AuthorizationResponse = rp.parse_authorization_response(req)
+    rp.parse_authorization_response([("code", "c"), ("state", "s")], response_mode="fragment")
+    rp.parse_authorization_response({"code": ["c"]}, response_mode="form_post", accept_jarm=True)
+    rp.parse_authorization_response({"code": ("c",)})
+    req.query = [("code", "c")]
+    req.form = [("code", "c")]
+    req.query = {"code": "c"}
+    req.form = {"code": "c"}
+    # A plain dict[str, str] must not type-check (a str is a Sequence[str]).
+    plain: dict[str, str] = {"code": "c"}
+    rp.parse_authorization_response(plain)  # type: ignore[arg-type]
+    code: str | None = r.code
+    state: str | None = r.state
+    error: str | None = r.error
+    desc: str | None = r.error_description_safe
+    uri: str | None = r.error_uri
+    iss: str | None = r.iss
+    jarm: str | None = r.response
+    mode: str = r.response_mode
+    flags: tuple[bool, bool] = (r.is_error, r.error_known)
+    ok: bool = r.matches_iss("https://op.example", required=False)
+    st_ok: bool = r.matches_state("expected-state")
+    st_opt: bool = r.matches_state("expected-state", required=False)
+    del code, state, error, desc, uri, iss, jarm, mode, flags, ok, st_ok, st_opt
+
+
+def use_helpers(unknown: object, md: metadata.ProviderMetadata) -> None:
+    info = rp.ProviderInfo.from_metadata(md)
+    me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret="s")
+    res: rp.BeginResult = rp.begin(info, me)
+    begin_url: str = res.url
+    begin_state: str = res.state
+    begin_nonce: str = res.nonce
+    begin_verifier: str | None = res.code_verifier
+    as_tuple: tuple[str, str, str, str | None] = res
+    url, state, nonce, verifier = res
+    del begin_url, begin_state, begin_nonce, begin_verifier, as_tuple, url, state, nonce, verifier
+
+    ts: rp.TokenSet = rp.exchange_code(None, info, me, "code")
+    refresh: str | None = ts.refresh_token
+    expires: int | None = ts.expires_in
+    scope: str | None = ts.scope
+    del refresh, expires, scope
+
+    auds: list[str] = rp.claims_audiences({"aud": "a"})
+    del auds
+
+    embedded: metadata.ProviderMetadata | None = info.metadata
+    del embedded
+
+    problems: list[str] = rp.check_rp_compatibility(info)
+    rp.check_rp_compatibility(md)
+    rp.check_rp_compatibility(
+        info,
+        client=me,
+        pkce=True,
+        algorithms=["ES256"],
+        scopes=("openid", "email"),
+        acr_values=["urn:x"],
+        shared_secret_keys=True,
+    )
+    rp.check_rp_compatibility(
+        md, client=None, pkce=None, algorithms=None, scopes=None, acr_values=None, shared_secret_keys=False
+    )
+    del problems
+
+    ok: bool = pygrindvakt.http.supports_get_with_headers(unknown)
+    pygrindvakt.http.supports_get_with_headers(None)
+    if pygrindvakt.http.supports_get_with_headers(unknown):
+        rp.fetch_userinfo(
+            unknown,
+            "https://op.example.com/ui",
+            "tok",
+            "sub",
+            "https://op.example.com",
+            method="GET",
+        )
+    del ok
+
+
+def use_testing(op: provider.Provider, key: keys.SigningKey) -> None:
+    """``pygrindvakt.testing`` is type-checked here, so it is covered by ``--strict``."""
+    route: testing.FetchResult = (200, b"{}", "application/json", (("Cache-Control", "max-age=60"),))
+
+    def dynamic(req: testing.RecordedRequest) -> testing.FetchResult:
+        return 200, req.url.encode(), None, ()
+
+    static = testing.StaticHttpClient(
+        {"https://a/x": route, ("POST", "https://a/y"): dynamic}, default=(500, b"", None, ())
+    )
+    routes_a: dict[str, testing.FetchResult] = {"https://a/a": route}
+    routes_b: dict[tuple[str, str], testing.FetchResult] = {("GET", "https://a/b"): route}
+    routes_c: dict[str | tuple[str, str], testing.FetchResult] = {"https://a/c": route, ("GET", "https://a/d"): route}
+    routes_d: dict[str, Callable[[testing.RecordedRequest], testing.FetchResult]] = {"https://a/e": dynamic}
+    for routes in (testing.StaticHttpClient(routes_a), testing.StaticHttpClient(routes_b)):
+        rp.discover(routes, "https://op.example.com")
+    testing.StaticHttpClient(routes_c, default=(500, b"", None))
+    testing.StaticHttpClient(routes_d)
+    from_json = testing.StaticHttpClient.from_json({"https://a/z": {"k": 1}})
+    testing.StaticHttpClient.from_json({"https://a/z": {"k": 1}}, cache_control=None)
+    bridge = testing.ProviderHttpClient(op, "https://op.example.com", token_path="/t", jwks_path="/j")
+    testing.ProviderHttpClient(op, "https://op.example.com", cache_control=None)
+    testing.ProviderHttpClient(op, "https://op.example.com", cache_control="max-age=60")
+    rp.discover(static, "https://op.example.com")
+    rp.discover(from_json, "https://op.example.com")
+    rp.discover(bridge, "https://op.example.com")
+    rp.fetch_userinfo(bridge, "https://op.example.com/userinfo", "tok", "sub", "https://op.example.com", method="GET")
+    rp.fetch_userinfo(static, "https://a/x", "tok", "sub", "https://op.example.com", method="GET")
+    recorded: list[testing.RecordedRequest] = static.calls + bridge.calls
+    forms: list[list[tuple[str, str]]] = bridge.forms
+    first: testing.RecordedRequest = recorded[0]
+    method: str = first.method
+    form: tuple[tuple[str, str], ...] | None = first.form
+    hdrs: tuple[tuple[str, str], ...] = first.headers
+    authz: str | None = first.header("authorization")
+    del forms, method, form, hdrs, authz
+    token: str = testing.mint_id_token(
+        key,
+        issuer="https://op.example.com",
+        client_id="demo",
+        sub="bob",
+        nonce="n",
+        access_token="at",
+        code="c",
+        lifetime=60,
+        iat=1,
+        extra={"acr": "x", "azp": "demo", "auth_time": 1, "jti": "j"},
+    )
+    testing.mint_id_token(key, issuer="https://op.example.com", client_id="demo")
+    del token

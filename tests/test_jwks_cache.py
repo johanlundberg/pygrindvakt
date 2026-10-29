@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from pygrindvakt import (
     AuthnError,
-    BadRequestError,
+    ConfigError,
     GrindvaktError,
     InternalError,
     JoseError,
@@ -299,9 +299,10 @@ def test_python_client_without_headers_warns_once_and_uses_default_ttl():
     cache.jwks()
     assert http.calls == 1
     clock.advance(2)  # expired: refetch must not warn again
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         cache.jwks()
+    assert caught == []
     assert http.calls == 2
     # Another cache warns for itself.
     other, _ = make_cache(ScriptedHttp({"keys": []}))
@@ -311,9 +312,10 @@ def test_python_client_without_headers_warns_once_and_uses_default_ttl():
 
 def test_builtin_client_does_not_warn(jwks_server):
     cache, _ = server_cache(jwks_server)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         cache.jwks()
+    assert caught == []
 
 
 @pytest.mark.parametrize("as_response", [False, True])
@@ -322,14 +324,15 @@ def test_python_client_with_headers_honours_cache_control(as_response):
     http.as_response = as_response
     http.headers = [("Cache-Control", "public, max-age=120"), ("Age", "100")]
     cache, clock = make_cache(http, min_ttl=1)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         cache.jwks()
         clock.advance(19)
         cache.jwks()
         assert http.calls == 1
         clock.advance(2)  # 120 - 100 = 20s lifetime
         cache.jwks()
+    assert caught == []
     assert http.calls == 2
 
 
@@ -698,7 +701,7 @@ def test_rp_verify_id_token_with_cache_rejects_issuer_mismatch():
     cache, _ = make_cache(http)
     other = "https://other.example.com"
     # Token claims iss == other and is signed by the cache's key.
-    with pytest.raises(BadRequestError, match="issuer"):
+    with pytest.raises(ConfigError, match="issuer"):
         rp.verify_id_token(cache, id_token(k1, issuer=other), other, CLIENT_ID, "n", ["ES256"])
     # Rejected before any fetch.
     assert http.calls == 0
@@ -781,11 +784,11 @@ def test_cache_argument_errors_do_not_fetch():
     tok = id_token(k1)
     with pytest.raises(AuthnError, match="expected_nonce is required"):
         cache.verify_id_token(tok, CLIENT_ID, None, ["ES256"])
-    with pytest.raises(BadRequestError, match="leeway"):
+    with pytest.raises(ConfigError, match="leeway"):
         verify(cache, tok, leeway=301)
-    with pytest.raises(BadRequestError, match="require_at_hash"):
+    with pytest.raises(ConfigError, match="require_at_hash"):
         verify(cache, tok, require_at_hash=True)
-    with pytest.raises(BadRequestError, match="acr_values"):
+    with pytest.raises(ConfigError, match="acr_values"):
         verify(cache, tok, acr_values=[])
     with pytest.raises(ValueError, match="algorithm"):
         cache.verify_id_token(tok, CLIENT_ID, "n", ["nope"])
@@ -855,7 +858,7 @@ def test_fetch_userinfo_with_cache_rejects_issuer_mismatch():
     claims = {"iss": other, "sub": "alice", "aud": CLIENT_ID, "iat": now}
     http = UserinfoHttp(jwks_doc(k1), jwt.sign(k1, claims))
     cache, _ = make_cache(http)
-    with pytest.raises(BadRequestError, match="issuer"):
+    with pytest.raises(ConfigError, match="issuer"):
         rp.fetch_userinfo(
             http,
             f"{other}/userinfo",
@@ -1104,3 +1107,88 @@ def test_waiter_never_hangs_when_holder_finishes_near_deadline(stalling):
     a.join(timeout=10)
     assert cache.jwks() == jwks_doc(http.k1)
     assert http.calls == 1
+
+
+# --- shared-secret algorithms and symmetric keys (ADR 0006) ---------------------
+
+
+def oct_jwk(secret=b"s" * 64, kid="c"):
+    import base64
+
+    return {"kty": "oct", "k": base64.urlsafe_b64encode(secret).rstrip(b"=").decode(), "kid": kid}
+
+
+@pytest.mark.parametrize("algs", [["HS256"], ["HS384"], ["HS512"], ["ES256", "HS256"]])
+def test_verify_id_token_refuses_shared_secret_algorithms(algs):
+    k1 = make_key("k1")
+    http = ScriptedHttp({"keys": [*jwks_doc(k1)["keys"], oct_jwk()]})
+    cache, _ = make_cache(http)
+    with pytest.raises(ConfigError) as exc:
+        cache.verify_id_token(id_token(k1), CLIENT_ID, "n", algs)
+    assert exc.value.code == "shared_secret_algorithm"
+    assert isinstance(exc.value, ValueError)
+    assert "client_secret" in str(exc.value)
+    assert http.calls == 0  # refused before any fetch
+
+
+def test_oct_keys_are_dropped_with_one_warning_per_fetch():
+    k1 = make_key("k1")
+    http = ScriptedHttp({"keys": [oct_jwk(), *jwks_doc(k1)["keys"], oct_jwk(kid="d")]})
+    cache, clock = make_cache(http, min_ttl=0, default_ttl=10)
+    with pytest.warns(UserWarning, match=r"symmetric \(oct\) key, ignored") as record:
+        doc = cache.jwks()
+    assert len([w for w in record if "symmetric" in str(w.message)]) == 1
+    assert doc == jwks_doc(k1)
+    # Served from the cache: no second fetch, no second warning.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        warnings.filterwarnings("ignore", message=".*reports no response headers.*")
+        assert cache.jwks() == jwks_doc(k1)
+        assert verify(cache, id_token(k1))["sub"] == "alice"
+    assert caught == []
+    # An expired set is fetched again and warns again.
+    clock.advance(11)
+    with pytest.warns(UserWarning, match="symmetric"):
+        cache.jwks()
+    assert http.calls == 2
+
+
+def test_hs256_token_signed_with_published_oct_key_never_verifies():
+    k1 = make_key("k1")
+    secret = b"p" * 64
+    http = ScriptedHttp({"keys": [*jwks_doc(k1)["keys"], oct_jwk(secret)]})
+    cache, _ = make_cache(http)
+    sk = keys.signing_key_from_jwk(oct_jwk(secret), alg="HS256", kid="c")
+    forged = jwt.sign(
+        sk,
+        {
+            "iss": ISSUER,
+            "sub": "mallory",
+            "aud": CLIENT_ID,
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 300,
+            "nonce": "n",
+        },
+    )
+    with pytest.warns(UserWarning, match="symmetric"):
+        cache.jwks()
+    with pytest.raises(GrindvaktError):
+        verify(cache, forged)  # ES256 only: algorithm not allowed
+    with pytest.raises(ConfigError) as exc:
+        cache.verify_id_token(forged, CLIENT_ID, "n", ["HS256"])
+    assert exc.value.code == "shared_secret_algorithm"
+    with pytest.raises(UnknownKeyError):
+        verify(cache, forged)  # kid "c" is not in the filtered set
+
+
+def test_clean_jwks_emits_no_warning_and_asymmetric_paths_work():
+    k1 = make_key("k1")
+    http = ScriptedHttp(jwks_doc(k1))
+    cache, _ = make_cache(http)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        warnings.filterwarnings("ignore", message=".*reports no response headers.*")
+        assert cache.jwks() == jwks_doc(k1)
+        assert verify(cache, id_token(k1))["sub"] == "alice"
+        assert rp.verify_id_token(cache, id_token(k1), ISSUER, CLIENT_ID, "n", ["ES256"])["sub"] == "alice"
+    assert caught == []

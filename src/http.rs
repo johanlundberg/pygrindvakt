@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyMapping, PyModule};
 
 use grindvakt::http as gh;
 use grindvakt::http::{HttpClient, HttpFetchResponse as RsFetch};
@@ -65,6 +65,38 @@ pub struct HttpRequestData {
     pub inner: gh::HttpRequestData,
     query_pairs: Vec<(String, String)>,
     form_pairs: Vec<(String, String)>,
+    /// `query` was supplied as a mapping, which may have discarded duplicate
+    /// parameters; the authorization-response parser refuses such a channel.
+    query_from_mapping: bool,
+    form_from_mapping: bool,
+}
+
+/// Convert a `query` / `form` value to ordered pairs, also reporting whether it
+/// was a mapping (which discards duplicates) rather than a sequence of pairs.
+fn request_pairs(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<(Vec<(String, String)>, bool)> {
+    if obj.cast::<PyDict>().is_err() {
+        if let Ok(mapping) = obj.cast::<PyMapping>() {
+            let pairs = mapping
+                .items()?
+                .try_iter()?
+                .map(|item| item?.extract::<(String, String)>())
+                .collect::<PyResult<Vec<_>>>()?;
+            return Ok((pairs, true));
+        }
+        return Ok((parameter_pairs(obj, name)?, false));
+    }
+    Ok((parameter_pairs(obj, name)?, true))
+}
+
+impl HttpRequestData {
+    /// True if the query channel was built from a non-empty mapping.
+    pub fn query_is_lossy(&self) -> bool {
+        self.query_from_mapping && !self.query_pairs.is_empty()
+    }
+    /// True if the form channel was built from a non-empty mapping.
+    pub fn form_is_lossy(&self) -> bool {
+        self.form_from_mapping && !self.form_pairs.is_empty()
+    }
 }
 
 #[pymethods]
@@ -83,12 +115,12 @@ impl HttpRequestData {
         headers: Option<BTreeMap<String, String>>,
         cookies: Option<BTreeMap<String, String>>,
     ) -> PyResult<Self> {
-        let query_pairs = query
-            .map(|value| parameter_pairs(value, "query"))
+        let (query_pairs, query_from_mapping) = query
+            .map(|value| request_pairs(value, "query"))
             .transpose()?
             .unwrap_or_default();
-        let form_pairs = form
-            .map(|value| parameter_pairs(value, "form"))
+        let (form_pairs, form_from_mapping) = form
+            .map(|value| request_pairs(value, "form"))
             .transpose()?
             .unwrap_or_default();
         let headers = headers
@@ -111,6 +143,8 @@ impl HttpRequestData {
             },
             query_pairs,
             form_pairs,
+            query_from_mapping,
+            form_from_mapping,
         })
     }
 
@@ -143,9 +177,12 @@ impl HttpRequestData {
         self.inner.query.clone()
     }
     #[setter]
-    fn set_query(&mut self, v: BTreeMap<String, String>) {
-        self.query_pairs = v.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.inner.query = v;
+    fn set_query(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let (pairs, from_mapping) = request_pairs(v, "query")?;
+        self.inner.query = pairs.iter().cloned().collect();
+        self.query_pairs = pairs;
+        self.query_from_mapping = from_mapping;
+        Ok(())
     }
     /// Ordered query parameters, retaining duplicates for protocol validation.
     #[getter]
@@ -157,9 +194,12 @@ impl HttpRequestData {
         self.inner.form.clone()
     }
     #[setter]
-    fn set_form(&mut self, v: BTreeMap<String, String>) {
-        self.form_pairs = v.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.inner.form = v;
+    fn set_form(&mut self, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let (pairs, from_mapping) = request_pairs(v, "form")?;
+        self.inner.form = pairs.iter().cloned().collect();
+        self.form_pairs = pairs;
+        self.form_from_mapping = from_mapping;
+        Ok(())
     }
     /// Ordered form parameters, retaining duplicates for protocol validation.
     #[getter]
@@ -1101,11 +1141,33 @@ pub fn extract_http_client(
     Ok((client, failures))
 }
 
+/// Whether `client` can send request headers on GET, as
+/// `rp.fetch_userinfo(method="GET")` needs, decided with the same test the
+/// networked functions use but WITHOUT performing any request. `None` (the
+/// built-in client) and a `ReqwestClient` are `True`. Any other object is
+/// `True` only if it has callable `get` and `post_form` and either a callable
+/// `get_with_headers` or a `get` taking `headers` by keyword (or `**kwargs`).
+/// Never raises: an object of any other shape gives `False`. Lets an
+/// application fail at startup instead of on the first userinfo call.
+#[pyfunction]
+#[pyo3(signature = (client))]
+fn supports_get_with_headers(client: Option<&Bound<'_, PyAny>>) -> bool {
+    let Some(o) = client.filter(|o| !o.is_none()) else {
+        return true;
+    };
+    if o.cast::<ReqwestClient>().is_ok() {
+        return true;
+    }
+    require_methods(o, &["get", "post_form"], "HttpClient").is_ok()
+        && headers_mode(o.py(), o) != HeadersMode::Unsupported
+}
+
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = new_submodule(py, parent, "http")?;
     m.add_class::<HttpRequestData>()?;
     m.add_class::<Response>()?;
     m.add_class::<HttpFetchResponse>()?;
     m.add_class::<ReqwestClient>()?;
+    m.add_function(wrap_pyfunction!(supports_get_with_headers, &m)?)?;
     Ok(())
 }

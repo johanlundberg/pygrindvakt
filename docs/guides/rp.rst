@@ -29,7 +29,22 @@ wrong place cannot redirect you to someone else's endpoints.
 
 Discovery is one HTTP round trip; keep ``info`` for the process lifetime and
 refresh it on a timer. The provider's signing keys are cached by a
-:class:`~pygrindvakt.rp.JwksCache` (see below). For a statically configured OP, build the
+:class:`~pygrindvakt.rp.JwksCache` (see below).
+
+``ProviderInfo.from_metadata(discover(...))`` keeps the discovery document as
+``info.metadata``; ``discover`` itself returns a
+:class:`~pygrindvakt.metadata.ProviderMetadata`, which has no ``.metadata``.
+
+.. warning::
+
+   Every endpoint on ``info.metadata`` (``userinfo_endpoint``,
+   ``token_endpoint``, ``authorization_endpoint``, ``jwks_uri``,
+   ``end_session_endpoint`` ...) is UNVALIDATED data from the OP. Never send
+   credentials or tokens to them; use the validated properties on ``info``
+   itself (``info.userinfo_endpoint``, ``info.token_endpoint`` ...). The raw
+   ``end_session_endpoint`` is kept only to diagnose a rejection.
+
+For a statically configured OP, build the
 :class:`~pygrindvakt.rp.ProviderInfo` by hand instead:
 
 .. code-block:: python
@@ -49,12 +64,51 @@ An :class:`~pygrindvakt.rp.RpClient` carries the ``client_id``, the
 ``redirect_uri`` registered at the OP, the requested ``scope`` and how the
 client authenticates at the token endpoint. The method defaults to
 ``client_secret_basic`` when a secret is given and ``none`` otherwise;
-inconsistent combinations raise ``ValueError`` rather than being ignored.
+inconsistent combinations raise :class:`~pygrindvakt.ConfigError` (also a
+``ValueError``) rather than being ignored.
 
 .. code-block:: python
 
    me = rp.RpClient("demo", "https://rp.example.com/cb", client_secret=os.environ["OIDC_CLIENT_SECRET"])
    # or, for a public client (native app, SPA): rp.RpClient("spa", "https://rp.example.com/cb")
+
+Startup checks
+--------------
+
+Two checks let a service fail at startup instead of on the first login.
+:func:`~pygrindvakt.rp.check_rp_compatibility` compares your intent with what
+the OP advertises, and :func:`pygrindvakt.http.supports_get_with_headers`
+checks a custom HTTP client before you rely on ``fetch_userinfo(method="GET")``:
+
+.. code-block:: python
+
+   problems = rp.check_rp_compatibility(info, client=me, pkce=True, algorithms=["ES256"])
+   hard = [p for p in problems if not p.startswith("not advertised:")]
+   if hard:
+       raise SystemExit("; ".join(hard))
+   if not http.supports_get_with_headers(http_client):
+       raise SystemExit("http_client cannot send headers on GET")
+
+``check_rp_compatibility`` accepts the ``ProviderInfo`` or the
+``ProviderMetadata`` from ``discover`` directly. It checks ``code`` in
+``response_types_supported``, ``S256`` in ``code_challenge_methods_supported``
+(only with ``pkce=True``), your ``algorithms``, ``scopes`` and ``acr_values``,
+and the client's token endpoint auth method. Two ``algorithms`` rules mirror
+ADR 0006: ``none`` is always reported (fix the RP config), and ``HS256``/
+``HS384``/``HS512`` are reported unless you pass ``shared_secret_keys=True``
+(you verify with a key set derived from the ``client_secret``). It remains
+advisory. It does not check
+``grant_types_supported``, ``response_modes_supported``, DPoP or anything else.
+
+Messages starting with ``not advertised:`` are informational (the OP omits
+that metadata member; no default is assumed, so ``RS256`` is not assumed for
+``id_token_signing_alg_values_supported``). The one exception is
+``token_endpoint_auth_methods_supported``: when absent or empty, the spec
+default ``["client_secret_basic"]`` is assumed, so a ``client_secret_post``,
+``private_key_jwt`` or ``none`` client is reported as a real mismatch. The
+metadata is untrusted data from the OP, so treat the result as advice. If ``from_metadata`` dropped the OP's
+``end_session_endpoint`` (it warns), compare ``info.end_session_endpoint``
+with ``info.metadata.end_session_endpoint`` to see that it was rejected.
 
 Starting the flow: PKCE, state and nonce in the session
 -------------------------------------------------------
@@ -74,9 +128,17 @@ before redirecting:
 
    @app.get("/login")
    def login():
-       url, state, nonce, verifier = rp.begin(info, me)
-       session["oidc"] = {"state": state, "nonce": nonce, "verifier": verifier}
-       return redirect(url)
+       started = rp.begin(info, me)          # a rp.BeginResult (still a tuple)
+       session["oidc"] = {
+           "state": started.state,
+           "nonce": started.nonce,
+           "verifier": started.code_verifier,
+       }
+       return redirect(started.url)
+
+The result is a named tuple, so ``url, state, nonce, verifier = rp.begin(info,
+me)`` works too. Its ``repr()`` redacts the secrets, so it is safe in a debug
+log.
 
 ``state`` and ``nonce`` are 32 random bytes each and the verifier is 48
 (64 characters, within the RFC 7636 range). ``pkce=False`` is refused for
@@ -144,14 +206,18 @@ a signed request object:
 The callback: exchange and verify
 ---------------------------------
 
-On the callback, check ``state`` first and pop the session entry so it can be
-used only once. Then exchange the code with the stored verifier and verify the
+On the callback, parse the response with
+:func:`~pygrindvakt.rp.parse_authorization_response`, then check ``state``
+against the session entry (popped first; see the warning below for what that
+does and does not guarantee) with
+:meth:`~pygrindvakt.rp.AuthorizationResponse.matches_state` and ``iss``
+with :meth:`~pygrindvakt.rp.AuthorizationResponse.matches_iss`. Then exchange the code with the stored verifier and verify the
 id_token against the issuer, your ``client_id`` and the stored nonce, using the
 process-wide :class:`~pygrindvakt.rp.JwksCache`.
 
 .. code-block:: python
 
-   from pygrindvakt import AuthnError, GrindvaktError
+   from pygrindvakt import AuthnError, BadRequestError, ConfigError, GrindvaktError
 
    # Created once at startup, next to `info`; thread-safe, shared by all requests.
    jwks_cache = rp.JwksCache(http_client, info.jwks_uri, info.issuer)
@@ -159,22 +225,89 @@ process-wide :class:`~pygrindvakt.rp.JwksCache`.
    @app.get("/callback")
    def callback():
        pending = session.pop("oidc", None)
-       if pending is None or request.args.get("state") != pending["state"]:
+       try:
+           # items(multi=True) keeps duplicates; a plain dict would hide them.
+           resp = rp.parse_authorization_response(list(request.args.items(multi=True)))
+       except BadRequestError as e:
+           log.warning("bad callback: %s", e.log_summary)
+           abort(400)
+       # The parse proves nothing: state and iss are still ours to check.
+       if pending is None or not resp.matches_state(pending["state"]):
            abort(400)                                        # not our flow
-       if "error" in request.args:
-           log.warning("OP returned %s", request.args["error"])
+       if not resp.matches_iss(info.issuer):
+           abort(400)                                        # wrong OP or missing iss (RFC 9207)
+       if resp.is_error:
+           log.warning("OP returned %s: %s", resp.error, resp.error_description_safe)
            return render_template("login_failed.html")
        try:
-           ts = rp.exchange_code(http_client, info, me, request.args["code"], code_verifier=pending["verifier"])
+           ts = rp.exchange_code(http_client, info, me, resp.code, code_verifier=pending["verifier"])
            claims = rp.verify_id_token(
                jwks_cache, ts.id_token, info.issuer, me.client_id,
                pending["nonce"], ["ES256"],
            )
-       except GrindvaktError:
-           log.exception("login failed")                     # str(e) is for logs only
-           return render_template("login_failed.html")
+       except ConfigError as e:
+           log.error("RP misconfigured: %s", e.log_summary)  # deployment fault: log, alert, 500
+           raise
+       except GrindvaktError as e:
+           log.warning("login failed: %s", e.log_summary)    # log_summary is for logs only
+           if e.retryable:                                   # OP or network trouble
+               return render_template("login_unavailable.html"), 503
+           return render_template("login_failed.html"), 401 if e.auth_failure else 400
        session["user"] = {"sub": claims["sub"], "email": claims.get("email")}
        return redirect("/")
+
+:func:`~pygrindvakt.rp.parse_authorization_response` replaces hand-written
+``request.args`` handling. It refuses repeated parameters, a response with
+both or neither of ``code`` and ``error``, control, bidi or invisible
+characters and values over 2048 characters in ``code`` / ``state`` / ``iss``,
+a malformed ``error`` and a JARM ``response`` (see
+`ADR 0007 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0007-authorization-response-parsing.md>`_).
+It proves nothing by itself: you still call ``matches_state`` (constant
+time) and ``matches_iss``, always before exchanging the code. Both fail
+closed. ``matches_state`` keeps ``required=True`` because ``rp.authorization_url``
+and ``rp.begin`` always send ``state`` (RFC 6749 section 10.12); pass
+``required=False`` only for a request you deliberately built without it. A
+response without ``iss`` does not match. Only if the OP metadata does **not** advertise
+``authorization_response_iss_parameter_supported`` (RFC 9207 section 2.4) may you
+pass ``required=False`` so that a missing ``iss`` is tolerated; a present
+``iss`` is always compared exactly. Log
+``error_description_safe``, never the raw ``error_description`` (the binding
+does not expose it: it is provider-controlled text). Treat ``error_uri`` as
+untrusted: do not follow it or render it as a link (it is kept only as an
+https URL, or plain http for loopback). Unknown error codes are
+kept (``error_known`` is false) so they can be logged and shown as a generic
+failure. ``error_known`` is wider than what
+:class:`~pygrindvakt.OAuthError` accepts, so do not rebuild an ``OAuthError``
+from ``resp.error``: ``OAuthError("consent_required")`` raises
+``ValueError``. Branch on the string instead, for example
+``if resp.error == "access_denied": ...`` (and ``login_required`` /
+``interaction_required`` for a silent ``prompt=none`` attempt). For a ``response_mode=form_post`` callback pass the
+:class:`~pygrindvakt.http.HttpRequestData` of the ``POST`` instead (with its
+form already parsed). A werkzeug ``request.args`` can also be passed directly;
+a plain ``dict`` is refused. When building an
+:class:`~pygrindvakt.http.HttpRequestData` for the parser, pass ``query`` /
+``form`` as a list of pairs (``request.args.items(multi=True)``), not a
+``dict`` such as ``request.args.to_dict()``: a mapping-built channel raises
+``TypeError`` because it has already dropped duplicate parameters.
+
+:class:`~pygrindvakt.ConfigError` is handled before the generic branch, so a
+broken deployment never looks like a failed login. In the generic branch the
+status comes from the exception attributes: ``retryable`` (OP or network
+trouble) gives 503, ``auth_failure`` gives 401, anything else gives 400. The
+status is for monitors and clients only; the page body is generic and error
+details never reach the browser.
+
+.. warning:: ``retryable`` does not make the callback safe to replay.
+
+   Pop the pending entry before the token exchange, but do not rely on the pop
+   alone for single use. With Flask's default signed-cookie session the pending
+   entry lives in the browser, so an older cookie can restore it, and
+   concurrent callbacks can each pass the state check. For strict single use,
+   keep the pending entry server-side and consume it in one atomic step (for
+   example a database ``DELETE ... RETURNING`` or a Redis ``GETDEL``). The OP
+   rejects a code it has already used, which is a separate protection.
+   After a retryable failure, start a new login instead of retrying the same
+   callback.
 
 :func:`~pygrindvakt.rp.verify_id_token` checks the signature against the
 JWKS, the explicit signing-algorithm allowlist, ``iss``, ``sub``, every
@@ -195,6 +328,37 @@ log them verbatim or show them to the user.
    for flows that genuinely carry no nonce (a pure OAuth 2.0 flow whose
    token response happens to include an id_token). A nonce that *is* given
    is always enforced, flag or not.
+
+OPs that sign ID tokens with HS256 (the client secret)
+-------------------------------------------------------
+
+An OP that registered ``id_token_signed_response_alg`` as ``HS256``,
+``HS384`` or ``HS512`` MACs the ID token with a key derived from your
+``client_secret`` (OIDC Core 10.1). It does not, and must not, publish that key
+in its ``jwks_uri``. So these tokens are verified with a key set **you** build,
+not with a fetched one:
+
+.. code-block:: python
+
+   import base64
+   from pygrindvakt import rp
+
+   secret = client_secret.encode()          # at least 32 bytes for HS256
+   jwks = {"keys": [{"kty": "oct", "k": base64.urlsafe_b64encode(secret).rstrip(b"=").decode()}]}
+   claims = rp.verify_id_token(jwks, ts.id_token, info.issuer, me.client_id, nonce, ["HS256"])
+
+There is no flag and no warning for this: it is the specified way. Everything
+else is refused. A :class:`~pygrindvakt.rp.JwksCache` with an ``HS*`` algorithm
+raises :class:`~pygrindvakt.ConfigError` (``code == "shared_secret_algorithm"``),
+and an ``oct`` key in a published JWK Set is dropped with a ``UserWarning`` by
+:func:`~pygrindvakt.rp.fetch_jwks` and ``JwksCache``. A secret shorter than the
+hash output (32, 48 or 64 bytes; RFC 7518 3.2) raises ``ConfigError`` with
+``code == "weak_shared_secret"``: ask the OP for a longer client secret. See
+ADR 0006.
+
+.. versionchanged:: 0.3.0
+   ``JwksCache`` with ``HS*`` raises, fetched ``oct`` keys are ignored and
+   short secrets are refused.
 
 Key caching and rotation
 ------------------------
@@ -240,7 +404,7 @@ return them (a ``(status, body, content_type, headers)`` tuple or
 
 ``rp.verify_id_token(jwks_cache, id_token, issuer, ...)`` is equivalent, but
 ``issuer`` must equal the cache's own issuer: a mismatch raises
-:class:`pygrindvakt.BadRequestError` before any fetch, so one provider's keys
+:class:`pygrindvakt.ConfigError` before any fetch, so one provider's keys
 can never vouch for another provider's ``iss``. The cache is accepted as ``jwks=`` by :func:`~pygrindvakt.rp.fetch_userinfo`
 for signed UserInfo responses. Extra checks are keyword options on both:
 ``max_age`` (against ``auth_time``), ``acr_values``, ``access_token`` /
@@ -267,6 +431,69 @@ for signed UserInfo responses. Extra checks are keyword options on both:
        max_age=300, acr_values=["urn:mfa"],
        access_token=ts.access_token, require_at_hash=True,
    )
+
+Long-lived RPs: discovery cache
+-------------------------------
+
+:func:`~pygrindvakt.rp.discover` is a one-shot primitive: one round trip, no
+memory. A long-running RP wants the document refreshed on the OP's schedule,
+without a refetch per login and without every login failing while the
+well-known endpoint is briefly down. :class:`~pygrindvakt.rp.DiscoveryCache`
+does that and hands out the objects the rest of the flow needs.
+
+.. code-block:: python
+
+   from pygrindvakt import http, rp
+
+   # Created once per process, next to the RpClient; thread-safe.
+   discovery = rp.DiscoveryCache(http.ReqwestClient(), "https://op.example.com")
+
+   info = discovery.info()          # rp.ProviderInfo, rebuilt when the document is refetched
+   jwks_cache = discovery.jwks()    # rp.JwksCache for info.jwks_uri; same object across refreshes
+   claims = jwks_cache.verify_id_token(id_token, me.client_id, nonce, ["ES256"])
+
+Call ``discovery.info()`` and ``discovery.jwks()`` per request instead of
+keeping the results: the first is cheap while the document is fresh, and the
+second hands you the right :class:`~pygrindvakt.rp.JwksCache` if the OP ever
+moves its ``jwks_uri``. The ``JwksCache`` keeps its keys across metadata
+refreshes as long as ``jwks_uri`` and issuer are unchanged, and is replaced
+(never reused) when they change, so keys of one location cannot verify tokens
+on behalf of another.
+
+*Refresh.* The document lives for ``Cache-Control: max-age`` minus ``Age``,
+else ``default_ttl``, clamped to ``[min_ttl, max_ttl]`` (same rules and the
+same one-time warning for HTTP clients that report no headers as
+:class:`~pygrindvakt.rp.JwksCache`). ``discovery.refresh()`` forces a refetch.
+Concurrent callers share one fetch, and waiters give up after ``fetch_timeout``
+with ``InternalError(code="discovery_fetch_timeout")``; the fetch finishes and
+is cached.
+
+*Failure and back-off.* After a failed fetch the cache makes no request for
+``failure_backoff`` seconds (default 10), so a dead well-known endpoint is not
+hammered by every login. In that window and when refetching an expired
+document fails, the cache serves the previous document **if**
+``stale_on_error`` is true (the default) and the document expired less than
+``max_stale`` seconds ago (default one day); the first time this happens a
+``UserWarning`` is emitted. Otherwise the failing call raises the original
+error and calls inside the window raise
+``InternalError(code="discovery_backoff")`` with the original as
+``__cause__``; the latter is ``retryable`` exactly when the original was
+(transient failures yes, an issuer mismatch or malformed document no). A
+thread that times out waiting for another thread's fetch (``fetch_timeout``)
+is served the stale document under the same rules instead of raising. Pass ``stale_on_error=False`` if you
+would rather fail than log users in against metadata the OP has not
+confirmed. This is deliberately more lenient than ``JwksCache``, which never
+serves expired keys; the keys obtained through ``discovery.jwks()`` keep that
+strict policy (ADR 0008).
+
+*Fork.* The cache is plain in-process memory: a forked child keeps the cached
+document and expiry. Fork only while no other thread is inside a call.
+
+``rp.discover`` and ``ProviderInfo.from_metadata`` remain the primitives
+underneath and are unchanged; use them directly for a short-lived script or
+when you want to manage refresh yourself. Issuer binding is the same either
+way: a document whose ``issuer`` differs from the configured one is rejected
+and never cached.
 
 Userinfo
 --------
@@ -430,12 +657,16 @@ Testing without a network
 -------------------------
 
 Because the HTTP client is injectable, an RP can be tested end to end against
-an in-process :class:`~pygrindvakt.provider.Provider`, as
-``tests/test_rp.py`` does: a fake client answers discovery and JWKS from
-``op.discovery_document()`` / ``op.jwks_document()`` and forwards token and
-userinfo requests to ``op.handle_token_request`` / ``op.userinfo``. Those
-nested calls into pygrindvakt from inside the fake are supported; each runs
-on a helper thread (see :doc:`stores`).
+an in-process :class:`~pygrindvakt.provider.Provider`. The test-only module
+:mod:`pygrindvakt.testing` ships the pieces: ``ProviderHttpClient`` answers
+discovery and JWKS from ``op.discovery_document()`` / ``op.jwks_document()``
+and forwards token and userinfo requests to ``op.handle_token_request`` /
+``op.userinfo`` (``tests/test_rp.py`` is built on it); ``StaticHttpClient``
+serves fixed responses and records the requests; ``mint_id_token`` signs an
+ID Token with a key you hold. Import them explicitly
+(``from pygrindvakt import testing``) and never ship them in your application.
+Nested calls into pygrindvakt from inside such a client are supported; each
+runs on a helper thread (see :doc:`stores`).
 
 Logout
 ------
@@ -470,10 +701,11 @@ host the attacker chose. A provider without an ``end_session_endpoint`` makes ``
 host of the ``end_session_endpoint``. Therefore ``ProviderInfo`` requires that
 endpoint to have the same origin as the issuer (scheme, host, effective port),
 besides the https / no-credentials / no-fragment checks. ``ProviderInfo(...)``
-raises ``BadRequestError`` for a cross-origin endpoint, and
+raises ``ConfigError`` for a cross-origin endpoint, and
 ``ProviderInfo.from_metadata`` drops it, so ``info.end_session_endpoint`` is
-``None`` and ``end_session_url`` raises ``ConfigError`` (the advertised endpoint
-was missing, unsafe, or on a different origin than the issuer). If the OP
+``None`` and ``end_session_url`` raises ``ConfigError``. The message says
+whether the provider does not advertise the endpoint or the advertised value
+was rejected (cross-origin or unsafe). If the OP
 legitimately logs out on another origin, opt in explicitly with
 ``allow_cross_origin_end_session=True`` on ``ProviderInfo(...)`` or
 ``ProviderInfo.from_metadata(...)``.
@@ -488,8 +720,9 @@ origin-checked.
 Security notes
 --------------
 
-* Check ``state`` before touching anything else on the callback, and pop the
-  session entry so it cannot be reused.
+* Parse the callback with :func:`~pygrindvakt.rp.parse_authorization_response`,
+  check ``state`` (constant time) before touching anything else, and pop the
+  session entry so it cannot be reused. Compare ``iss`` with ``matches_iss``.
 * Always pass the stored nonce; never ``unsafe_skip_nonce_check`` in a code
   flow.
 * Prefer ``private_key_jwt``; load the key from a file or HSM, not source.

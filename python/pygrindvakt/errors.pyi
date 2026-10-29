@@ -30,6 +30,10 @@ class OAuthError(GrindvaktError):
 
         Only call this with a ``redirect_uri`` that has already been validated
         against the registered client. The response mode is mandatory.
+
+        Raises ``BadRequestError`` if ``redirect_uri`` contains whitespace,
+        control, bidi or invisible characters or userinfo, is unparsable, or
+        has a fragment (header-injection guard; registration is not checked).
         """
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...

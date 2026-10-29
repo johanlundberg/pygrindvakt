@@ -305,3 +305,69 @@ def test_reqwest_get_invalid_header_is_bad_request(headers):
 
     with pytest.raises(BadRequestError):
         http.ReqwestClient().get("http://127.0.0.1:9/", headers)
+
+
+# --- supports_get_with_headers -----------------------------------------------------------
+
+
+class _GetPost:
+    def get(self, url):
+        raise AssertionError("no request may be made")
+
+    def post_form(self, url, form, headers):
+        raise AssertionError("no request may be made")
+
+
+class _GetHeaders(_GetPost):
+    def get(self, url, headers=None):
+        raise AssertionError("no request may be made")
+
+
+class _GetKwargs(_GetPost):
+    def get(self, url, **kwargs):
+        raise AssertionError("no request may be made")
+
+
+class _GetWithHeaders(_GetPost):
+    def get_with_headers(self, url, headers):
+        raise AssertionError("no request may be made")
+
+
+class _PositionalOnly(_GetPost):
+    def get(self, url, headers=None, /):
+        raise AssertionError("no request may be made")
+
+
+class _NoPost:
+    def get(self, url, headers=None):
+        raise AssertionError("no request may be made")
+
+
+class _Exploding:
+    @property
+    def get(self):
+        raise RuntimeError("boom")
+
+    post_form = None
+
+
+@pytest.mark.parametrize(
+    ("client", "expected"),
+    [
+        (None, True),
+        (http.ReqwestClient(), True),
+        (_GetPost(), False),
+        (_GetHeaders(), True),
+        (_GetKwargs(), True),
+        (_GetWithHeaders(), True),
+        (_PositionalOnly(), False),
+        (_NoPost(), False),
+        (_Exploding(), False),
+        (object(), False),
+        ("https://example.com", False),
+        (42, False),
+        (print, False),
+    ],
+)
+def test_supports_get_with_headers(client, expected):
+    assert http.supports_get_with_headers(client) is expected
