@@ -16,12 +16,13 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use grindvakt::callback as gcb;
 use grindvakt::http::{HttpClient, HttpFetchResponse};
 use grindvakt::Error as RsError;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyTuple};
+use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PySequence, PyTuple};
 
 use grindvakt::jose_rs::algorithm::JwsAlgorithm;
 use grindvakt::jose_rs::jwk::JwkSet;
@@ -30,7 +31,7 @@ use grindvakt::metadata as gm;
 use grindvakt::rp as grp;
 use grindvakt::rp::ClientAuth;
 
-use crate::convert::{from_py, new_submodule, protocol_parameter_pairs, to_py, warn};
+use crate::convert::{from_py, new_submodule, to_py, warn};
 use crate::errors::{
     config_err, config_from, err, escape_untrusted_quoted, escape_untrusted_text,
     is_invisible_format, with_code, with_code_retryable, AuthnError, InternalError,
@@ -3074,48 +3075,6 @@ const RESPONSE_PARAMS: [&str; 7] = [
     "response",
 ];
 
-/// Every `error` code `AuthorizationResponse.error_known` treats as known: the
-/// union of RFC 6749 sections 4.1.2.1 and 5.2, OIDC Core 1.0 section 3.1.2.6,
-/// the JAR / registration codes an authorization endpoint may return, and
-/// every code `parse_oauth_code` (errors.rs) recognises (`login_required`,
-/// `invalid_dpop_proof`). Keep it a SUPERSET of `parse_oauth_code`.
-///
-/// "Known" here is WIDER than what `OAuthError(...)` accepts: `parse_oauth_code`
-/// knows only 12 codes, so e.g. `consent_required` is known but
-/// `OAuthError("consent_required")` raises `ValueError`. Never build an
-/// `OAuthError` from a callback value without catching `ValueError`.
-const KNOWN_ERROR_CODES: [&str; 20] = [
-    // RFC 6749 sections 4.1.2.1 and 5.2.
-    "invalid_request",
-    "invalid_client",
-    "invalid_grant",
-    "unauthorized_client",
-    "unsupported_grant_type",
-    "unsupported_response_type",
-    "invalid_scope",
-    "access_denied",
-    "server_error",
-    "temporarily_unavailable",
-    // OIDC Core section 3.1.2.6 and JAR / registration.
-    "login_required",
-    "interaction_required",
-    "account_selection_required",
-    "consent_required",
-    "invalid_request_uri",
-    "invalid_request_object",
-    "request_not_supported",
-    "request_uri_not_supported",
-    "registration_not_supported",
-    // RFC 9449 (DPoP).
-    "invalid_dpop_proof",
-];
-
-/// Cap (characters) of `code`, `state` and `iss`, and the raw `error_uri`.
-const RESPONSE_VALUE_MAX: usize = 2048;
-
-/// Cap (characters) of the JARM `response` JWT.
-const RESPONSE_JARM_MAX: usize = 32768;
-
 /// Cap (characters) of `AuthorizationResponse.error_description_safe`.
 const ERROR_DESCRIPTION_SAFE_MAX: usize = 256;
 
@@ -3142,15 +3101,14 @@ fn bad_response(msg: impl Into<String>) -> PyErr {
 )]
 #[derive(Clone)]
 pub struct AuthorizationResponse {
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
+    inner: gcb::AuthorizationResponse,
+    /// Transport label (`query` / `fragment` / `form_post`); the core's own
+    /// mode is `Jwt` for a JARM stub, which the binding never reports.
+    transport: &'static str,
+    /// Escaped with the binding's escaper from the single raw value.
     error_description_safe: Option<String>,
+    /// Core's normalised `error_uri` minus any URL with a fragment.
     error_uri: Option<String>,
-    iss: Option<String>,
-    response: Option<String>,
-    response_mode: &'static str,
-    error_known: bool,
 }
 
 #[pymethods]
@@ -3158,19 +3116,19 @@ impl AuthorizationResponse {
     /// The authorization code, verbatim, or `None` for an error response.
     #[getter]
     fn code(&self) -> Option<&str> {
-        self.code.as_deref()
+        self.inner.code()
     }
     /// The `state` echoed by the OP, verbatim. Check it with `matches_state`
     /// (constant time) before anything else.
     #[getter]
     fn state(&self) -> Option<&str> {
-        self.state.as_deref()
+        self.inner.state()
     }
     /// The OAuth error code (RFC 6749 charset, at most 64 characters), or
     /// `None`. Unknown codes are kept; see `error_known`.
     #[getter]
     fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.inner.error()
     }
     /// `error_description` escaped (control, bidi and invisible characters)
     /// and capped at 256 characters. The raw value is not exposed.
@@ -3190,24 +3148,23 @@ impl AuthorizationResponse {
     /// `matches_iss`.
     #[getter]
     fn iss(&self) -> Option<&str> {
-        self.iss.as_deref()
+        self.inner.iss()
     }
-    /// The raw JARM `response` JWT, at most 32768 characters. UNVERIFIED and
-    /// untrusted: the binding has no JARM support. Only set when
-    /// `accept_jarm=True` was passed.
+    /// The raw JARM `response` JWT, at most 32768 characters. Untrusted
+    /// unless `jarm_verified`. Only set when `accept_jarm=True` was passed.
     #[getter]
     fn response(&self) -> Option<&str> {
-        self.response.as_deref()
+        self.inner.jarm_response()
     }
     /// How the response arrived: `"query"`, `"fragment"` or `"form_post"`.
     #[getter]
     fn response_mode(&self) -> &str {
-        self.response_mode
+        self.transport
     }
     /// True when the response carries an OAuth `error`.
     #[getter]
     fn is_error(&self) -> bool {
-        self.error.is_some()
+        self.inner.is_error()
     }
     /// True when `error` is a code the binding knows (RFC 6749, OIDC Core,
     /// DPoP). Unknown codes are kept, never rejected. "Known" is WIDER than
@@ -3218,7 +3175,7 @@ impl AuthorizationResponse {
     /// string instead.
     #[getter]
     fn error_known(&self) -> bool {
-        self.error_known
+        self.inner.error_known()
     }
 
     /// RFC 9207 issuer check, fail closed: exact, byte-for-byte comparison of
@@ -3226,17 +3183,12 @@ impl AuthorizationResponse {
     /// `not required`, so False by default. Pass `required=False` ONLY when
     /// the OP does not advertise `authorization_response_iss_parameter_supported`
     /// (RFC 9207 section 2.4). An empty `expected` is a configuration fault
-    /// and always returns False, regardless of `required`. Never raises. The
-    /// caller MUST call it; parsing does not.
+    /// and always returns False, regardless of `required`, as does an
+    /// unverified JARM stub (`response` set; the binding cannot verify it).
+    /// Never raises. The caller MUST call it; parsing does not.
     #[pyo3(signature = (expected, *, required = true))]
     fn matches_iss(&self, expected: &str, required: bool) -> bool {
-        if expected.is_empty() {
-            return false;
-        }
-        match self.iss.as_deref() {
-            Some(iss) => iss == expected,
-            None => !required,
-        }
+        self.inner.matches_iss(expected, required)
     }
 
     /// `state` check, fail closed: constant-time comparison of the UTF-8
@@ -3248,33 +3200,143 @@ impl AuthorizationResponse {
     /// built without `state`. Never raises for a mismatch. The caller MUST
     /// call it before exchanging the code; parsing does not. An empty
     /// `expected` (no state stored in the session) always returns False,
-    /// regardless of `required`.
+    /// regardless of `required`, as does an unverified JARM stub (`response`
+    /// set).
     #[pyo3(signature = (expected, *, required = true))]
     fn matches_state(&self, expected: &str, required: bool) -> bool {
-        if expected.is_empty() {
-            return false;
+        self.inner.matches_state(expected, required)
+    }
+
+    /// True only for the result of a successful `verify_jarm`.
+    #[getter]
+    fn jarm_verified(&self) -> bool {
+        self.inner.jarm_verified()
+    }
+
+    /// Verify the JARM `response` JWT of this stub (see the `.pyi` stub for
+    /// the full contract) and return the inner response. Fails closed.
+    #[pyo3(signature = (jwks, *, issuer, client_id, allowed_algorithms, trust = "typed",
+                        typ = None, leeway = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_jarm<'py>(
+        &self,
+        py: Python<'py>,
+        jwks: &Bound<'py, PyAny>,
+        issuer: &str,
+        client_id: &str,
+        allowed_algorithms: Vec<String>,
+        trust: &str,
+        typ: Option<&str>,
+        leeway: Option<i64>,
+    ) -> PyResult<AuthorizationResponse> {
+        if !matches!(
+            trust,
+            "typed" | "dedicated_keys" | "untyped_shared_key_compat"
+        ) {
+            return Err(config_err(format!(
+                "trust must be \"typed\", \"dedicated_keys\" or \"untyped_shared_key_compat\", \
+                 got '{}'",
+                escape_untrusted_quoted(trust, 64)
+            )));
         }
-        match self.state.as_deref() {
-            Some(state) => grindvakt::mac::constant_time_eq(state.as_bytes(), expected.as_bytes()),
-            None => !required,
+        if typ.is_some() && trust != "typed" {
+            return Err(config_err("typ is only used with trust=\"typed\""));
         }
+        if typ.is_some_and(|t| t.trim().is_empty()) {
+            return Err(config_err("typ must not be empty"));
+        }
+        if allowed_algorithms.is_empty() {
+            return Err(config_err("allowed_algorithms must not be empty"));
+        }
+        if issuer.is_empty() {
+            return Err(config_err("issuer must not be empty"));
+        }
+        if client_id.is_empty() {
+            return Err(config_err("client_id must not be empty"));
+        }
+        let leeway = seconds("leeway", leeway)?;
+        if leeway.is_some_and(|l| l > MAX_ID_TOKEN_LEEWAY) {
+            return Err(config_err(format!(
+                "JARM leeway must be at most {MAX_ID_TOKEN_LEEWAY} seconds"
+            )));
+        }
+        let algs = parse_algorithms(&allowed_algorithms)?;
+        let source = JwksSource::from_py(jwks)?;
+        source.check_issuer(issuer)?;
+        source.check_algorithms(py, &algs)?;
+
+        // Shape checks before any key-set fetch.
+        let token = match (self.inner.jarm_response(), self.inner.jarm_verified()) {
+            (Some(t), false) => t,
+            (Some(_), true) => return Err(bad_response("JARM response is already verified")),
+            (None, _) => return Err(bad_response("response is not a JARM response")),
+        };
+        // Five dot-separated segments is a compact JWE.
+        if token.split('.').count() == 5 {
+            return Err(bad_response("encrypted JARM not supported"));
+        }
+
+        // A cache refreshes once if the response's `kid` is unknown.
+        // An unknown `kid` after that refresh is an authentication failure of
+        // the response, so it is an `AuthnError` here (`JwksCache` itself
+        // raises `UnknownKeyError`). Every other resolve error is unchanged.
+        let set = source.resolve(py, token, issuer).map_err(|e| {
+            if e.is_instance_of::<UnknownKeyError>(py) {
+                let msg = e.value(py).to_string();
+                let new = with_code(py, AuthnError::new_err(msg), "unknown_kid");
+                new.set_cause(py, Some(e));
+                new
+            } else {
+                e
+            }
+        })?;
+        let set = prepare_mac_keys(py, &set, token, &algs, KeySelection::Named)?;
+        let mut options = gcb::JarmOptions::new(issuer, client_id, &algs);
+        options = match (trust, typ) {
+            ("typed", Some(t)) => options.with_expected_typ(t),
+            ("typed", None) => options,
+            ("dedicated_keys", _) => options.with_dedicated_keys(),
+            _ => options.allow_untyped_shared_keys(),
+        };
+        if let Some(l) = leeway {
+            options = options.with_leeway(l);
+        }
+        let inner = self.inner.verify_jarm(&set, &options).map_err(err)?;
+
+        // Core keeps only its own escaped description for a verified JARM
+        // response. Take the raw value from the token and escape it with the
+        // binding's escaper. Reading claims without verification is safe ONLY
+        // here: the signature, `iss`, `aud` and `exp` were just verified over
+        // this exact token.
+        let error_description_safe = gj::peek_claims_unverified(token)
+            .ok()
+            .and_then(|c| match c.extra.get("error_description") {
+                Some(serde_json::Value::String(d)) => Some(d.clone()),
+                _ => None,
+            })
+            .map(|d| escape_untrusted_text(&d, ERROR_DESCRIPTION_SAFE_MAX));
+        Ok(AuthorizationResponse::new(
+            inner,
+            self.transport,
+            error_description_safe,
+        ))
     }
 
     fn __repr__(&self) -> String {
-        let quoted = |v: &Option<String>| match v {
+        let quoted = |v: Option<&str>| match v {
             Some(s) => format!("'{}'", escape_untrusted_quoted(s, 128)),
             None => "None".to_string(),
         };
-        let set = |v: &Option<String>| if v.is_some() { "<set>" } else { "None" };
+        let set = |v: Option<&str>| if v.is_some() { "<set>" } else { "None" };
         format!(
             "AuthorizationResponse(is_error={}, error={}, code={}, state={}, iss={}, response={}, response_mode='{}')",
-            if self.error.is_some() { "True" } else { "False" },
-            quoted(&self.error),
-            set(&self.code),
-            set(&self.state),
-            quoted(&self.iss),
-            set(&self.response),
-            self.response_mode,
+            if self.inner.is_error() { "True" } else { "False" },
+            quoted(self.inner.error()),
+            set(self.inner.code()),
+            set(self.inner.state()),
+            quoted(self.inner.iss()),
+            set(self.inner.jarm_response()),
+            self.transport,
         )
     }
 }
@@ -3295,6 +3357,72 @@ const SHAPES: &str = "an http.HttpRequestData, a list of (str, str) pairs, a \
 multi-dict mapping of str to list[str] (the urllib.parse.parse_qs shape), or an \
 object with a .lists() method such as a werkzeug MultiDict";
 
+/// The protocol parameters that may be named in an error message. Any other
+/// name is attacker-chosen and is never echoed.
+const KNOWN_PARAMS: [&str; 7] = [
+    "code",
+    "state",
+    "error",
+    "error_description",
+    "error_uri",
+    "iss",
+    "response",
+];
+
+/// Text of a parameter name. `Err(None)` means "not a str" (the caller raises
+/// its own `TypeError`); a lone surrogate is per-request input and becomes a
+/// `BadRequestError` that never echoes the name.
+fn param_name(obj: &Bound<'_, PyAny>) -> Result<String, Option<PyErr>> {
+    let s = obj.cast::<pyo3::types::PyString>().map_err(|_| None)?;
+    s.to_cow().map(|c| c.into_owned()).map_err(|_| {
+        Some(bad_response(
+            "an authorization response parameter name must not contain lone surrogates",
+        ))
+    })
+}
+
+/// Text of the value of parameter `name`. `None` means "not a str"; a lone
+/// surrogate is a `BadRequestError` that names the parameter only when it is
+/// a known protocol parameter, and never echoes the value.
+fn param_value(obj: &Bound<'_, PyAny>, name: &str) -> Option<PyResult<String>> {
+    let s = obj.cast::<pyo3::types::PyString>().ok()?;
+    Some(s.to_cow().map(|c| c.into_owned()).map_err(|_| {
+        let label = if KNOWN_PARAMS.contains(&name) {
+            name
+        } else {
+            "a request parameter"
+        };
+        bad_response(format!("{label} must not contain lone surrogates"))
+    }))
+}
+
+/// Ordered `(str, str)` pairs from a list or tuple (any sequence, never a set,
+/// generator or dict view) of 2-tuples. Shape faults, including a non-`str`
+/// name or value, are `TypeError`; a lone surrogate in a name or value is
+/// `BadRequestError`.
+fn flatten_pairs(params: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
+    let shape = || PyTypeError::new_err(format!("params must be {SHAPES}"));
+    if params.is_instance_of::<pyo3::types::PyString>() || params.is_instance_of::<PyDict>() {
+        return Err(shape());
+    }
+    let seq = params.cast::<PySequence>().map_err(|_| shape())?;
+    let mut pairs = Vec::new();
+    for item in seq.try_iter().map_err(|_| shape())? {
+        let item = item.map_err(|_| shape())?;
+        let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract().map_err(|_| shape())?;
+        // Both type checks come before any surrogate check.
+        if !k.is_instance_of::<pyo3::types::PyString>()
+            || !v.is_instance_of::<pyo3::types::PyString>()
+        {
+            return Err(shape());
+        }
+        let key = param_name(&k).map_err(|e| e.unwrap_or_else(shape))?;
+        let value = param_value(&v, &key).ok_or_else(shape)??;
+        pairs.push((key, value));
+    }
+    Ok(pairs)
+}
+
 /// Flatten `(name, [values])` items, keeping duplicates. A non-list value
 /// names its key in the `TypeError`.
 fn flatten_multi<'py>(
@@ -3305,9 +3433,12 @@ fn flatten_multi<'py>(
     for item in items {
         let item = item?;
         let (k, v): (Bound<'_, PyAny>, Bound<'_, PyAny>) = item.extract()?;
-        let key: String = k.extract().map_err(|_| {
-            PyTypeError::new_err("authorization response parameter names must be str")
-        })?;
+        if !k.is_instance_of::<pyo3::types::PyString>() {
+            return Err(PyTypeError::new_err(
+                "authorization response parameter names must be str",
+            ));
+        }
+        let key = param_name(&k);
         if !(v.is_instance_of::<PyList>() || v.is_instance_of::<PyTuple>()) {
             let subclass = !owner.is_exact_instance_of::<PyDict>();
             let hint = if subclass {
@@ -3321,13 +3452,25 @@ fn flatten_multi<'py>(
             };
             return Err(PyTypeError::new_err(format!(
                 "params is a mapping with a non-list value for key '{}'{hint}; params must be {SHAPES}",
-                escape_untrusted_text(&key, 64)
+                escape_untrusted_text(key.as_deref().unwrap_or("?"), 64)
             )));
         }
+        // Value types are checked before the key or any value is tested for
+        // lone surrogates: a non-str value is a programmer error.
+        let mut raw = Vec::new();
         for value in v.try_iter()? {
-            let value: String = value?.extract().map_err(|_| {
-                PyTypeError::new_err("authorization response parameter values must be str")
-            })?;
+            let value = value?;
+            if !value.is_instance_of::<pyo3::types::PyString>() {
+                return Err(PyTypeError::new_err(
+                    "authorization response parameter values must be str",
+                ));
+            }
+            raw.push(value);
+        }
+        let shape = || PyTypeError::new_err(format!("params must be {SHAPES}"));
+        let key = key.map_err(|e| e.unwrap_or_else(shape))?;
+        for value in raw {
+            let value = param_value(&value, &key).ok_or_else(shape)??;
             pairs.push((key.clone(), value));
         }
     }
@@ -3407,64 +3550,8 @@ fn response_pairs(
         let pairs = flatten_multi(mapping.items()?.try_iter()?, params)?;
         return Ok((pairs, mode));
     }
-    let pairs = protocol_parameter_pairs(params, "params").map_err(|e| {
-        if e.is_instance_of::<PyTypeError>(params.py()) {
-            PyTypeError::new_err(format!("params must be {SHAPES}"))
-        } else {
-            e
-        }
-    })?;
+    let pairs = flatten_pairs(params)?;
     Ok((pairs, mode))
-}
-
-/// Cap the length and reject control, backslash and bidi / invisible
-/// formatting characters in a value kept verbatim. The message never echoes
-/// the value.
-fn check_response_value(name: &str, v: &str) -> PyResult<()> {
-    if v.chars().count() > RESPONSE_VALUE_MAX {
-        return Err(bad_response(format!(
-            "{name} must be at most {RESPONSE_VALUE_MAX} characters"
-        )));
-    }
-    if v.chars()
-        .any(|c| c.is_control() || c == '\\' || is_invisible_format(c))
-    {
-        return Err(bad_response(format!(
-            "{name} must not contain control, bidi or invisible formatting characters or backslashes"
-        )));
-    }
-    Ok(())
-}
-
-/// RFC 6749 section 5.2: `error` is %x20-21 / %x23-5B / %x5D-7E.
-fn check_error_code(v: &str) -> PyResult<()> {
-    if v.chars().count() > 64
-        || !v
-            .bytes()
-            .all(|b| matches!(b, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E))
-    {
-        return Err(bad_response(
-            "error must be at most 64 characters from the RFC 6749 section 5.2 set",
-        ));
-    }
-    Ok(())
-}
-
-/// `error_uri` survives only as a safe absolute http(s) URL.
-/// Returns the NORMALISED URL (`Url::as_str`), so what the caller sees is
-/// what was validated (`https:evil.example/x` becomes `https://evil.example/x`).
-fn safe_error_uri(uri: &str) -> Option<String> {
-    if uri.chars().count() > RESPONSE_VALUE_MAX {
-        return None;
-    }
-    check_redirect_uri(uri).ok()?;
-    let u = url::Url::parse(uri).ok()?;
-    let ok = matches!(u.scheme(), "http" | "https")
-        && check_redirect_uri_transport(u.as_str()).is_ok()
-        && u.host().is_some()
-        && u.username().is_empty()
-        && u.password().is_none();
-    ok.then(|| u.as_str().to_string())
 }
 
 /// Parse the authorization response (the callback) of an authorization
@@ -3479,7 +3566,10 @@ fn safe_error_uri(uri: &str) -> Option<String> {
 /// because a mapping discards duplicate parameters. `response_mode` (`"query"`, `"fragment"` or
 /// `"form_post"`) labels list and multi-dict input; default `"query"`.
 ///
-/// Raises `BadRequestError` for a repeated parameter, both or neither of
+/// Raises `BadRequestError` for a lone surrogate in a parameter name or value
+/// of pairs, multi-dict or `.lists()` input (`HttpRequestData` construction
+/// raises `TypeError` instead),
+/// a repeated parameter, both or neither of
 /// `code` and `error`, an empty `code` / `state` / `error` / `iss`, control, bidi or
 /// invisible characters or backslashes in `code` / `state` / `iss`, a `code` /
 /// `state` / `iss` over 2048 characters (a JARM `response` over 32768), an `error` outside RFC 6749 section
@@ -3498,82 +3588,69 @@ fn parse_authorization_response(
     accept_jarm: bool,
 ) -> PyResult<AuthorizationResponse> {
     let (pairs, mode) = response_pairs(params, response_mode)?;
-    let mut found: BTreeMap<&str, String> = BTreeMap::new();
-    for (k, v) in pairs {
-        if let Some(name) = RESPONSE_PARAMS.iter().find(|n| **n == k) {
-            if found.insert(name, v).is_some() {
-                return Err(bad_response(format!("{name} must not be repeated")));
-            }
+    jarm_prechecks(&pairs, accept_jarm)?;
+    let mut opts = gcb::AuthorizationResponseOptions::new();
+    if accept_jarm {
+        opts = opts.accept_unverified_jarm();
+    }
+    let inner = gcb::parse_authorization_response(&pairs, &opts).map_err(err)?;
+    // The core rejected repeats, so at most one raw description exists.
+    let error_description_safe = pairs
+        .iter()
+        .find(|(k, _)| k == "error_description")
+        .map(|(_, d)| escape_untrusted_text(d, ERROR_DESCRIPTION_SAFE_MAX));
+    Ok(AuthorizationResponse::new(
+        inner,
+        mode,
+        error_description_safe,
+    ))
+}
+
+impl AuthorizationResponse {
+    /// Wrap a core response, applying the `error_uri` fragment filter.
+    fn new(
+        inner: gcb::AuthorizationResponse,
+        transport: &'static str,
+        error_description_safe: Option<String>,
+    ) -> Self {
+        // A URL with a fragment is never exposed.
+        let error_uri = inner
+            .error_uri()
+            .filter(|u| url::Url::parse(u).is_ok_and(|p| p.fragment().is_none()))
+            .map(str::to_string);
+        Self {
+            inner,
+            transport,
+            error_description_safe,
+            error_uri,
         }
     }
-    let mut take = |n: &str| found.remove(n);
-    let (code, state, error) = (take("code"), take("state"), take("error"));
-    let (description, uri) = (take("error_description"), take("error_uri"));
-    let (iss, response) = (take("iss"), take("response"));
+}
 
-    if response.is_some() && !accept_jarm {
+/// The binding's own wording for the two JARM refusals (default-off and
+/// `response` alongside other parameters). Additive: it only fires when no
+/// parameter repeats, so the core reports a repeat first, as before.
+fn jarm_prechecks(pairs: &[(String, String)], accept_jarm: bool) -> PyResult<()> {
+    let count = |n: &str| pairs.iter().filter(|(k, _)| k == n).count();
+    if RESPONSE_PARAMS.iter().any(|n| count(n) > 1) || count("response") == 0 {
+        return Ok(());
+    }
+    if !accept_jarm {
         return Err(bad_response(
             "JARM response parameter is not supported; pass accept_jarm=True only if you \
              verify the JWT yourself",
         ));
     }
-    if response.is_some()
-        && [&code, &state, &error, &description, &uri, &iss]
-            .iter()
-            .any(|v| v.is_some())
+    if RESPONSE_PARAMS
+        .iter()
+        .any(|n| *n != "response" && count(n) > 0)
     {
         return Err(bad_response(
             "a JARM response carries every parameter inside the JWT: code, state, error, \
              error_description, error_uri and iss must not appear alongside response",
         ));
     }
-    if code.is_some() && error.is_some() {
-        return Err(bad_response("code and error must not both be present"));
-    }
-    if code.is_none() && error.is_none() && response.is_none() {
-        return Err(bad_response("response has neither code nor error"));
-    }
-    for (name, v) in [
-        ("code", &code),
-        ("state", &state),
-        ("error", &error),
-        ("iss", &iss),
-    ] {
-        if v.as_deref() == Some("") {
-            return Err(bad_response(format!("{name} must not be empty")));
-        }
-    }
-    for (name, v) in [("code", &code), ("state", &state), ("iss", &iss)] {
-        if let Some(v) = v {
-            check_response_value(name, v)?;
-        }
-    }
-    if response
-        .as_deref()
-        .is_some_and(|r| r.chars().count() > RESPONSE_JARM_MAX)
-    {
-        return Err(bad_response(format!(
-            "response must be at most {RESPONSE_JARM_MAX} characters"
-        )));
-    }
-    if let Some(e) = &error {
-        check_error_code(e)?;
-    }
-    let error_known = error
-        .as_deref()
-        .is_some_and(|e| KNOWN_ERROR_CODES.contains(&e));
-    Ok(AuthorizationResponse {
-        code,
-        state,
-        error,
-        error_description_safe: description
-            .map(|d| escape_untrusted_text(&d, ERROR_DESCRIPTION_SAFE_MAX)),
-        error_uri: uri.and_then(|u| safe_error_uri(&u)),
-        iss,
-        response,
-        response_mode: mode,
-        error_known,
-    })
+    Ok(())
 }
 
 /// Render untrusted OP-advertised values for a message: each escaped and
@@ -3842,5 +3919,15 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(asymmetric_algorithms, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_authorization_response, &m)?)?;
     m.add("MAX_ID_TOKEN_LEEWAY", MAX_ID_TOKEN_LEEWAY)?;
+    m.add(
+        "JARM_ASYMMETRIC_ALGORITHMS",
+        PyTuple::new(
+            py,
+            gcb::JARM_ASYMMETRIC_ALGORITHMS
+                .iter()
+                .map(|a| a.to_string()),
+        )?,
+    )?;
+    m.add("JARM_TYP", gcb::JARM_TYP)?;
     Ok(())
 }

@@ -660,11 +660,18 @@ The authorization response
 
    Raises :class:`pygrindvakt.BadRequestError` (per-request input) when:
 
+   * a parameter name or value in pairs, multi-dict or ``.lists()`` input is
+     not valid Unicode (a lone surrogate, for example from a decoded
+     ``\ud800``); the message names the parameter only when it is a known
+     protocol parameter and never echoes the value. A name or value that is
+     not a ``str`` at all is a programmer error and raises :class:`TypeError`,
+     as does constructing ``HttpRequestData`` with a lone surrogate;
    * ``code``, ``state``, ``error``, ``error_description``, ``error_uri``,
      ``iss`` or ``response`` appears more than once;
    * ``code`` and ``error`` are both present, or neither is (unless
      ``response`` is present and ``accept_jarm=True``);
    * ``code``, ``state``, ``error`` or ``iss`` is the empty string;
+   * ``response`` is the empty string;
    * ``code``, ``state`` or ``iss`` contains a control character (newline,
      NUL, tab, DEL, ...), a bidi or invisible formatting character, or a
      backslash. Otherwise they are kept verbatim, without trimming;
@@ -693,13 +700,24 @@ The authorization response
       :meth:`AuthorizationResponse.matches_iss`, and only then exchange the
       code with :func:`exchange_code`. Parsing does none of these.
 
-   .. warning::
+   .. note::
 
-      JARM (JWT Secured Authorization Response Mode) is not supported by the
-      core library. With ``accept_jarm=True`` the raw ``response`` JWT is
-      exposed as :attr:`AuthorizationResponse.response` and is
-      **UNVERIFIED and untrusted**; verify its signature, ``iss``, ``aud``
-      and ``exp`` yourself before reading anything from it.
+      JARM (JWT Secured Authorization Response Mode) is parsed only as a
+      stub. With ``accept_jarm=True`` the raw ``response`` JWT is exposed as
+      :attr:`AuthorizationResponse.response` and is **UNVERIFIED and
+      untrusted**: ``code``, ``state`` and ``error`` are ``None`` and
+      ``matches_state`` / ``matches_iss`` return ``False``. Call
+      :meth:`AuthorizationResponse.verify_jarm` to verify it and get the inner
+      response. If you requested a JARM response mode, call ``verify_jarm``
+      on every callback without checking :attr:`AuthorizationResponse.response`
+      first: ``accept_jarm=True`` also accepts a plain code or error response,
+      and ``verify_jarm`` rejects that with ``BadRequestError`` instead of
+      letting unsigned parameters through.
+
+   The shape rules (duplicates, blank values, character set and length caps,
+   both / neither of ``code`` and ``error``) are enforced by the core
+   library's callback parser
+   (`ADR 0009 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0009-core-callback-parser-and-jarm-verification.md>`_).
 
    .. versionadded:: 0.3.0
 
@@ -755,7 +773,12 @@ The authorization response
       :type: str | None
 
       The raw JARM ``response`` JWT, at most 32768 characters; only set with
-      ``accept_jarm=True``. UNVERIFIED and untrusted.
+      ``accept_jarm=True``. UNVERIFIED and untrusted. Verify it with
+      :meth:`verify_jarm`.
+   .. py:property:: jarm_verified
+      :type: bool
+
+      ``True`` only for the result of a successful :meth:`verify_jarm`.
    .. py:property:: response_mode
       :type: str
 
@@ -791,7 +814,8 @@ The authorization response
       normalisation). When the response has no ``iss`` the result is
       ``not required``, so ``False`` by default. An empty ``expected`` is a
       configuration fault and always gives ``False``, regardless of
-      ``required``. Never raises. The caller
+      ``required``; so does an unverified JARM stub
+      (``response`` set, even with ``required=False``). Never raises. The caller
       MUST call it. Pass ``required=False`` **only** when the OP does not
       advertise ``authorization_response_iss_parameter_supported`` in its
       metadata (RFC 9207 section 2.4); otherwise a mix-up attacker's response
@@ -806,12 +830,67 @@ The authorization response
       UTF-8 bytes (RFC 6749 sections 4.1.2.3 and 10.12). When the response has
       no ``state`` the result is ``not required``, so ``False`` by default.
       An empty ``expected`` always gives ``False``, regardless of
-      ``required``. Never raises for a mismatch; ``expected`` must be a ``str`` (``TypeError``
+      ``required``, as does an unverified JARM stub (``response`` set). Never raises for a mismatch; ``expected`` must be a ``str`` (``TypeError``
       otherwise). ``state`` in the response is conditional on the request
       carrying one; :func:`authorization_url` and :func:`begin` always send it,
       so keep ``required=True``. Pass ``required=False`` only for a request you
       deliberately built without ``state``. ALWAYS call it before exchanging
       the code: the parse result alone proves nothing.
+
+   .. versionadded:: 0.3.0
+
+   .. py:method:: verify_jarm(jwks: dict[str, Any] | JwksCache, *, issuer: str, client_id: str, allowed_algorithms: Sequence[str], trust: Literal["typed", "dedicated_keys", "untyped_shared_key_compat"] = "typed", typ: str | None = None, leeway: int | None = None) -> AuthorizationResponse
+
+      Verify the JARM ``response`` JWT of a stub parsed with
+      ``accept_jarm=True`` and return the inner authorization response (a new
+      :class:`AuthorizationResponse` with :attr:`jarm_verified` ``True`` and
+      the same ``response_mode``). Fails closed.
+
+      ``jwks`` is a ``{"keys": [...]}`` dict or a :class:`JwksCache`. A
+      ``JwksCache`` must belong to ``issuer`` and is refreshed once for an
+      unknown ``kid``. ``allowed_algorithms`` is required; use
+      :data:`JARM_ASYMMETRIC_ALGORITHMS`. ``HS*`` with a ``JwksCache`` raises
+      :class:`pygrindvakt.ConfigError` (``code == "shared_secret_algorithm"``).
+      ``issuer`` must be the JWT ``iss`` and ``client_id`` its ``aud``; ``exp``
+      is required. ``leeway`` (seconds) is capped at
+      :data:`MAX_ID_TOKEN_LEEWAY`.
+
+      ``trust`` states how the JWT is proven to be a JARM response rather than
+      an ID token signed with the same key (same vocabulary as
+      :func:`fetch_userinfo`):
+
+      * ``"typed"`` (default, safe): the JOSE ``typ`` header must equal
+        ``typ`` (default :data:`JARM_TYP`, ``oauth-authz-resp+jwt``).
+      * ``"dedicated_keys"``: you assert that ``jwks`` holds only keys the OP
+        uses for JARM, never ID tokens. A missing ``typ`` or ``JWT`` is
+        tolerated.
+      * ``"untyped_shared_key_compat"`` (weakest): for OPs that sign JARM and
+        ID tokens with the same keys and set no ``typ``. A missing ``typ`` or
+        ``JWT`` is tolerated.
+
+      Treat both opt-ins as weaker than ``"typed"``; this release does not
+      distinguish them in behaviour. ``typ`` is only valid with
+      ``"typed"``.
+
+      Raises :class:`pygrindvakt.BadRequestError` when this is not an
+      unverified JARM stub, the JWT is encrypted (a JWE) or the inner response
+      has a bad shape; :class:`pygrindvakt.AuthnError` for a bad signature,
+      ``typ``, ``kid``, ``iss``, ``aud`` or ``exp``. A ``kid`` that names no
+      key in the issuer's JWK Set (after the cache's rate-limited refresh,
+      which may have been skipped by the minimum refresh interval) raises
+      :class:`pygrindvakt.AuthnError` with ``code == "unknown_kid"`` (401) and
+      the original :class:`UnknownKeyError` as ``__cause__``. The response is
+      rejected (fail closed); a key-rotation race therefore surfaces as
+      ``AuthnError``.
+      :class:`pygrindvakt.ConfigError` for bad arguments (empty
+      ``allowed_algorithms``, ``issuer`` or ``client_id``, an issuer that
+      differs from the cache, ``leeway`` out of range), before any fetch.
+
+      ``error_description_safe`` of the result is escaped by this binding.
+      The result is still untrusted until you call :meth:`matches_state`
+      and :meth:`matches_iss` on it (not on the stub, which always gives
+      ``False``). A verified response is valid until its ``exp``; there is no
+      ``iat`` / max-age bound, so a captured one can be replayed until then.
 
    .. versionadded:: 0.3.0
 
@@ -1193,6 +1272,22 @@ distinction; branch on the class instead.
    (300); a larger value raises :class:`pygrindvakt.ConfigError`. It is a cap
    enforced by the library, **not** a recommended value: keep ``leeway`` as
    small as your clock skew allows.
+
+   .. versionadded:: 0.3.0
+
+.. py:data:: JARM_ASYMMETRIC_ALGORITHMS
+   :type: tuple[str, ...]
+
+   The asymmetric JWS algorithms suitable for
+   ``verify_jarm(allowed_algorithms=...)``.
+
+   .. versionadded:: 0.3.0
+
+.. py:data:: JARM_TYP
+   :type: str
+
+   The JARM response JWT ``typ`` header value, ``"oauth-authz-resp+jwt"``,
+   the default for ``verify_jarm(trust="typed")``.
 
    .. versionadded:: 0.3.0
 

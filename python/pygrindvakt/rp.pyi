@@ -15,6 +15,10 @@ A cap on skew tolerance, not a recommended value. A larger ``leeway`` raises
 
 .. versionadded:: 0.3.0
 """
+JARM_ASYMMETRIC_ALGORITHMS: tuple[str, ...]
+"""Asymmetric JWS algorithms suitable for ``verify_jarm(allowed_algorithms=...)``."""
+JARM_TYP: str
+"""The JARM response JWT ``typ`` header value (``oauth-authz-resp+jwt``)."""
 
 class ProviderInfo:
     """Minimal upstream-provider information the RP needs.
@@ -725,6 +729,9 @@ class AuthorizationResponse:
     @property
     def response_mode(self) -> Literal["query", "fragment", "form_post"]: ...
     @property
+    def jarm_verified(self) -> bool:
+        """True only for the result of a successful :meth:`verify_jarm`."""
+    @property
     def is_error(self) -> bool: ...
     @property
     def error_known(self) -> bool:
@@ -743,7 +750,8 @@ class AuthorizationResponse:
         default. Pass ``required=False`` ONLY when the OP does not advertise
         ``authorization_response_iss_parameter_supported`` (RFC 9207 section
         2.4). An empty ``expected`` is a configuration fault and always gives
-        ``False``, regardless of ``required``. Never raises.
+        ``False``, regardless of ``required``, as does an unverified JARM stub
+        (``response`` set). Never raises.
         """
     def matches_state(self, expected: str, *, required: bool = True) -> bool:
         """Constant-time comparison of ``state`` with ``expected`` (RFC 6749 4.1.2.3, 10.12).
@@ -753,8 +761,51 @@ class AuthorizationResponse:
         ``rp.begin`` always send ``state``, so keep ``required=True``; pass
         ``required=False`` only for a request deliberately built without
         ``state``. An empty ``expected`` always gives ``False``, regardless of
-        ``required``. Never raises for a mismatch. ALWAYS call it before
+        ``required``, as does an unverified JARM stub (``response`` set). Never raises for a mismatch. ALWAYS call it before
         exchanging the code.
+        """
+    def verify_jarm(
+        self,
+        jwks: dict[str, Any] | JwksCache,
+        *,
+        issuer: str,
+        client_id: str,
+        allowed_algorithms: Sequence[str],
+        trust: Literal["typed", "dedicated_keys", "untyped_shared_key_compat"] = ...,
+        typ: str | None = ...,
+        leeway: int | None = ...,
+    ) -> AuthorizationResponse:
+        """Verify the JARM ``response`` JWT and return the inner response.
+
+        Fails closed. ``allowed_algorithms`` is required (use
+        :data:`JARM_ASYMMETRIC_ALGORITHMS`); ``HS*`` with a ``JwksCache``
+        raises ``ConfigError`` (``code == "shared_secret_algorithm"``). A
+        ``JwksCache`` must belong to ``issuer`` and is refreshed once for an
+        unknown ``kid``. ``trust`` is ``"typed"`` (default; the JOSE ``typ``
+        must be ``typ``, default :data:`JARM_TYP`), ``"dedicated_keys"`` or
+        ``"untyped_shared_key_compat"`` (a missing ``typ`` or ``JWT`` is
+        tolerated; weakest). ``typ`` is only valid with ``"typed"``.
+        ``leeway`` is capped at :data:`MAX_ID_TOKEN_LEEWAY`.
+
+        Raises ``BadRequestError`` for a response that is not an unverified
+        JARM stub (including a plain code/error callback), a JWE, or a bad
+        inner shape; ``AuthnError`` for a bad signature, ``typ``, ``kid``,
+        ``iss``, ``aud`` or ``exp``; ``ConfigError`` for bad arguments. A
+        ``kid`` that names no key in the issuer's JWK Set (after the cache's
+        rate-limited refresh, which may have been skipped by the minimum
+        refresh interval) raises ``AuthnError`` with ``code == "unknown_kid"``
+        (401) and the original ``UnknownKeyError`` as ``__cause__``. The
+        response is rejected (fail closed); a key-rotation race therefore
+        surfaces as ``AuthnError``.
+
+        If you requested a JARM response mode, call this on every callback
+        without checking ``response`` first. A ``BadRequestError`` for such a
+        callback means a rejected response and a possible downgrade attempt:
+        reject it, never fall back to plain parameters. The result keeps
+        ``response_mode`
+        and has ``jarm_verified`` True. The caller MUST still call
+        :meth:`matches_state` and :meth:`matches_iss` (the JWT ``iss``).
+        ``error_description_safe`` is escaped by this binding.
         """
     def __repr__(self) -> str: ...
 
@@ -778,8 +829,11 @@ def parse_authorization_response(
     ``code=valid&code=``. ``response_mode`` labels list and multi-dict
     input (default ``"query"``).
 
-    Raises ``BadRequestError`` for a repeated parameter, both or neither of
-    ``code`` and ``error``, an empty ``code`` / ``state`` / ``error`` / ``iss``, control,
+    Raises ``BadRequestError`` for a lone surrogate in a parameter name or
+    value of pairs, multi-dict or ``lists()`` input (the message never echoes
+    it; a non-``str`` name or value is a ``TypeError``, and so is a lone
+    surrogate in ``HttpRequestData`` construction), a repeated parameter, both or neither of
+    ``code`` and ``error``, an empty ``code`` / ``state`` / ``error`` / ``iss`` / ``response``, control,
     bidi or invisible characters or backslashes in ``code`` / ``state`` /
     ``iss``, a ``code`` / ``state`` / ``iss`` over 2048 characters, a JARM
     ``response`` over 32768 characters, an

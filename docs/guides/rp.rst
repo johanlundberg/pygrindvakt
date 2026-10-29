@@ -260,7 +260,7 @@ process-wide :class:`~pygrindvakt.rp.JwksCache`.
 ``request.args`` handling. It refuses repeated parameters, a response with
 both or neither of ``code`` and ``error``, control, bidi or invisible
 characters and values over 2048 characters in ``code`` / ``state`` / ``iss``,
-a malformed ``error`` and a JARM ``response`` (see
+a malformed ``error`` and, unless ``accept_jarm=True``, a JARM ``response`` (see
 `ADR 0007 <https://github.com/kushaldas/pygrindvakt/blob/main/docs/adr/0007-authorization-response-parsing.md>`_).
 It proves nothing by itself: you still call ``matches_state`` (constant
 time) and ``matches_iss``, always before exchanging the code. Both fail
@@ -289,6 +289,39 @@ a plain ``dict`` is refused. When building an
 ``form`` as a list of pairs (``request.args.items(multi=True)``), not a
 ``dict`` such as ``request.args.to_dict()``: a mapping-built channel raises
 ``TypeError`` because it has already dropped duplicate parameters.
+
+For a signed JARM callback (``response_mode=jwt`` and friends) parse with
+``accept_jarm=True``, which gives an unverified stub, then verify it. Check
+``state`` and ``iss`` on the **verified** result; on the stub both checks
+always fail:
+
+.. code-block:: python
+
+   resp = rp.parse_authorization_response(request.args, accept_jarm=True)
+   resp = resp.verify_jarm(
+       jwks_cache,
+       issuer=info.issuer,
+       client_id=me.client_id,
+       allowed_algorithms=rp.JARM_ASYMMETRIC_ALGORITHMS,
+   )  # AuthnError on a bad signature, typ, kid, iss, aud or exp
+   if not resp.matches_state(pending["state"]):
+       abort(400)
+   if not resp.matches_iss(info.issuer):
+       abort(400)
+   if resp.is_error:
+       ...  # the OP's error is inside the JWT: handle it before using resp.code
+
+Call ``verify_jarm`` unconditionally, without checking ``resp.response`` first.
+``accept_jarm=True`` also accepts an ordinary code or error response, and a
+callback requested in a JARM response mode must never fall back to unsigned
+parameters; ``verify_jarm`` raises ``BadRequestError`` for anything that is
+not a JARM response. In that case the handler must reject the callback as a
+possible downgrade attempt and never fall back to the plain parameters.
+
+``trust`` defaults to ``"typed"``: the JWT must carry the JOSE ``typ``
+``oauth-authz-resp+jwt`` (``rp.JARM_TYP``). Only pass ``trust="dedicated_keys"``
+or ``"untyped_shared_key_compat"`` for an OP that does not type its JARM
+responses (see :ref:`the security guide <jarm-verification>`).
 
 :class:`~pygrindvakt.ConfigError` is handled before the generic branch, so a
 broken deployment never looks like a failed login. In the generic branch the

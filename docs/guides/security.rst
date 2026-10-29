@@ -184,8 +184,10 @@ framework integrations cannot accidentally omit deployment-critical choices.
        description with ANSI, bidi or newline characters can forge log
        lines. The response proves nothing until ``state`` is compared and
        ``iss`` is checked (RFC 9207 mix-up defence).
-     - ``accept_jarm=True`` exposes the raw, UNVERIFIED ``response`` JWT; you
-       must verify it yourself. ``matches_state`` and ``matches_iss``
+     - ``accept_jarm=True`` exposes the raw, UNVERIFIED ``response`` JWT as a
+       stub; verify it with
+       :meth:`~pygrindvakt.rp.AuthorizationResponse.verify_jarm` (see
+       :ref:`jarm-verification` below). ``matches_state`` and ``matches_iss``
        are the caller's job and cannot be forced; both fail closed
        (``matches_state`` on a missing ``state``, ``matches_iss`` on a missing
        ``iss`` unless you pass ``required=False`` for an
@@ -211,6 +213,45 @@ framework integrations cannot accidentally omit deployment-critical choices.
 If grindvakt later adopts these guards upstream, the binding's checks become
 redundant but harmless.
 
+
+.. _jarm-verification:
+
+Verifying a JARM response
+-------------------------
+
+:meth:`AuthorizationResponse.verify_jarm <pygrindvakt.rp.AuthorizationResponse.verify_jarm>`
+verifies a signed authorization response (JARM) parsed with
+``accept_jarm=True``. The signature is not the whole defence:
+
+* **ID tokens are signed by the same OP.** An ID token has the same ``iss`` and
+  ``aud`` as a JARM response and is signed by the same key. Where the keys are
+  shared, a captured ID token could be presented as a JARM response. The default
+  ``trust="typed"`` requires the JOSE ``typ`` ``oauth-authz-resp+jwt``
+  (``rp.JARM_TYP``), which an ID token does not carry. Keep it unless the OP
+  cannot type its responses.
+* **The opt-in trust modes are caller attestations.** ``"dedicated_keys"``
+  asserts that the key set holds only JARM signing keys.
+  ``"untyped_shared_key_compat"`` is the weakest: with shared keys and no
+  ``typ`` an ID token is indistinguishable from a JARM response. In this
+  release the two behave the same (a missing ``typ`` or ``JWT`` is
+  accepted), so do not rely on any difference. ``typ`` is only valid with
+  ``"typed"``.
+* **Pin the algorithms.** ``allowed_algorithms`` is required; pass
+  ``rp.JARM_ASYMMETRIC_ALGORITHMS`` or the exact algorithm the OP announces. An
+  ``HS*`` algorithm with a ``JwksCache`` raises ``ConfigError``
+  (``shared_secret_algorithm``, ADR 0006); an ``HS*`` response with a
+  caller-built key set needs a key at least as long as the hash output.
+* **A verified response can be replayed until ``exp``.** There is no ``iat`` or
+  max-age bound. Single use comes from consuming the session ``state`` once.
+* **Always check ``state`` and ``iss`` on the verified result.** Verification
+  does not know your session. Call ``matches_state`` and ``matches_iss`` on
+  the result of ``verify_jarm``; on the unverified stub they always return
+  ``False``. See ADR 0009.
+* **Never fall back to plain parameters.** If you requested a JARM response
+  mode, call ``verify_jarm`` on every callback without checking
+  ``resp.response`` first. ``accept_jarm=True`` also accepts an ordinary code
+  or error response; ``verify_jarm`` rejects that with ``BadRequestError``,
+  whereas skipping it would accept unsigned ``code``, ``state`` and ``iss``.
 
 ``token_url`` comes from configuration, never from ``Host``
 ------------------------------------------------------------

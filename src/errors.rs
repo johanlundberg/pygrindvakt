@@ -450,7 +450,7 @@ pub fn oauth_err(py: Python<'_>, e: &RsOAuthError) -> PyErr {
 }
 
 /// Inverse of `OAuthErrorCode::as_str` (grindvakt has no `from_str`).
-// NOTE: `AuthorizationResponse.error_known` (rp.rs `KNOWN_ERROR_CODES`) is a
+// NOTE: `AuthorizationResponse.error_known` (core `grindvakt::callback`) is a
 // SUPERSET of the codes accepted here; tests/test_rp.py locks that in. Do not
 // widen this match without core support.
 pub fn parse_oauth_code(s: &str) -> PyResult<OAuthErrorCode> {
