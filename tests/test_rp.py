@@ -2974,6 +2974,58 @@ def test_authorization_response_error_uri_handling():
         assert _parse([("error", "x"), ("error_uri", bad)]).error_uri is None, bad
 
 
+# Differential baseline: outcomes identical to the pre-core-callback-wrap parser
+# (verified over ~48k candidates against commit f08049e).
+_ERROR_URI_BASELINE = [
+    ("https://op.example.com/e", "https://op.example.com/e"),
+    ("http://localhost/x", "http://localhost/x"),
+    ("http://LOCALHOST/x", "http://localhost/x"),
+    ("http://localhost./x", None),
+    ("http://127.0.0.1:8080/x", "http://127.0.0.1:8080/x"),
+    ("http://[::1]/x", "http://[::1]/x"),
+    ("http://127.1/x", "http://127.0.0.1/x"),
+    ("http://0x7f.1/x", "http://127.0.0.1/x"),
+    ("http://[::ffff:127.0.0.1]/x", None),
+    ("http://0.0.0.0/x", None),
+    ("http://10.0.0.1/x", None),
+    ("https://op.example.com./x", "https://op.example.com./x"),
+    ("https://bücher.example/x", "https://xn--bcher-kva.example/x"),
+    ("https://op.example.com/é", "https://op.example.com/%C3%A9"),
+    ("https://op.example.com:99999/x", None),
+    ("https://", None),
+    ("https:///x", "https://x/"),
+    ("https://:pw@op.example.com/x", None),
+    ("http://u@localhost/x", None),
+    ("https://op.example.com/x#", None),
+    ("https://op.example.com/x#f", None),
+    ("https://op.example.com/a\tb", None),
+    ("https://op.example.com/a\x00b", None),
+    ("https://op.example.com/a\x7fb", None),
+    ("https://op.example.com/a\u200bb", None),
+    ("https://op.example.com/a\ufeffb", None),
+    ("https://op.example.com/a\u2028b", None),
+    ("https://op.example.com/a\\b", None),
+    ("https://op.example.com/a%5cb", "https://op.example.com/a%5cb"),
+    ("https://op.example.com/%00", "https://op.example.com/%00"),
+    ("\thttps://op.example.com/x", None),
+    ("https://op.example.com/x\n", None),
+    ("ftp://op.example.com/x", None),
+    ("file:///etc/passwd", None),
+    ("data:text/html,x", None),
+    ("com.example.app:/cb", None),
+    ("ws://op.example.com/x", None),
+    ("//op.example.com/x", None),
+    (" ", None),
+    ("https://\u202eop.example.com", None),
+    ("https://ex\u200bample.com/", None),
+]
+
+
+@pytest.mark.parametrize(("raw", "expected"), _ERROR_URI_BASELINE)
+def test_authorization_response_error_uri_baseline(raw, expected):
+    assert _parse([("error", "x"), ("error_uri", raw)]).error_uri == expected
+
+
 @pytest.mark.parametrize(
     "bad",
     ["a\r\nb", "a\nb", "a\x00b", "a\\b", "a\tb", "a\x7fb", "a\u202eb", "a\u200bb", "a\u2066b", "a\ufeffb", "a\u2028b"],
