@@ -61,6 +61,24 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `JwksCache` from `jwks()` keeps that policy). A discovery document whose
   `issuer` differs from the configured one is never cached or served.
   `rp.discover` and `ProviderInfo.from_metadata` are unchanged. See ADR 0008.
+- `rp.AuthorizationResponse.verify_jarm(jwks, *, issuer, client_id,
+  allowed_algorithms, trust="typed", typ=None, leeway=None)`,
+  `AuthorizationResponse.jarm_verified`, `rp.JARM_ASYMMETRIC_ALGORITHMS` and
+  `rp.JARM_TYP`: verification of a signed JARM `response` JWT parsed with
+  `accept_jarm=True`, replacing "verify it yourself". `jwks` is a key set or a
+  `JwksCache`; `allowed_algorithms` is required; `trust` takes `"typed"`
+  (default, requires `typ`, default `oauth-authz-resp+jwt`),
+  `"dedicated_keys"` or `"untyped_shared_key_compat"`; `HS*` with a
+  `JwksCache` raises `ConfigError` (`shared_secret_algorithm`). Raises
+  `BadRequestError` (not a stub, JWE, bad inner shape), `ConfigError` (bad
+  arguments) or `AuthnError` (signature, `typ`, `kid`, `iss`, `aud`, `exp`).
+  The caller must still call `matches_state` / `matches_iss` on the verified
+  result; both are always False on an unverified stub, and an empty JARM
+  `response` is rejected. A verified response is replayable until `exp`.
+  `parse_authorization_response` now delegates the callback shape rules to
+  `grindvakt::callback` (grindvakt 0.9.1, which is now required); the binding
+  keeps the input adapter, `error_description_safe` with its own escaper and
+  `error_uri` validation. See ADR 0009.
 - `rp.parse_authorization_response(params, *, response_mode=None, accept_jarm=False)`
   and the frozen `rp.AuthorizationResponse` (`code`, `state`, `error`,
   `error_description_safe`, `error_uri`, `iss`, `response`, `response_mode`,
