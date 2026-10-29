@@ -14,7 +14,7 @@ copyright = "2026, Kushal Das"
 try:
     release = importlib.metadata.version("pygrindvakt")
 except importlib.metadata.PackageNotFoundError:
-    release = "0.2.0"
+    release = "0.3.0"
 version = ".".join(release.split(".")[:2])
 
 extensions = [

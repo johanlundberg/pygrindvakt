@@ -153,6 +153,10 @@ version is what ``Cargo.lock`` pins).
    * - pygrindvakt
      - grindvakt
      - Notes
+   * - 0.3.0
+     - 0.9.1
+     - fail-closed RP hardening: ``ConfigError``/``BadRequestError``, authorization
+       response parsing, ``DiscoveryCache``, ``pygrindvakt.testing``.
    * - 0.2.0
      - 0.9.0
      - id_token hash binding (``strict_hashes``), registered redirect and
