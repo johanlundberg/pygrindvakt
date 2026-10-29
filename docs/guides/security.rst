@@ -247,6 +247,11 @@ verifies a signed authorization response (JARM) parsed with
   does not know your session. Call ``matches_state`` and ``matches_iss`` on
   the result of ``verify_jarm``; on the unverified stub they always return
   ``False``. See ADR 0009.
+* **Never fall back to plain parameters.** If you requested a JARM response
+  mode, call ``verify_jarm`` on every callback without checking
+  ``resp.response`` first. ``accept_jarm=True`` also accepts an ordinary code
+  or error response; ``verify_jarm`` rejects that with ``BadRequestError``,
+  whereas skipping it would accept unsigned ``code``, ``state`` and ``iss``.
 
 ``token_url`` comes from configuration, never from ``Host``
 ------------------------------------------------------------

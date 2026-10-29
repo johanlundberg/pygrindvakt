@@ -3277,7 +3277,19 @@ impl AuthorizationResponse {
         }
 
         // A cache refreshes once if the response's `kid` is unknown.
-        let set = source.resolve(py, token, issuer)?;
+        // An unknown `kid` after that refresh is an authentication failure of
+        // the response, so it is an `AuthnError` here (`JwksCache` itself
+        // raises `UnknownKeyError`). Every other resolve error is unchanged.
+        let set = source.resolve(py, token, issuer).map_err(|e| {
+            if e.is_instance_of::<UnknownKeyError>(py) {
+                let msg = e.value(py).to_string();
+                let new = with_code(py, AuthnError::new_err(msg), "unknown_kid");
+                new.set_cause(py, Some(e));
+                new
+            } else {
+                e
+            }
+        })?;
         let set = prepare_mac_keys(py, &set, token, &algs, KeySelection::Named)?;
         let mut options = gcb::JarmOptions::new(issuer, client_id, &algs);
         options = match (trust, typ) {

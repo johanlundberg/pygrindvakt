@@ -76,7 +76,18 @@ an unverified JARM stub could return True with `required=False`.
      stub, a JWE, or a bad inner shape; `ConfigError` for bad arguments (empty
      `allowed_algorithms`, `issuer` or `client_id`, issuer mismatch with the
      cache, bad leeway), raised before any fetch; `AuthnError` for a bad
-     signature, `typ`, `kid`, `iss`, `aud` or `exp`.
+     signature, `typ`, `kid`, `iss`, `aud` or `exp`. A `kid` that names no key in the issuer's
+     JWK Set (after the cache's rate-limited refresh, which may have been
+     skipped by the minimum refresh interval) raises `AuthnError`
+     (`code == "unknown_kid"`, 401) with the original `UnknownKeyError` as
+     `__cause__`. The response is rejected (fail closed). This differs from `verify_id_token` /
+     `JwksCache` consumers, which raise `UnknownKeyError`; the difference is
+     deliberate, because a callback response must be rejected, not retried.
+     Other resolve errors propagate unchanged.
+   * Callers that requested a JARM response mode must call `verify_jarm`
+     unconditionally, never only `if resp.response is not None`: a plain
+     code/error response is accepted by `accept_jarm=True` and would skip
+     signature and `typ` checks.
    * The result is a new `AuthorizationResponse` with `jarm_verified` True and
      the original `response_mode`. A verified response is not a stub, so
      `matches_state` / `matches_iss` compare the inner values.

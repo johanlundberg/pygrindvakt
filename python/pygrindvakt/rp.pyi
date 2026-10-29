@@ -788,9 +788,21 @@ class AuthorizationResponse:
         ``leeway`` is capped at :data:`MAX_ID_TOKEN_LEEWAY`.
 
         Raises ``BadRequestError`` for a response that is not an unverified
-        JARM stub, a JWE, or a bad inner shape; ``AuthnError`` for a bad
-        signature, ``typ``, ``kid``, ``iss``, ``aud`` or ``exp``;
-        ``ConfigError`` for bad arguments. The result keeps ``response_mode``
+        JARM stub (including a plain code/error callback), a JWE, or a bad
+        inner shape; ``AuthnError`` for a bad signature, ``typ``, ``kid``,
+        ``iss``, ``aud`` or ``exp``; ``ConfigError`` for bad arguments. A
+        ``kid`` that names no key in the issuer's JWK Set (after the cache's
+        rate-limited refresh, which may have been skipped by the minimum
+        refresh interval) raises ``AuthnError`` with ``code == "unknown_kid"``
+        (401) and the original ``UnknownKeyError`` as ``__cause__``. The
+        response is rejected (fail closed); a key-rotation race therefore
+        surfaces as ``AuthnError``.
+
+        If you requested a JARM response mode, call this on every callback
+        without checking ``response`` first. A ``BadRequestError`` for such a
+        callback means a rejected response and a possible downgrade attempt:
+        reject it, never fall back to plain parameters. The result keeps
+        ``response_mode`
         and has ``jarm_verified`` True. The caller MUST still call
         :meth:`matches_state` and :meth:`matches_iss` (the JWT ``iss``).
         ``error_description_safe`` is escaped by this binding.

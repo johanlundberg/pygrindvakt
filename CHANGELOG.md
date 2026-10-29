@@ -71,7 +71,10 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `"dedicated_keys"` or `"untyped_shared_key_compat"`; `HS*` with a
   `JwksCache` raises `ConfigError` (`shared_secret_algorithm`). Raises
   `BadRequestError` (not a stub, JWE, bad inner shape), `ConfigError` (bad
-  arguments) or `AuthnError` (signature, `typ`, `kid`, `iss`, `aud`, `exp`).
+  arguments) or `AuthnError` (signature, `typ`, `kid`, `iss`, `aud`, `exp`;
+  a `kid` that names no key in the issuer's JWK Set (after the cache's
+  rate-limited refresh, which may have been skipped by the minimum refresh
+  interval) is an `AuthnError` with `code == "unknown_kid"` and the original `UnknownKeyError` as `__cause__`; the response is rejected).
   The caller must still call `matches_state` / `matches_iss` on the verified
   result; both are always False on an unverified stub, and an empty JARM
   `response` is rejected. A verified response is replayable until `exp`.

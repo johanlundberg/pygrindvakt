@@ -708,7 +708,11 @@ The authorization response
       untrusted**: ``code``, ``state`` and ``error`` are ``None`` and
       ``matches_state`` / ``matches_iss`` return ``False``. Call
       :meth:`AuthorizationResponse.verify_jarm` to verify it and get the inner
-      response.
+      response. If you requested a JARM response mode, call ``verify_jarm``
+      on every callback without checking :attr:`AuthorizationResponse.response`
+      first: ``accept_jarm=True`` also accepts a plain code or error response,
+      and ``verify_jarm`` rejects that with ``BadRequestError`` instead of
+      letting unsigned parameters through.
 
    The shape rules (duplicates, blank values, character set and length caps,
    both / neither of ``code`` and ``error``) are enforced by the core
@@ -871,7 +875,13 @@ The authorization response
       Raises :class:`pygrindvakt.BadRequestError` when this is not an
       unverified JARM stub, the JWT is encrypted (a JWE) or the inner response
       has a bad shape; :class:`pygrindvakt.AuthnError` for a bad signature,
-      ``typ``, ``kid``, ``iss``, ``aud`` or ``exp``;
+      ``typ``, ``kid``, ``iss``, ``aud`` or ``exp``. A ``kid`` that names no
+      key in the issuer's JWK Set (after the cache's rate-limited refresh,
+      which may have been skipped by the minimum refresh interval) raises
+      :class:`pygrindvakt.AuthnError` with ``code == "unknown_kid"`` (401) and
+      the original :class:`UnknownKeyError` as ``__cause__``. The response is
+      rejected (fail closed); a key-rotation race therefore surfaces as
+      ``AuthnError``.
       :class:`pygrindvakt.ConfigError` for bad arguments (empty
       ``allowed_algorithms``, ``issuer`` or ``client_id``, an issuer that
       differs from the cache, ``leeway`` out of range), before any fetch.

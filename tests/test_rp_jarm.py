@@ -9,7 +9,7 @@ import json
 import time
 
 import pytest
-from pygrindvakt import AuthnError, BadRequestError, ConfigError, jwt, keys, rp
+from pygrindvakt import AuthnError, BadRequestError, ConfigError, InternalError, UnknownKeyError, jwt, keys, rp
 
 ISS = "https://op.example.com"
 CLIENT = "demo"
@@ -362,6 +362,59 @@ def test_cache_happy_and_kid_refresh():
     now[0] += 31
     assert verify(typed(k2), cache).jarm_verified
     assert http.calls == 2
+
+
+def test_cache_unknown_kid_after_refresh_is_authn_error():
+    k1, k2 = make_key("k1"), make_key("k2")
+    http = Http(jwks_of(k1))
+    now = [1000.0]
+    cache = rp.JwksCache(http, JWKS_URI, ISS, _now=lambda: now[0])
+    assert verify(typed(k1), cache).jarm_verified
+    now[0] += 31  # refresh allowed, but the OP still lacks k2
+    with pytest.raises(AuthnError, match="kid") as ei:
+        verify(typed(k2), cache)
+    assert not isinstance(ei.value, UnknownKeyError)
+    assert ei.value.code == "unknown_kid"
+    assert isinstance(ei.value.__cause__, UnknownKeyError)
+    assert http.calls == 2
+
+
+def test_cache_unknown_kid_refresh_skipped_is_authn_error():
+    k1, k2 = make_key("k1"), make_key("k2")
+    http = Http(jwks_of(k1))
+    now = [1000.0]
+    cache = rp.JwksCache(http, JWKS_URI, ISS, _now=lambda: now[0])
+    assert verify(typed(k1), cache).jarm_verified
+    http.doc = jwks_of(k1, k2)  # would resolve, but the refresh is rate limited
+    with pytest.raises(AuthnError, match="kid") as ei:
+        verify(typed(k2), cache)  # clock not advanced past the minimum refresh interval
+    assert not isinstance(ei.value, UnknownKeyError)
+    assert ei.value.code == "unknown_kid"
+    assert isinstance(ei.value.__cause__, UnknownKeyError)
+    assert http.calls == 1
+
+
+def test_cache_other_errors_not_converted(key):
+    http = Http(jwks_of(key))
+    cache = rp.JwksCache(http, JWKS_URI, "https://other.example.com")
+    with pytest.raises(ConfigError) as ei:
+        verify(typed(key), cache)
+    assert not isinstance(ei.value, AuthnError)
+
+
+def test_cache_fetch_failure_not_converted(key):
+    class FailingHttp(Http):
+        def get(self, url):
+            self.calls += 1
+            return 503, b"", "text/plain", []
+
+    http = FailingHttp(jwks_of(key))
+    cache = rp.JwksCache(http, JWKS_URI, ISS)
+    with pytest.raises(InternalError) as ei:
+        verify(typed(key), cache)
+    assert not isinstance(ei.value, AuthnError)
+    assert ei.value.__cause__ is None or not isinstance(ei.value.__cause__, UnknownKeyError)
+    assert http.calls == 1
 
 
 def error_token(key, **over):

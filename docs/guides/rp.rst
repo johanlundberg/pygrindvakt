@@ -298,19 +298,25 @@ always fail:
 .. code-block:: python
 
    resp = rp.parse_authorization_response(request.args, accept_jarm=True)
-   if resp.response is not None:
-       resp = resp.verify_jarm(
-           jwks_cache,
-           issuer=info.issuer,
-           client_id=me.client_id,
-           allowed_algorithms=rp.JARM_ASYMMETRIC_ALGORITHMS,
-       )  # AuthnError on a bad signature, typ, iss, aud or exp
+   resp = resp.verify_jarm(
+       jwks_cache,
+       issuer=info.issuer,
+       client_id=me.client_id,
+       allowed_algorithms=rp.JARM_ASYMMETRIC_ALGORITHMS,
+   )  # AuthnError on a bad signature, typ, kid, iss, aud or exp
    if not resp.matches_state(pending["state"]):
        abort(400)
    if not resp.matches_iss(info.issuer):
        abort(400)
    if resp.is_error:
        ...  # the OP's error is inside the JWT: handle it before using resp.code
+
+Call ``verify_jarm`` unconditionally, without checking ``resp.response`` first.
+``accept_jarm=True`` also accepts an ordinary code or error response, and a
+callback requested in a JARM response mode must never fall back to unsigned
+parameters; ``verify_jarm`` raises ``BadRequestError`` for anything that is
+not a JARM response. In that case the handler must reject the callback as a
+possible downgrade attempt and never fall back to the plain parameters.
 
 ``trust`` defaults to ``"typed"``: the JWT must carry the JOSE ``typ``
 ``oauth-authz-resp+jwt`` (``rp.JARM_TYP``). Only pass ``trust="dedicated_keys"``
