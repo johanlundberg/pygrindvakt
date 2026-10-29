@@ -15,6 +15,10 @@ A cap on skew tolerance, not a recommended value. A larger ``leeway`` raises
 
 .. versionadded:: 0.3.0
 """
+JARM_ASYMMETRIC_ALGORITHMS: tuple[str, ...]
+"""Asymmetric JWS algorithms suitable for ``verify_jarm(allowed_algorithms=...)``."""
+JARM_TYP: str
+"""The JARM response JWT ``typ`` header value (``oauth-authz-resp+jwt``)."""
 
 class ProviderInfo:
     """Minimal upstream-provider information the RP needs.
@@ -725,6 +729,9 @@ class AuthorizationResponse:
     @property
     def response_mode(self) -> Literal["query", "fragment", "form_post"]: ...
     @property
+    def jarm_verified(self) -> bool:
+        """True only for the result of a successful :meth:`verify_jarm`."""
+    @property
     def is_error(self) -> bool: ...
     @property
     def error_known(self) -> bool:
@@ -756,6 +763,37 @@ class AuthorizationResponse:
         ``state``. An empty ``expected`` always gives ``False``, regardless of
         ``required``, as does an unverified JARM stub (``response`` set). Never raises for a mismatch. ALWAYS call it before
         exchanging the code.
+        """
+    def verify_jarm(
+        self,
+        jwks: dict[str, Any] | JwksCache,
+        *,
+        issuer: str,
+        client_id: str,
+        allowed_algorithms: Sequence[str],
+        trust: Literal["typed", "dedicated_keys", "untyped_shared_key_compat"] = ...,
+        typ: str | None = ...,
+        leeway: int | None = ...,
+    ) -> AuthorizationResponse:
+        """Verify the JARM ``response`` JWT and return the inner response.
+
+        Fails closed. ``allowed_algorithms`` is required (use
+        :data:`JARM_ASYMMETRIC_ALGORITHMS`); ``HS*`` with a ``JwksCache``
+        raises ``ConfigError`` (``code == "shared_secret_algorithm"``). A
+        ``JwksCache`` must belong to ``issuer`` and is refreshed once for an
+        unknown ``kid``. ``trust`` is ``"typed"`` (default; the JOSE ``typ``
+        must be ``typ``, default :data:`JARM_TYP`), ``"dedicated_keys"`` or
+        ``"untyped_shared_key_compat"`` (a missing ``typ`` or ``JWT`` is
+        tolerated; weakest). ``typ`` is only valid with ``"typed"``.
+        ``leeway`` is capped at :data:`MAX_ID_TOKEN_LEEWAY`.
+
+        Raises ``BadRequestError`` for a response that is not an unverified
+        JARM stub, a JWE, or a bad inner shape; ``AuthnError`` for a bad
+        signature, ``typ``, ``kid``, ``iss``, ``aud`` or ``exp``;
+        ``ConfigError`` for bad arguments. The result keeps ``response_mode``
+        and has ``jarm_verified`` True. The caller MUST still call
+        :meth:`matches_state` and :meth:`matches_iss` (the JWT ``iss``).
+        ``error_description_safe`` is escaped by this binding.
         """
     def __repr__(self) -> str: ...
 

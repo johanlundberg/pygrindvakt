@@ -3150,9 +3150,8 @@ impl AuthorizationResponse {
     fn iss(&self) -> Option<&str> {
         self.inner.iss()
     }
-    /// The raw JARM `response` JWT, at most 32768 characters. UNVERIFIED and
-    /// untrusted: the binding has no JARM support. Only set when
-    /// `accept_jarm=True` was passed.
+    /// The raw JARM `response` JWT, at most 32768 characters. Untrusted
+    /// unless `jarm_verified`. Only set when `accept_jarm=True` was passed.
     #[getter]
     fn response(&self) -> Option<&str> {
         self.inner.jarm_response()
@@ -3206,6 +3205,106 @@ impl AuthorizationResponse {
     #[pyo3(signature = (expected, *, required = true))]
     fn matches_state(&self, expected: &str, required: bool) -> bool {
         self.inner.matches_state(expected, required)
+    }
+
+    /// True only for the result of a successful `verify_jarm`.
+    #[getter]
+    fn jarm_verified(&self) -> bool {
+        self.inner.jarm_verified()
+    }
+
+    /// Verify the JARM `response` JWT of this stub (see the `.pyi` stub for
+    /// the full contract) and return the inner response. Fails closed.
+    #[pyo3(signature = (jwks, *, issuer, client_id, allowed_algorithms, trust = "typed",
+                        typ = None, leeway = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_jarm<'py>(
+        &self,
+        py: Python<'py>,
+        jwks: &Bound<'py, PyAny>,
+        issuer: &str,
+        client_id: &str,
+        allowed_algorithms: Vec<String>,
+        trust: &str,
+        typ: Option<&str>,
+        leeway: Option<i64>,
+    ) -> PyResult<AuthorizationResponse> {
+        if !matches!(
+            trust,
+            "typed" | "dedicated_keys" | "untyped_shared_key_compat"
+        ) {
+            return Err(config_err(format!(
+                "trust must be \"typed\", \"dedicated_keys\" or \"untyped_shared_key_compat\", \
+                 got '{}'",
+                escape_untrusted_quoted(trust, 64)
+            )));
+        }
+        if typ.is_some() && trust != "typed" {
+            return Err(config_err("typ is only used with trust=\"typed\""));
+        }
+        if allowed_algorithms.is_empty() {
+            return Err(config_err("allowed_algorithms must not be empty"));
+        }
+        if issuer.is_empty() {
+            return Err(config_err("issuer must not be empty"));
+        }
+        if client_id.is_empty() {
+            return Err(config_err("client_id must not be empty"));
+        }
+        let leeway = seconds("leeway", leeway)?;
+        if leeway.is_some_and(|l| l > MAX_ID_TOKEN_LEEWAY) {
+            return Err(config_err(format!(
+                "JARM leeway must be at most {MAX_ID_TOKEN_LEEWAY} seconds"
+            )));
+        }
+        let algs = parse_algorithms(&allowed_algorithms)?;
+        let source = JwksSource::from_py(jwks)?;
+        source.check_issuer(issuer)?;
+        source.check_algorithms(py, &algs)?;
+
+        // Shape checks before any key-set fetch.
+        let token = match (self.inner.jarm_response(), self.inner.jarm_verified()) {
+            (Some(t), false) => t,
+            (Some(_), true) => return Err(bad_response("JARM response is already verified")),
+            (None, _) => return Err(bad_response("response is not a JARM response")),
+        };
+        // Five dot-separated segments is a compact JWE.
+        if token.split('.').count() == 5 {
+            return Err(bad_response("encrypted JARM not supported"));
+        }
+
+        // A cache refreshes once if the response's `kid` is unknown.
+        let set = source.resolve(py, token, issuer)?;
+        let set = prepare_mac_keys(py, &set, token, &algs, KeySelection::Named)?;
+        let mut options = gcb::JarmOptions::new(issuer, client_id, &algs);
+        options = match (trust, typ) {
+            ("typed", Some(t)) => options.with_expected_typ(t),
+            ("typed", None) => options,
+            ("dedicated_keys", _) => options.with_dedicated_keys(),
+            _ => options.allow_untyped_shared_keys(),
+        };
+        if let Some(l) = leeway {
+            options = options.with_leeway(l);
+        }
+        let inner = self.inner.verify_jarm(&set, &options).map_err(err)?;
+
+        // Core keeps only its own escaped description for a verified JARM
+        // response. Take the raw value from the token and escape it with the
+        // binding's escaper. Reading claims without verification is safe ONLY
+        // here: the signature, `iss`, `aud` and `exp` were just verified over
+        // this exact token.
+        let error_description_safe = gj::peek_claims_unverified(token)
+            .ok()
+            .and_then(|c| match c.extra.get("error_description") {
+                Some(serde_json::Value::String(d)) => Some(d.clone()),
+                _ => None,
+            })
+            .map(|d| escape_untrusted_text(&d, ERROR_DESCRIPTION_SAFE_MAX));
+        Ok(AuthorizationResponse::new(
+            inner,
+            self.transport,
+            error_description_safe,
+        ))
     }
 
     fn __repr__(&self) -> String {
@@ -3407,17 +3506,32 @@ fn parse_authorization_response(
         .iter()
         .find(|(k, _)| k == "error_description")
         .map(|(_, d)| escape_untrusted_text(d, ERROR_DESCRIPTION_SAFE_MAX));
-    // A URL with a fragment is never exposed.
-    let error_uri = inner
-        .error_uri()
-        .filter(|u| url::Url::parse(u).is_ok_and(|p| p.fragment().is_none()))
-        .map(str::to_string);
-    Ok(AuthorizationResponse {
+    Ok(AuthorizationResponse::new(
         inner,
-        transport: mode,
+        mode,
         error_description_safe,
-        error_uri,
-    })
+    ))
+}
+
+impl AuthorizationResponse {
+    /// Wrap a core response, applying the `error_uri` fragment filter.
+    fn new(
+        inner: gcb::AuthorizationResponse,
+        transport: &'static str,
+        error_description_safe: Option<String>,
+    ) -> Self {
+        // A URL with a fragment is never exposed.
+        let error_uri = inner
+            .error_uri()
+            .filter(|u| url::Url::parse(u).is_ok_and(|p| p.fragment().is_none()))
+            .map(str::to_string);
+        Self {
+            inner,
+            transport,
+            error_description_safe,
+            error_uri,
+        }
+    }
 }
 
 /// The binding's own wording for the two JARM refusals (default-off and
@@ -3712,5 +3826,15 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(asymmetric_algorithms, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_authorization_response, &m)?)?;
     m.add("MAX_ID_TOKEN_LEEWAY", MAX_ID_TOKEN_LEEWAY)?;
+    m.add(
+        "JARM_ASYMMETRIC_ALGORITHMS",
+        PyTuple::new(
+            py,
+            gcb::JARM_ASYMMETRIC_ALGORITHMS
+                .iter()
+                .map(|a| a.to_string()),
+        )?,
+    )?;
+    m.add("JARM_TYP", gcb::JARM_TYP)?;
     Ok(())
 }

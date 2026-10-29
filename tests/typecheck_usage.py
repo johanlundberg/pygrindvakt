@@ -331,6 +331,17 @@ def use_authorization_response(req: pygrindvakt.http.HttpRequestData) -> None:
     # A plain dict[str, str] must not type-check (a str is a Sequence[str]).
     plain: dict[str, str] = {"code": "c"}
     rp.parse_authorization_response(plain)  # type: ignore[arg-type]
+    v: rp.AuthorizationResponse = r.verify_jarm(
+        {"keys": []},
+        issuer="https://op.example",
+        client_id="c",
+        allowed_algorithms=rp.JARM_ASYMMETRIC_ALGORITHMS,
+        trust="dedicated_keys",
+        leeway=5,
+    )
+    r.verify_jarm({"keys": []}, issuer="i", client_id="c", allowed_algorithms=["ES256"], typ=rp.JARM_TYP)
+    jv: bool = v.jarm_verified
+    jt: tuple[str, ...] = rp.JARM_ASYMMETRIC_ALGORITHMS
     code: str | None = r.code
     state: str | None = r.state
     error: str | None = r.error
@@ -339,6 +350,7 @@ def use_authorization_response(req: pygrindvakt.http.HttpRequestData) -> None:
     iss: str | None = r.iss
     jarm: str | None = r.response
     mode: str = r.response_mode
+    del jv, jt
     flags: tuple[bool, bool] = (r.is_error, r.error_known)
     ok: bool = r.matches_iss("https://op.example", required=False)
     st_ok: bool = r.matches_state("expected-state")
