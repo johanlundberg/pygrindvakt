@@ -75,12 +75,15 @@ class Clock:
 class ScriptedHttp:
     """Serves ``doc`` at the JWKS URI and counts fetches."""
 
-    def __init__(self, doc, delay=0.0):
+    def __init__(self, doc, delay=0.0, headerless=False):
         self.doc = doc
         self.delay = delay
         self.status = 200
         self.error = None
-        self.headers = None  # None -> 3-tuple (no headers)
+        # Any header keeps the "reports no response headers" warning quiet
+        # without influencing the TTL (no Cache-Control: default_ttl applies).
+        self.headers = [("x-scripted", "1")]
+        self.headerless = headerless  # True -> legacy 3-tuple, no headers at all
         self.as_response = False
         self.calls = 0
         self._lock = threading.Lock()
@@ -97,9 +100,9 @@ class ScriptedHttp:
         body = json.dumps(self.doc).encode()
         if self.as_response:
             return rp_http.HttpFetchResponse(self.status, body, "application/json", self.headers)
-        if self.headers is not None:
-            return self.status, body, "application/json", self.headers
-        return self.status, body, "application/json"
+        if self.headerless:
+            return self.status, body, "application/json"
+        return self.status, body, "application/json", self.headers
 
     def post_form(self, url, form, headers):
         return 404, b"", "text/plain"
@@ -291,7 +294,7 @@ def test_no_store_with_zero_min_ttl_never_caches(jwks_server, header):
 
 
 def test_python_client_without_headers_warns_once_and_uses_default_ttl():
-    http = ScriptedHttp({"keys": []})
+    http = ScriptedHttp({"keys": []}, headerless=True)
     cache, clock = make_cache(http, default_ttl=100, min_ttl=1)
     with pytest.warns(UserWarning, match=r"reports no response headers.*default_ttl \(100s\)"):
         cache.jwks()
@@ -305,8 +308,8 @@ def test_python_client_without_headers_warns_once_and_uses_default_ttl():
     assert caught == []
     assert http.calls == 2
     # Another cache warns for itself.
-    other, _ = make_cache(ScriptedHttp({"keys": []}))
-    with pytest.warns(UserWarning):
+    other, _ = make_cache(ScriptedHttp({"keys": []}, headerless=True))
+    with pytest.warns(UserWarning, match="reports no response headers"):
         other.jwks()
 
 
@@ -380,18 +383,19 @@ def test_fetch_response_headers_attribute():
 
 
 @pytest.mark.parametrize("bad", [[("a",)], "x", [1, 2], [("a", 1)]])
-def test_bad_headers_shape_is_an_adapter_error(bad):
+def test_bad_headers_shape_is_an_adapter_error(bad, unraisable):
     http = ScriptedHttp({"keys": []})
     http.headers = bad
     cache, _ = make_cache(http)
     with pytest.raises(InternalError):
         cache.jwks()
+    unraisable.expect(InternalError, "HttpClient method must return", count=1, adapter=ScriptedHttp)
 
 
 # --- failures -------------------------------------------------------------------
 
 
-def test_transport_failure_surfaces_with_cause():
+def test_transport_failure_surfaces_with_cause(unraisable):
     http = ScriptedHttp({"keys": []})
     http.error = RuntimeError("network down")
     cache, _ = make_cache(http)
@@ -399,6 +403,7 @@ def test_transport_failure_surfaces_with_cause():
         cache.jwks()
     assert ei.value.code == "transport"
     assert isinstance(ei.value.__cause__, RuntimeError)
+    unraisable.expect(RuntimeError, "down", count=1, adapter=ScriptedHttp)
 
 
 def test_upstream_failure_surfaces_upstream_attributes():
@@ -414,7 +419,7 @@ def test_upstream_failure_surfaces_upstream_attributes():
     assert cache.jwks() == {"keys": []}
 
 
-def test_stale_set_is_never_served_after_expiry():
+def test_stale_set_is_never_served_after_expiry(unraisable):
     k1 = make_key("k1")
     http = ScriptedHttp(jwks_doc(k1))
     cache, clock = make_cache(http)
@@ -427,6 +432,7 @@ def test_stale_set_is_never_served_after_expiry():
         verify(cache, id_token(k1))
     http.error = None
     assert verify(cache, id_token(k1))["sub"] == "alice"
+    unraisable.expect(RuntimeError, "down", count=2, adapter=ScriptedHttp)
 
 
 # --- refresh() ------------------------------------------------------------------
@@ -447,7 +453,7 @@ def test_refresh_first_fetch_then_rate_limited():
     assert http.calls == 2
 
 
-def test_refresh_after_failed_first_fetch_is_rate_limited():
+def test_refresh_after_failed_first_fetch_is_rate_limited(unraisable):
     """A failed attempt counts: an unavailable endpoint must not be hammered."""
     http = ScriptedHttp({"keys": []})
     http.error = RuntimeError("down")
@@ -461,9 +467,10 @@ def test_refresh_after_failed_first_fetch_is_rate_limited():
     with pytest.raises(InternalError):
         cache.refresh()
     assert http.calls == 2
+    unraisable.expect(RuntimeError, "down", count=2, adapter=ScriptedHttp)
 
 
-def test_refresh_failure_keeps_cached_set():
+def test_refresh_failure_keeps_cached_set(unraisable):
     k1 = make_key("k1")
     http = ScriptedHttp(jwks_doc(k1))
     cache, clock = make_cache(http)
@@ -473,6 +480,7 @@ def test_refresh_failure_keeps_cached_set():
     with pytest.raises(InternalError):
         cache.refresh()
     assert cache.jwks() == jwks_doc(k1)  # still within its TTL
+    unraisable.expect(RuntimeError, "down", count=1, adapter=ScriptedHttp)
 
 
 def test_refresh_picks_up_new_keys():
@@ -551,7 +559,7 @@ def test_rotation_blocked_inside_interval_then_recovers():
     assert verify(cache, id_token(k2))
 
 
-def test_refresh_failure_during_unknown_kid_raises_fetch_error():
+def test_refresh_failure_during_unknown_kid_raises_fetch_error(unraisable):
     k1, k2 = make_key("k1"), make_key("k2")
     http = ScriptedHttp(jwks_doc(k1))
     cache, clock = make_cache(http)
@@ -566,6 +574,7 @@ def test_refresh_failure_during_unknown_kid_raises_fetch_error():
     assert verify(cache, id_token(k1))
     with pytest.raises(UnknownKeyError):
         verify(cache, id_token(k2))
+    unraisable.expect(RuntimeError, "down", count=1, adapter=ScriptedHttp)
 
 
 def test_kidless_set_does_not_trigger_refresh():
@@ -659,12 +668,13 @@ def test_concurrent_rotation_refreshes_once():
     assert http.calls == 2
 
 
-def test_concurrent_failure_does_not_deadlock():
+def test_concurrent_failure_does_not_deadlock(unraisable):
     http = ScriptedHttp({"keys": []}, delay=0.02)
     http.error = RuntimeError("down")
     cache, _ = make_cache(http)
     results = run_threads(16, cache.jwks)
     assert all(isinstance(r, InternalError) for r in results)
+    unraisable.expect(RuntimeError, "down", adapter=ScriptedHttp)
 
 
 def test_concurrent_with_reentrant_python_client():

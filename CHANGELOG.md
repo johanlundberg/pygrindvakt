@@ -7,6 +7,70 @@ needed to track the upstream `grindvakt` library and correct protocol or
 security handling. `pygrindvakt` is a thin PyO3 binding; most entries reflect
 adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
+## [Unreleased]
+
+### Added
+
+- RFC 9207 (`iss` on authorization responses) for the in-process `Provider`,
+  opt in with `Provider(..., authorization_response_iss=True)` (default
+  `False`, behaviour unchanged). Success and error redirects, query or
+  fragment, then carry `iss` equal to the issuer, and discovery advertises
+  `authorization_response_iss_parameter_supported: true`. The relying party
+  side already exists: `rp.parse_authorization_response(...)` then
+  `matches_iss(issuer)`.
+- `Provider.authorization_error_redirect(request, error)` renders an
+  authorization error redirect carrying `iss` when the flag is on (and none
+  otherwise; `OAuthError.to_redirect` never adds it). It validates the request
+  first and raises the validation `OAuthError` on failure, so a request built
+  with `AuthorizationRequest.from_dict` cannot make it redirect to an
+  unregistered `redirect_uri`. `state` comes from the error.
+- With the flag on, a query-mode response (`authorization_redirect` or
+  `authorization_error_redirect`) for a registered `redirect_uri` that already
+  has an `iss` query parameter (`%69ss` included) raises
+  `OAuthError(server_error)` instead of sending two `iss` values.
+- A `Provider` built without the flag but whose metadata advertises
+  `authorization_response_iss_parameter_supported: true` now emits the
+  existing unimplemented-members `UserWarning`.
+
+### Changed
+
+- `http.Response.redirect`, `Response.with_header`, the `Response.headers`
+  setter and the `Response(...)` constructor now validate their input and raise `BadRequestError` (header-injection
+  hardening). `redirect` rejects whitespace, control, bidi and invisible
+  formatting characters and backslashes in the location (relative targets and
+  fragments stay valid; no scheme or host policy); a `location` header set
+  through the other three paths gets the same check. Header names must be
+  non-empty RFC 9110
+  tokens; values may not contain C0 controls (HTAB is allowed), DEL or NUL.
+- Added a regression test that `Provider.authorization_redirect` refuses a
+  registered `redirect_uri` containing CRLF (core already validates it; no
+  behaviour change).
+- `rp.asymmetric_algorithms()` takes its names from core's `JWS_ALGORITHMS`
+  catalogue (minus `HS*`), intersected with a fixed list of the 11 classical
+  asymmetric names, instead of probing that list through the parser. The 11
+  names are unchanged; the order now follows core (`ES512`, `EdDSA`,
+  `ES256K`). An algorithm core adds later is not listed until the binding
+  adds it.
+- Python values converted to JSON (claims, metadata, request data) now raise
+  `ValueError` on `NaN` and infinity instead of silently becoming `null`
+  (previously `jwt.sign(key, {"exp": float("nan")})` signed `exp: null`).
+- `Provider.authorization_redirect` and `Provider.authorization_error_redirect`
+  now apply the binding's `redirect_uri` rules (no backslash, invisible or bidi
+  characters, userinfo) before anything is minted or rendered, and raise
+  `OAuthError(invalid_request)` otherwise, even when the client registered the
+  URI: core accepted such URIs and they reached the `Location` header.
+- `retryable` for upstream HTTP failures uses core's
+  `UpstreamHttpError::is_retryable`, and OAuth error codes are parsed with
+  core's `OAuthErrorCode::from_str`. Behaviour is unchanged.
+- Bound to `grindvakt` 0.10.0 (`jose-rs` 0.10, `kryptering` 0.7). The minimum
+  Rust version is now 1.89, as upstream's.
+- JSON <-> Python conversion (`src/convert.rs`) goes through `serde_json`:
+  `jose-rs` 0.10 enables `serde_json/arbitrary_precision` and reads `exp`,
+  `iat` and `nbf` from a `RawValue`, which `pythonize` alone cannot handle.
+  `pythonize` is built with its `arbitrary_precision` feature and `serde_json`
+  with `preserve_order`, so numbers stay native `int` / `float` and dicts keep
+  insertion order. Shape errors still raise `TypeError`.
+
 ## [0.3.0] - 2026-10-29
 
 ### Added

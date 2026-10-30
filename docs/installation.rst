@@ -54,7 +54,7 @@ required.
 From source
 -----------
 
-Building from source needs a Rust toolchain (1.88 or newer, the
+Building from source needs a Rust toolchain (1.89 or newer, the
 ``rust-version`` declared in ``Cargo.toml``) and `maturin
 <https://www.maturin.rs>`_. The project uses uv:
 

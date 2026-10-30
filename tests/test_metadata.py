@@ -204,6 +204,12 @@ def test_raw_is_source_document_and_snapshot():
     assert metadata.ProviderMetadata(ISSUER).raw is None
 
 
+def test_raw_preserves_nested_key_order():
+    doc = minimal_doc() | {"x_vendor": {"zeta": 1, "alpha": 2, "mid": 3}}
+    md = metadata.ProviderMetadata.from_dict(doc)
+    assert list(md.raw["x_vendor"]) == ["zeta", "alpha", "mid"]
+
+
 def test_userinfo_endpoint_optional():
     md = metadata.ProviderMetadata.from_dict(minimal_doc())
     assert md.userinfo_endpoint is None

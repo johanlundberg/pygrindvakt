@@ -14,14 +14,17 @@ from pygrindvakt import (
     GrindvaktError,
     InternalError,
     OAuthError,
+    client,
     discovery,
     federation,
     jwt,
     keys,
     metadata,
     provider,
+    request,
     rp,
     testing,
+    tokens,
 )
 
 if TYPE_CHECKING:
@@ -410,6 +413,25 @@ def use_helpers(unknown: object, md: metadata.ProviderMetadata) -> None:
             method="GET",
         )
     del ok
+
+
+def use_authorization_response_iss(
+    md: metadata.ProviderMetadata,
+    key: keys.SigningKey,
+    clients: client.InMemoryClientStore,
+    codec: tokens.TokenCodec,
+    req: request.AuthorizationRequest,
+) -> None:
+    op = provider.Provider(
+        md,
+        key,
+        clients,
+        codec,
+        token_use_store=provider.InMemoryTokenUseStore(),
+        authorization_response_iss=True,
+    )
+    resp: pygrindvakt.http.Response = op.authorization_error_redirect(req, OAuthError("access_denied", state=req.state))
+    del resp
 
 
 def use_testing(op: provider.Provider, key: keys.SigningKey) -> None:

@@ -176,7 +176,15 @@ Outbound response
 
    ``headers`` is a list of ``(name, value)`` pairs, so multi-valued headers
    such as ``set-cookie`` are supported; ``body`` is ``bytes``. All three are
-   readable and writable.
+   readable and writable. The constructor and assigning ``headers`` apply the
+   same checks as :meth:`with_header` to every pair and raise
+   :class:`pygrindvakt.BadRequestError` on the first bad one (an assignment
+   leaves the old value in place).
+
+   .. versionchanged:: 0.4.0
+      Header names, header values and redirect locations are validated
+      (header-injection hardening); see :meth:`with_header` and
+      :meth:`redirect`. Previously any string was accepted.
 
    .. py:attribute:: status
       :type: int
@@ -195,7 +203,14 @@ Outbound response
 
    .. py:method:: with_header(name: str, value: str) -> Response
 
-      Return a copy with an extra header appended.
+      Return a copy with an extra header appended. Raises
+      :class:`pygrindvakt.BadRequestError` if ``name`` is empty or not an
+      RFC 9110 token, or ``value`` contains a C0 control character (a
+      horizontal tab is allowed), DEL or NUL. A ``location`` header (any
+      case) must also pass the :meth:`redirect` check on its value.
+
+      .. versionchanged:: 0.4.0
+         Validates ``name`` and ``value``.
 
    .. py:method:: with_body(body: bytes) -> Response
 
@@ -203,7 +218,16 @@ Outbound response
 
    .. py:staticmethod:: redirect(location: str) -> Response
 
-      A ``302`` redirect to ``location``.
+      A ``302`` redirect to ``location``. Raises
+      :class:`pygrindvakt.BadRequestError` if ``location`` contains
+      whitespace, control, bidi or invisible formatting characters or a
+      backslash (the ``url`` crate and browsers read ``\\`` as ``/``). No
+      scheme or host policy is applied: relative targets (``/login``) and
+      fragments are accepted. The same check applies to a ``location`` header
+      set through the constructor, ``with_header`` or the ``headers`` setter.
+
+      .. versionchanged:: 0.4.0
+         Rejects unsafe characters in ``location``.
 
    .. py:staticmethod:: html(body: str) -> Response
 

@@ -118,7 +118,7 @@ def test_client_store_returning_dict(op_key, demo_client):
     assert _flow(_op(op_key, D())).token_type == "Bearer"
 
 
-def test_client_store_get_raising_is_unknown_client(op_key):
+def test_client_store_get_raising_is_unknown_client(op_key, unraisable):
     """A raising get() is treated as 'no such client' and logged, never as a crash."""
 
     class Bad:
@@ -141,9 +141,10 @@ def test_client_store_get_raising_is_unknown_client(op_key):
     )
     with pytest.raises(OAuthError):
         op.validate_authorization_request(req)
+    unraisable.expect(RuntimeError, "db down", count=1, adapter=Bad)
 
 
-def test_token_use_store_raising_is_server_error(op_key, demo_client):
+def test_token_use_store_raising_is_server_error(op_key, demo_client, unraisable):
     """An infrastructure failure in consume() is reported as server_error, not
     as a replay (invalid_grant)."""
 
@@ -155,9 +156,10 @@ def test_token_use_store_raising_is_server_error(op_key, demo_client):
     with pytest.raises(OAuthError) as ei:
         _flow(op)
     assert ei.value.code == "server_error" and ei.value.http_status == 500
+    unraisable.expect(RuntimeError, "redis down", count=1, adapter=Broken)
 
 
-def test_token_use_store_wrong_return_type(op_key, demo_client):
+def test_token_use_store_wrong_return_type(op_key, demo_client, unraisable):
     class Wrong:
         def consume(self, h, ttl):
             return "yes"
@@ -165,6 +167,7 @@ def test_token_use_store_wrong_return_type(op_key, demo_client):
     with pytest.raises(OAuthError) as ei:
         _flow(_op(op_key, client.InMemoryClientStore([demo_client]), Wrong()))
     assert ei.value.code == "server_error"
+    unraisable.expect(TypeError, "not an instance of 'bool'", count=1, adapter=Wrong)
 
 
 def test_protocol_validation_at_construction(op_key, demo_client):
@@ -228,7 +231,7 @@ def test_python_http_client_is_used(op):
     assert (fake.calls[0].method, fake.calls[0].url) == ("GET", f"{ISSUER}/.well-known/openid-configuration")
 
 
-def test_python_http_client_raising(op):
+def test_python_http_client_raising(op, unraisable):
     class Bad:
         def get(self, url):
             raise ConnectionError("boom")
@@ -238,9 +241,10 @@ def test_python_http_client_raising(op):
 
     with pytest.raises(InternalError, match="boom"):
         rp.discover(Bad(), ISSUER)
+    unraisable.expect(ConnectionError, "boom", count=1, adapter=Bad)
 
 
-def test_python_http_client_bad_return(op):
+def test_python_http_client_bad_return(op, unraisable):
     class Bad:
         def get(self, url):
             return "nope"
@@ -250,6 +254,7 @@ def test_python_http_client_bad_return(op):
 
     with pytest.raises(GrindvaktError):
         rp.discover(Bad(), ISSUER)
+    unraisable.expect(InternalError, "HttpClient method must return", count=1, adapter=Bad)
     with pytest.raises(TypeError, match="HttpClient"):
         rp.discover(object(), ISSUER)
 

@@ -452,6 +452,13 @@ pub(crate) fn reject_reinterpreted_url_chars(name: &str, raw: &str) -> Result<()
     Ok(())
 }
 
+/// Whitespace, control, bidi or invisible formatting character: the gate that
+/// keeps a URI safe to echo into a `Location` header.
+pub(crate) fn has_unsafe_uri_char(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_whitespace() || c.is_control() || is_invisible_format(c))
+}
+
 /// Binding-side redirect URI syntax check; every redirect URI in this module
 /// goes through it. Stricter than core's `validate_redirect_uri_syntax`, which
 /// parses with the `url` crate (that strips tab/CR/LF) while the raw string is
@@ -461,10 +468,7 @@ pub(crate) fn reject_reinterpreted_url_chars(name: &str, raw: &str) -> Result<()
 /// value is never echoed. Custom-scheme URIs without an authority pass.
 pub(crate) fn check_redirect_uri(uri: &str) -> Result<(), RsError> {
     reject_reinterpreted_url_chars("redirect_uri", uri)?;
-    if uri
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || is_invisible_format(c))
-    {
+    if has_unsafe_uri_char(uri) {
         return Err(RsError::BadRequest(
             "redirect_uri must not contain whitespace, control, bidi or invisible formatting characters"
                 .into(),
@@ -3031,12 +3035,14 @@ fn validate_service_endpoint(
     Ok(())
 }
 
-/// A FIXED list of the classical asymmetric JWS algorithm names the library
-/// parses: `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `ES256K` and
-/// `EdDSA`. `HS*` and `none` are never included. Post-quantum names (ML-DSA,
-/// feature-gated in jose-rs) are NOT included even if this build parses them.
+/// The classical asymmetric JWS algorithm names from core's catalogue
+/// (`grindvakt::JWS_ALGORITHMS`): `RS256/384/512`, `PS256/384/512`,
+/// `ES256/384/512`, `EdDSA` and `ES256K`, in core's order. `HS*` and `none`
+/// are never included. Only these names are ever listed, so a name core adds
+/// later (post-quantum ML-DSA, feature-gated in jose-rs) is NOT included until
+/// the binding adds it.
 ///
-/// It is a parser probe, not a recommended allowlist, not a list an OP
+/// It is a catalogue, not a recommended allowlist, not a list an OP
 /// advertises, and not what is appropriate for your deployment; pass an
 /// explicit allowlist to `verify_id_token`. It includes `EdDSA`, for which
 /// `jwt.supports_oidc_token_hash` is False, so
@@ -3046,16 +3052,19 @@ fn validate_service_endpoint(
 /// allowlist.
 #[pyfunction]
 fn asymmetric_algorithms() -> Vec<&'static str> {
-    // Fixed candidate list (RFC 7518 / RFC 8037 / RFC 8812 names). No `HS*` or
-    // `none` name is in it. Each candidate is probed through the library's own
-    // parser, so a name this build cannot parse is dropped.
-    const CANDIDATES: [&str; 11] = [
+    // Fixed names (RFC 7518 / RFC 8037 / RFC 8812), intersected with core's
+    // catalogue: a name core drops disappears, but one core adds is never
+    // listed without a decision here (a MAC-style addition cannot leak in).
+    const KNOWN_ASYMMETRIC: [&str; 11] = [
         "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "ES256K",
         "EdDSA",
     ];
-    CANDIDATES
-        .into_iter()
-        .filter(|name| JwsAlgorithm::from_str(name).is_ok())
+    grindvakt::JWS_ALGORITHMS
+        .iter()
+        .copied()
+        .filter(|a| !grindvakt::is_symmetric_jws_algorithm(a))
+        .map(JwsAlgorithm::as_str)
+        .filter(|n| KNOWN_ASYMMETRIC.contains(n))
         .collect()
 }
 

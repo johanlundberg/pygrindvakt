@@ -150,7 +150,13 @@ class Response:
     """A framework-agnostic HTTP response produced by grindvakt.
 
     ``headers`` is a list of ``(name, value)`` pairs (multi-valued headers such
-    as ``set-cookie`` are supported); ``body`` is ``bytes``.
+    as ``set-cookie`` are supported); ``body`` is ``bytes``. The constructor
+    and assigning ``headers`` validate each pair like ``with_header``.
+
+    Raises:
+        BadRequestError: from the constructor, the ``headers`` setter,
+            ``with_header`` and ``redirect`` on an unsafe name, value or
+            location.
     """
 
     def __init__(
@@ -176,12 +182,24 @@ class Response:
     def header(self, name: str) -> str | None:
         """First value of header ``name`` (case-insensitive), if any."""
     def with_header(self, name: str, value: str) -> Response:
-        """Return a copy with an extra header appended."""
+        """Return a copy with an extra header appended.
+
+        Raises ``BadRequestError`` if ``name`` is empty or not an RFC 9110
+        token, or ``value`` holds a C0 control (HTAB excepted), DEL or NUL. A
+        ``location`` header must also pass the ``redirect`` check.
+        """
     def with_body(self, body: bytes) -> Response:
         """Return a copy with the body replaced."""
     @staticmethod
     def redirect(location: str) -> Response:
-        """302 redirect to ``location``."""
+        """302 redirect to ``location``.
+
+        Raises ``BadRequestError`` if ``location`` contains whitespace,
+        control, bidi or invisible formatting characters or a backslash. No
+        scheme or host policy is applied; relative targets and fragments are
+        allowed. A ``location`` header set through the constructor,
+        ``with_header`` or the ``headers`` setter gets the same check.
+        """
     @staticmethod
     def html(body: str) -> Response:
         """A ``text/html`` response."""

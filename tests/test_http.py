@@ -6,7 +6,7 @@ import sys
 import time
 
 import pytest
-from pygrindvakt import http
+from pygrindvakt import BadRequestError, http
 
 
 def test_request_data_normalization():
@@ -371,3 +371,91 @@ class _Exploding:
 )
 def test_supports_get_with_headers(client, expected):
     assert http.supports_get_with_headers(client) is expected
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "/a\rb",
+        "/a\nb",
+        "/a\tb",
+        "/a b",
+        "/a\x00b",
+        "/a\u202eb",
+        "/a\u200bb",
+        "https://rp.example/cb\r\nSet-Cookie: x=1",
+        "/x\\@evil.example",
+        "https://evil.example\\@op.example.com/cb",
+    ],
+)
+def test_response_redirect_rejects_unsafe_chars(location):
+    with pytest.raises(BadRequestError):
+        http.Response.redirect(location)
+
+
+@pytest.mark.parametrize(
+    "location", ["https://rp.example/cb\u202e\u200b", "a b\u200fc", "/x\\@evil.example", "/a\u200bb"]
+)
+@pytest.mark.parametrize("name", ["location", "Location", "LOCATION"])
+def test_location_gate_applies_to_generic_header_apis(name, location):
+    with pytest.raises(BadRequestError):
+        http.Response(302, [(name, location)])
+    with pytest.raises(BadRequestError):
+        http.Response(302).with_header(name, location)
+    r = http.Response(302, [("location", "/ok")])
+    with pytest.raises(BadRequestError):
+        r.headers = [(name, location)]
+    assert r.headers == [("location", "/ok")]
+
+
+def test_location_gate_does_not_touch_other_headers():
+    r = http.Response(200).with_header("x-note", "a b\u200f\\c")
+    assert r.header("x-note") == "a b\u200f\\c"
+
+
+@pytest.mark.parametrize("location", ["/login", "https://rp.example/cb?x=1#frag", "relative/path?q=1"])
+def test_response_redirect_accepts_clean_targets(location):
+    r = http.Response.redirect(location)
+    assert r.status == 302 and r.header("location") == location
+
+
+@pytest.mark.parametrize("name", ["", "a b", "x:y", "x\r\n", "é"])
+def test_response_with_header_rejects_bad_name(name):
+    with pytest.raises(BadRequestError):
+        http.Response(200).with_header(name, "v")
+
+
+@pytest.mark.parametrize("value", ["a\rb", "a\nb", "a\x00b", "a\x0bb", "a\x7fb", "a\r\nSet-Cookie: x=1"])
+def test_response_with_header_rejects_bad_value(value):
+    with pytest.raises(BadRequestError):
+        http.Response(200).with_header("x-a", value)
+
+
+def test_response_with_header_accepts_normal_values():
+    r = http.Response(200).with_header("X-Tok_en.1", "a\tb c; d=e").with_header("x-empty", "")
+    assert r.headers == [("X-Tok_en.1", "a\tb c; d=e"), ("x-empty", "")]
+
+
+def test_response_constructor_validates_headers():
+    r = http.Response(200, [("x-a", "a\tb"), ("set-cookie", "k=v")])
+    assert r.headers == [("x-a", "a\tb"), ("set-cookie", "k=v")]
+    assert http.Response(204).headers == []
+    for bad in ([("", "v")], [("a b", "v")], [("x:y", "v")], [("x-a", "v\r\nx: y")], [("x-a", "v\x00")]):
+        with pytest.raises(BadRequestError):
+            http.Response(200, bad)
+    with pytest.raises(BadRequestError):
+        http.Response(302, [("x-ok", "v"), ("location", "/a\r\nSet-Cookie: x=1")])
+
+
+def test_response_headers_setter_validates_each_pair():
+    r = http.Response(200)
+    r.headers = [("x-a", "a\tb"), ("set-cookie", "k=v")]
+    assert r.headers == [("x-a", "a\tb"), ("set-cookie", "k=v")]
+    for bad in ([("", "v")], [("a b", "v")], [("x:y", "v")], [("x-a", "v\r\nx: y")], [("x-a", "v\x00")]):
+        with pytest.raises(BadRequestError):
+            r.headers = bad
+    # a rejected assignment leaves the previous headers untouched
+    assert r.headers == [("x-a", "a\tb"), ("set-cookie", "k=v")]
+    with pytest.raises(BadRequestError):
+        r.headers = [("x-ok", "v"), ("x-bad", "v\n")]
+    assert r.headers == [("x-a", "a\tb"), ("set-cookie", "k=v")]

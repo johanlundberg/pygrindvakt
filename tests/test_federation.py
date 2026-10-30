@@ -359,12 +359,11 @@ def test_http_argument_must_implement_the_protocol():
         federation.fetch_entity_configuration(object(), LEAF)
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_http_client_exception_fails_closed(fed):
+def test_http_client_exception_fails_closed(fed, unraisable):
     """An exception inside the Python client surfaces as InternalError, not a crash.
 
     The adapter also routes the traceback through ``sys.unraisablehook`` so
-    operators can see it; pytest reports that as a warning, ignored here.
+    operators can see it; the ``unraisable`` fixture records and checks it.
     """
 
     class Boom:
@@ -376,6 +375,7 @@ def test_http_client_exception_fails_closed(fed):
 
     with pytest.raises(pygrindvakt.InternalError, match="network down"):
         federation.fetch_entity_configuration(Boom(), LEAF)
+    unraisable.expect(RuntimeError, "network down", count=1, adapter=Boom)
 
 
 # ---------------------------------------------------------------------------
@@ -1079,9 +1079,10 @@ def test_entity_statement_jwks_getter_drops_oct_keys_with_warning(fed):
 
 def test_resolved_entity_subject_jwks_drops_oct_keys_with_warning(fed):
     pub = fed.leaf_key.to_public_jwks()
-    leaf_ec = federation.build_entity_configuration(
-        fed.leaf_key, LEAF, {"keys": [*pub["keys"], HS_JWK]}, [TA], LEAF_METADATA, None, 3600
-    )
+    with pytest.warns(UserWarning, match="publishing a symmetric"):
+        leaf_ec = federation.build_entity_configuration(
+            fed.leaf_key, LEAF, {"keys": [*pub["keys"], HS_JWK]}, [TA], LEAF_METADATA, None, 3600
+        )
     sub = subordinate_statement(fed.ta_key, TA, LEAF, pub)
     resolved = resolve_response(fed.ta_key, TA, LEAF, LEAF_METADATA, [leaf_ec, sub, fed.ta_ec])
     http = FakeHttpClient(

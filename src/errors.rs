@@ -256,13 +256,12 @@ pub fn config_from(e: RsError) -> PyErr {
 /// be able to claim unconditional retryability.
 const RETRYABLE_CODES: [&str; 3] = ["transport", "jwks_fetch_timeout", "discovery_fetch_timeout"];
 
-/// Single source of truth for `retryable`. The status rule (upstream 5xx or
-/// 429) is not spoofable and applies to any upstream failure. The code rule
-/// applies ONLY to codes the binding itself sets (`with_code`); a `code`
-/// adopted from upstream OAuth text in `err()` must never reach it.
-fn is_retryable(binding_code: Option<&str>, upstream_status: Option<u16>) -> bool {
-    binding_code.is_some_and(|c| RETRYABLE_CODES.contains(&c))
-        || upstream_status.is_some_and(|st| st >= 500 || st == 429)
+/// Code rule for `retryable`: applies ONLY to codes the binding itself sets
+/// (`with_code`); a `code` adopted from upstream OAuth text in `err()` must
+/// never reach it. The status rule (upstream 5xx or 429) is core's
+/// `UpstreamHttpError::is_retryable`.
+fn is_retryable_code(code: &str) -> bool {
+    RETRYABLE_CODES.contains(&code)
 }
 
 /// Best-effort setter for the per-instance attributes of a typed error.
@@ -321,7 +320,7 @@ impl<'a, 'py> Attrs<'a, 'py> {
 pub fn with_code(py: Python<'_>, e: PyErr, code: &str) -> PyErr {
     let mut attrs = Attrs::new(py, &e);
     attrs.set("code", code);
-    if is_retryable(Some(code), None) {
+    if is_retryable_code(code) {
         attrs.set("retryable", true);
     }
     attrs.finish();
@@ -331,7 +330,7 @@ pub fn with_code(py: Python<'_>, e: PyErr, code: &str) -> PyErr {
 /// Like `with_code`, but `retryable` is set explicitly instead of derived
 /// from the code. For `discovery_backoff`, which inherits the `retryable` of
 /// the stored failure it is chained to (that value was itself derived by
-/// `is_retryable`, so upstream text never reaches it).
+/// `err()`, so upstream text never reaches it).
 pub fn with_code_retryable(py: Python<'_>, e: PyErr, code: &str, retryable: bool) -> PyErr {
     let mut attrs = Attrs::new(py, &e);
     attrs.set("code", code);
@@ -365,7 +364,7 @@ pub fn err(e: RsError) -> PyErr {
                 (None, true) => None,
             };
             // `code` may be upstream-controlled text: derive retryable from status only.
-            let retry = is_retryable(None, u.status);
+            let retry = u.is_retryable();
             let mut attrs = Attrs::new(py, &exc);
             attrs.set_opt("code", code);
             attrs.set("auth_failure", auth);
@@ -449,31 +448,12 @@ pub fn oauth_err(py: Python<'_>, e: &RsOAuthError) -> PyErr {
     }
 }
 
-/// Inverse of `OAuthErrorCode::as_str` (grindvakt has no `from_str`).
 // NOTE: `AuthorizationResponse.error_known` (core `grindvakt::callback`) is a
 // SUPERSET of the codes accepted here; tests/test_rp.py locks that in. Do not
-// widen this match without core support.
+// widen this without core support.
 pub fn parse_oauth_code(s: &str) -> PyResult<OAuthErrorCode> {
-    use OAuthErrorCode as C;
-    Ok(match s {
-        "invalid_request" => C::InvalidRequest,
-        "invalid_client" => C::InvalidClient,
-        "invalid_grant" => C::InvalidGrant,
-        "unauthorized_client" => C::UnauthorizedClient,
-        "unsupported_grant_type" => C::UnsupportedGrantType,
-        "unsupported_response_type" => C::UnsupportedResponseType,
-        "invalid_scope" => C::InvalidScope,
-        "access_denied" => C::AccessDenied,
-        "login_required" => C::LoginRequired,
-        "server_error" => C::ServerError,
-        "temporarily_unavailable" => C::TemporarilyUnavailable,
-        "invalid_dpop_proof" => C::InvalidDpopProof,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown OAuth error code {other:?}"
-            )))
-        }
-    })
+    s.parse::<OAuthErrorCode>()
+        .map_err(|_| PyValueError::new_err(format!("unknown OAuth error code {s:?}")))
 }
 
 pub fn build_oauth_error(
@@ -558,7 +538,7 @@ pub(crate) use grindvakt::is_invisible_format;
 /// matching `is_invisible_format`, and backslash become `\n`, `\r`, `\t`,
 /// `\\` or `\u{XXXX}`; the result is capped at `max` characters, ending with
 /// `...` when cut. An escape sequence is never split. Shared by
-/// `log_summary`, `OAuthError.__str__` and (future) `error_description_safe`.
+/// `log_summary`, `OAuthError.__str__` and `error_description_safe`.
 pub(crate) fn escape_untrusted_text(s: &str, max: usize) -> String {
     escape_untrusted(s, max, false)
 }

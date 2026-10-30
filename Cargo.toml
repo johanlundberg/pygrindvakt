@@ -2,7 +2,7 @@
 name = "pygrindvakt"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Python bindings for the grindvakt OAuth 2.0 / OpenID Connect / OpenID Federation library"
 license = "BSD-2-Clause"
 repository = "https://github.com/kushaldas/pygrindvakt"
@@ -13,14 +13,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py310"] }
-pythonize = "0.29.0"
+pythonize = { version = "0.29.0", features = ["arbitrary_precision"] }
 # Use the published protocol engine in local and release builds alike.
 # jose-rs / kryptering types are re-exported by grindvakt.
-grindvakt = { version = "0.9.1", features = ["pkcs11", "redis"] }
+grindvakt = { version = "0.10.0", features = ["pkcs11", "redis"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 url = "2"
 tracing = "0.1"

@@ -10,6 +10,7 @@ from conftest import ISSUER, REDIRECT_URI, TOKEN_URL, basic_auth, code_from_redi
 from pygrindvakt import (
     ConfigError,
     OAuthError,
+    client,
     jwt,
     keys,
     metadata,
@@ -17,6 +18,7 @@ from pygrindvakt import (
     provider,
     request,
     rp,
+    tokens,
     util,
 )
 
@@ -484,6 +486,65 @@ def test_minting_revalidates_deserialized_request(op):
     tampered = request.AuthorizationRequest.from_dict(stored)
     with pytest.raises(OAuthError, match="redirect_uri"):
         op.authorization_redirect(tampered, "alice")
+
+
+def test_authorization_redirect_refuses_crlf_redirect_uri_even_if_registered(op_key):
+    """Regression test: a registered redirect_uri with CRLF never reaches a Location header."""
+    evil = REDIRECT_URI + "\r\nSet-Cookie: x=1"
+    c = client.Client("crlf", client_secret="s", redirect_uris=[evil])
+    crlf_op = provider.Provider(
+        metadata.ProviderMetadata(ISSUER),
+        op_key,
+        client.InMemoryClientStore([c]),
+        tokens.TokenCodec("crlf-secret"),
+        token_use_store=provider.InMemoryTokenUseStore(),
+    )
+    base = request.AuthorizationRequest.from_params(
+        [("client_id", "crlf"), ("response_type", "code"), ("redirect_uri", REDIRECT_URI), ("scope", "openid")]
+    )
+    stored = base.to_dict()
+    stored["redirect_uri"] = evil
+    req = request.AuthorizationRequest.from_dict(stored)
+    with pytest.raises(OAuthError) as ei:
+        crlf_op.authorization_redirect(req, "alice")
+    assert ei.value.code == "invalid_request"
+
+
+@pytest.mark.parametrize("iss_flag", [False, True])
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        REDIRECT_URI + "\\@evil.example",
+        REDIRECT_URI + "\u200b",
+        REDIRECT_URI + "\u202e",
+        "https://good.example@evil.example/cb",
+    ],
+    ids=["backslash", "zero-width", "bidi", "userinfo"],
+)
+def test_registered_unsafe_redirect_uri_never_reaches_a_location_header(op_key, unsafe, iss_flag):
+    """Core accepts these registered URIs; the binding's redirect_uri rules must stop them
+    on both render paths, with and without the RFC 9207 flag."""
+    c = client.Client("unsafe", client_secret="s", redirect_uris=[unsafe])
+    unsafe_op = provider.Provider(
+        metadata.ProviderMetadata(ISSUER),
+        op_key,
+        client.InMemoryClientStore([c]),
+        tokens.TokenCodec("unsafe-secret"),
+        token_use_store=provider.InMemoryTokenUseStore(),
+        authorization_response_iss=iss_flag,
+    )
+    base = request.AuthorizationRequest.from_params(
+        [("client_id", "unsafe"), ("response_type", "code"), ("redirect_uri", REDIRECT_URI), ("scope", "openid")]
+    )
+    stored = base.to_dict()
+    stored["redirect_uri"] = unsafe
+    req = request.AuthorizationRequest.from_dict(stored)
+    with pytest.raises(OAuthError) as ei:
+        unsafe_op.authorization_redirect(req, "alice")
+    assert ei.value.code == "invalid_request" and "evil" not in str(ei.value)
+    with pytest.raises(OAuthError) as ei:
+        unsafe_op.authorization_error_redirect(req, OAuthError("access_denied", "no", "st"))
+    assert ei.value.code == "invalid_request" and "evil" not in str(ei.value)
 
 
 def test_token_bearing_query_mode_and_empty_subject_are_rejected(op):

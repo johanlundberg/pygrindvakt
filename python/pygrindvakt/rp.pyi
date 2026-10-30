@@ -677,12 +677,12 @@ def validate_service_endpoint(
     """
 
 def asymmetric_algorithms() -> list[str]:
-    """A fixed list of the classical asymmetric JWS algorithms the library parses.
+    """The classical asymmetric JWS algorithms from the core library's catalogue.
 
-    ``RS256/384/512``, ``PS256/384/512``, ``ES256/384/512``, ``ES256K`` and
-    ``EdDSA``; never ``HS*`` or ``none``. Post-quantum names (ML-DSA,
+    ``RS256/384/512``, ``PS256/384/512``, ``ES256/384/512``, ``EdDSA`` and
+    ``ES256K``, in that order; never ``HS*`` or ``none``. Post-quantum names (ML-DSA,
     feature-gated in jose-rs) are NOT included even if the build parses them.
-    This is a parser probe, not a recommended allowlist; it is not a list an
+    This is a catalogue, not a recommended allowlist; it is not a list an
     OP advertises and not what suits your deployment. Pass an explicit
     allowlist to :func:`verify_id_token`. It includes ``EdDSA``, for which
     :func:`pygrindvakt.jwt.supports_oidc_token_hash` is ``False``, so
@@ -692,6 +692,10 @@ def asymmetric_algorithms() -> list[str]:
     ``jwt.supports_oidc_token_hash`` or pass an explicit allowlist.
 
     .. versionadded:: 0.3.0
+    .. versionchanged:: 0.4.0
+       The list comes from the core library's algorithm catalogue instead of a
+       fixed probe list. The names are unchanged; the order now follows the
+       catalogue (``ES512``, ``EdDSA``, ``ES256K``).
     """
 
 class MultiDictProtocol(Protocol):
