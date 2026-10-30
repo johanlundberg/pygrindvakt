@@ -153,6 +153,11 @@ version is what ``Cargo.lock`` pins).
    * - pygrindvakt
      - grindvakt
      - Notes
+   * - 0.4.0
+     - 0.10.0
+     - binds core 0.10 (Rust 1.89): RFC 9207 ``iss`` for the in-process ``Provider``,
+       header and ``Location`` injection checks on ``http.Response``, stricter
+       ``redirect_uri`` rules on authorization redirects, quiet and stricter test suite.
    * - 0.3.0
      - 0.9.1
      - fail-closed RP hardening: ``ConfigError``/``BadRequestError``, authorization

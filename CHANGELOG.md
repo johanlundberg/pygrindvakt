@@ -7,7 +7,7 @@ needed to track the upstream `grindvakt` library and correct protocol or
 security handling. `pygrindvakt` is a thin PyO3 binding; most entries reflect
 adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-30
 
 ### Added
 
@@ -63,7 +63,13 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   `UpstreamHttpError::is_retryable`, and OAuth error codes are parsed with
   core's `OAuthErrorCode::from_str`. Behaviour is unchanged.
 - Bound to `grindvakt` 0.10.0 (`jose-rs` 0.10, `kryptering` 0.7). The minimum
-  Rust version is now 1.89, as upstream's.
+  Rust version is now 1.89, as upstream's. Behaviour that follows from core
+  0.10: a token is now rejected at `now == exp + leeway` (RFC 7519), so a
+  token that expired exactly at the end of the leeway is refused one second
+  earlier than before, and a `private_key_jwt` client assertion can no longer
+  be replayed while it is still accepted (the `Provider`'s jti replay entry
+  now lives until `exp` plus leeway, or `iat` plus the maximum age plus
+  leeway).
 - JSON <-> Python conversion (`src/convert.rs`) goes through `serde_json`:
   `jose-rs` 0.10 enables `serde_json/arbitrary_precision` and reads `exp`,
   `iat` and `nbf` from a `RawValue`, which `pythonize` alone cannot handle.
