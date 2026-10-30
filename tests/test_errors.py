@@ -158,21 +158,21 @@ class RaisingClient:
         raise self.exc
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_python_client_exception_is_chained():
+def test_python_client_exception_is_chained(unraisable):
     boom = ValueError("boom")
     with pytest.raises(InternalError) as ei:
         rp.exchange_code(RaisingClient(boom), PROV, RPC, "code", VERIFIER)
+    unraisable.expect(ValueError, "boom", count=1, adapter=RaisingClient)
     assert ei.value.__cause__ is boom
     assert ei.value.code == "transport"
     assert ei.value.upstream_status is None
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_python_client_get_exception_is_chained():
+def test_python_client_get_exception_is_chained(unraisable):
     boom = RuntimeError("get failed")
     with pytest.raises(InternalError) as ei:
         rp.discover(RaisingClient(boom), "http://127.0.0.1:1")
+    unraisable.expect(RuntimeError, "get failed", count=1, adapter=RaisingClient)
     assert ei.value.__cause__ is boom
     assert ei.value.code == "transport"
 
@@ -301,8 +301,7 @@ def test_no_cross_call_leakage_between_threads(server):
         assert results[i].code != "transport"
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_nested_calls_keep_their_own_causes():
+def test_nested_calls_keep_their_own_causes(unraisable):
     inner_boom = KeyError("inner")
     outer_boom = ValueError("outer")
 
@@ -320,10 +319,10 @@ def test_nested_calls_keep_their_own_causes():
     with pytest.raises(InternalError) as ei:
         rp.discover(Outer(), "http://127.0.0.1:1")
     assert ei.value.__cause__ is outer_boom
+    assert sorted(type(r.exc_value).__name__ for r in unraisable) == ["KeyError", "ValueError"]
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_tolerated_earlier_failure_is_not_blamed_for_a_later_error():
+def test_tolerated_earlier_failure_is_not_blamed_for_a_later_error(unraisable):
     """A failed fetch in a multi-fetch flow must only be attributed to the error
     that fetch produced. Trust-anchor resolution tolerates per-anchor failures
     and raises the last error; one anchor's client raises, the other answers
@@ -350,6 +349,7 @@ def test_tolerated_earlier_failure_is_not_blamed_for_a_later_error():
     else:
         assert e.__cause__ is None
         assert e.upstream_status == 500
+    unraisable.expect(ValueError, "first anchor down", count=1, adapter=Mixed)
 
 
 # --- error layout: BadRequestError is a ValueError ---------------------------------

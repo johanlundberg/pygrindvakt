@@ -150,15 +150,15 @@ def test_discover_rejects_plain_http_before_fetching(http):
     assert http.calls == []
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_discover_fails_closed_when_http_client_raises():
+def test_discover_fails_closed_when_http_client_raises(unraisable):
     """A raising HttpClient surfaces as InternalError carrying the message.
 
     The adapter's traceback is also routed through ``sys.unraisablehook`` so
-    operators can see it; pytest reports that as a warning, ignored here.
+    operators can see it; the ``unraisable`` fixture records and checks it.
     """
     with pytest.raises(InternalError, match="network is down"):
         rp.discover(RaisingHttpClient(), ISSUER)
+    unraisable.expect(RuntimeError, "network is down", count=1, adapter=RaisingHttpClient)
 
 
 def test_discover_rejects_issuer_mismatch(op):

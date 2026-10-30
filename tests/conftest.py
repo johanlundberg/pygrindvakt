@@ -15,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import warnings
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -45,6 +46,33 @@ def code_from_redirect(resp) -> str:
     assert resp.status == 302, resp
     loc = resp.header("location")
     return parse_qs(urlparse(loc).query)["code"][0]
+
+
+# Third party: fastapi.testclient imports starlette.testclient, which warns that httpx is
+# deprecated in favour of httpx2 (a UserWarning subclass). Not ours to fix.
+_THIRD_PARTY_WARNINGS = ("Using `httpx` with `starlette.testclient` is deprecated",)
+
+
+@pytest.fixture(autouse=True)
+def no_unexpected_user_warnings():
+    """Fail a test that emits a ``UserWarning`` it did not expect.
+
+    ``filterwarnings = error::UserWarning`` is not enough: the Rust helper
+    ``convert::warn`` is best effort and discards the exception ``warnings.warn``
+    raises under an ``error`` filter, so those warnings would vanish without
+    failing anything. Record with an ``always`` filter instead and assert at
+    teardown. Tests that provoke a warning on purpose wrap it in ``pytest.warns``,
+    whose own recorder takes it before it gets here.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield
+    unexpected = [
+        f"{w.category.__name__}: {w.message}"
+        for w in caught
+        if issubclass(w.category, UserWarning) and not str(w.message).startswith(_THIRD_PARTY_WARNINGS)
+    ]
+    assert not unexpected, "unexpected UserWarning(s):\n" + "\n".join(unexpected)
 
 
 class UnraisableReports(list):

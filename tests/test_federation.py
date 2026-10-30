@@ -359,12 +359,11 @@ def test_http_argument_must_implement_the_protocol():
         federation.fetch_entity_configuration(object(), LEAF)
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_http_client_exception_fails_closed(fed):
+def test_http_client_exception_fails_closed(fed, unraisable):
     """An exception inside the Python client surfaces as InternalError, not a crash.
 
     The adapter also routes the traceback through ``sys.unraisablehook`` so
-    operators can see it; pytest reports that as a warning, ignored here.
+    operators can see it; the ``unraisable`` fixture records and checks it.
     """
 
     class Boom:
@@ -376,6 +375,7 @@ def test_http_client_exception_fails_closed(fed):
 
     with pytest.raises(pygrindvakt.InternalError, match="network down"):
         federation.fetch_entity_configuration(Boom(), LEAF)
+    unraisable.expect(RuntimeError, "network down", count=1, adapter=Boom)
 
 
 # ---------------------------------------------------------------------------

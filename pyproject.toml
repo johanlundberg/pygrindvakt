@@ -58,7 +58,10 @@ markers = [
 ]
 # Warnings are errors, so a new unexpected one fails the run. Tests that provoke a
 # warning on purpose use pytest.warns; adapter failures reported through
-# sys.unraisablehook (ADR 0002) are captured by the `unraisable` fixture.
+# sys.unraisablehook (ADR 0002) are captured by the `unraisable` fixture. The Rust
+# helper convert::warn is best effort and drops the exception an `error` filter makes
+# warnings.warn raise, so tests/conftest.py also records UserWarnings with an
+# `always` filter and fails a test that emitted one it did not expect.
 # Later entries take precedence over earlier ones.
 filterwarnings = [
     "error::pytest.PytestUnraisableExceptionWarning",
