@@ -43,7 +43,7 @@ Constants
 Provider
 --------
 
-.. py:class:: Provider(metadata: ProviderMetadata, signing_key: SigningKey, clients: InMemoryClientStore | ClientStoreProtocol, codec: TokenCodec, lifetimes: TokenLifetimes | None = None, token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol, client_assertion_max_age: int | None = None)
+.. py:class:: Provider(metadata: ProviderMetadata, signing_key: SigningKey, clients: InMemoryClientStore | ClientStoreProtocol, codec: TokenCodec, lifetimes: TokenLifetimes | None = None, token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol, client_assertion_max_age: int | None = None, authorization_response_iss: bool = False)
 
    The OpenID Provider engine. Build once, share across requests.
 
@@ -66,6 +66,16 @@ Provider
      :doc:`../guides/stores`.
    * ``client_assertion_max_age``: overrides
      :data:`DEFAULT_CLIENT_ASSERTION_MAX_AGE`.
+   * ``authorization_response_iss``: opt in to RFC 9207. Authorization
+     responses (success and error redirects, query or fragment) carry an
+     ``iss`` parameter equal to the issuer, and the discovery document gains
+     ``authorization_response_iss_parameter_supported: true``. A relying
+     party checks it with :meth:`pygrindvakt.rp.AuthorizationResponse.matches_iss`
+     after :func:`pygrindvakt.rp.parse_authorization_response`. Default
+     ``False`` leaves behaviour unchanged. Advertising the discovery member
+     in your own metadata without this flag emits a ``UserWarning``.
+
+     .. versionadded:: 0.4.0
 
    .. py:property:: clients
       :type: InMemoryClientStore | ClientStoreProtocol
@@ -143,7 +153,31 @@ Provider
       On :class:`pygrindvakt.OAuthError`, render the error using the request's
       response mode: ``"fragment"`` when ``request.use_fragment()`` is true,
       otherwise ``"query"``. The method itself revalidates the redirect URI
-      before producing any artifact.
+      before producing any artifact. With ``authorization_response_iss``
+      enabled, render errors with :meth:`authorization_error_redirect`
+      instead, so they carry ``iss`` too (``OAuthError.to_redirect`` never
+      adds it). In query mode, a registered ``redirect_uri`` that already has
+      an ``iss`` query parameter (percent-encoded spellings such as ``%69ss``
+      included) raises ``OAuthError(server_error)``; the value is not echoed.
+      Fragment mode is unaffected.
+
+   .. py:method:: authorization_error_redirect(request: AuthorizationRequest, error: OAuthError) -> Response
+
+      Render an authorization error redirect for ``request`` in its response
+      mode. With ``authorization_response_iss=True`` it carries ``iss``
+      (RFC 9207); without the flag it adds none and behaves like
+      ``error.to_redirect(...)``. ``state`` comes from ``error``, as with
+      ``to_redirect``: pass ``request.state`` yourself.
+
+      The request is validated first, exactly as
+      :meth:`validate_authorization_request` does, so a request rebuilt with
+      :meth:`AuthorizationRequest.from_dict` cannot turn this into an open
+      redirector. If validation fails that :class:`pygrindvakt.OAuthError` is
+      raised; render it with ``.to_response()``, never as a redirect. With the
+      flag on, query mode also raises ``OAuthError(server_error)`` when the
+      registered ``redirect_uri`` already has an ``iss`` query parameter.
+
+      .. versionadded:: 0.4.0
 
    .. py:method:: handle_token_request(form: list[tuple[str, str]], token_url: str, auth_header: str | None = None, dpop: DpopProof | None = None) -> TokenResponse
 

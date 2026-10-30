@@ -9,6 +9,29 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 
 ## [Unreleased]
 
+### Added
+
+- RFC 9207 (`iss` on authorization responses) for the in-process `Provider`,
+  opt in with `Provider(..., authorization_response_iss=True)` (default
+  `False`, behaviour unchanged). Success and error redirects, query or
+  fragment, then carry `iss` equal to the issuer, and discovery advertises
+  `authorization_response_iss_parameter_supported: true`. The relying party
+  side already exists: `rp.parse_authorization_response(...)` then
+  `matches_iss(issuer)`.
+- `Provider.authorization_error_redirect(request, error)` renders an
+  authorization error redirect carrying `iss` when the flag is on (and none
+  otherwise; `OAuthError.to_redirect` never adds it). It validates the request
+  first and raises the validation `OAuthError` on failure, so a request built
+  with `AuthorizationRequest.from_dict` cannot make it redirect to an
+  unregistered `redirect_uri`. `state` comes from the error.
+- With the flag on, a query-mode response (`authorization_redirect` or
+  `authorization_error_redirect`) for a registered `redirect_uri` that already
+  has an `iss` query parameter (`%69ss` included) raises
+  `OAuthError(server_error)` instead of sending two `iss` values.
+- A `Provider` built without the flag but whose metadata advertises
+  `authorization_response_iss_parameter_supported: true` now emits the
+  existing unimplemented-members `UserWarning`.
+
 ### Changed
 
 - `http.Response.redirect`, `Response.with_header`, the `Response.headers`

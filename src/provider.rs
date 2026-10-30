@@ -26,7 +26,7 @@ use crate::convert::{
     from_py, log_unraisable, new_submodule, protocol_parameter_pairs, require_methods, to_py,
 };
 use crate::dpop::DpopProof;
-use crate::errors::{err, internal_err, oauth_err};
+use crate::errors::{build_oauth_error, err, internal_err, oauth_err};
 use crate::http::Response;
 use crate::keys::SigningKey;
 use crate::metadata::ProviderMetadata;
@@ -318,7 +318,9 @@ pub struct Provider {
 
 /// Warn (once, listing all names) when the metadata advertises members for
 /// behaviour this engine does not implement. Publishing is still allowed.
-fn warn_unimplemented_members(metadata: &ProviderMetadata) -> PyResult<()> {
+/// `emits_iss` is the `authorization_response_iss` flag: the RFC 9207 member
+/// is only a claim about the front end when the engine is not emitting `iss`.
+fn warn_unimplemented_members(metadata: &ProviderMetadata, emits_iss: bool) -> PyResult<()> {
     const ALWAYS: &[&str] = &[
         "end_session_endpoint",
         "revocation_endpoint",
@@ -343,6 +345,10 @@ fn warn_unimplemented_members(metadata: &ProviderMetadata) -> PyResult<()> {
             .copied()
             .filter(|k| extra.get(*k).and_then(serde_json::Value::as_bool) == Some(true)),
     );
+    const ISS_MEMBER: &str = "authorization_response_iss_parameter_supported";
+    if !emits_iss && extra.get(ISS_MEMBER).and_then(serde_json::Value::as_bool) == Some(true) {
+        names.push(ISS_MEMBER);
+    }
     if names.is_empty() {
         return Ok(());
     }
@@ -365,7 +371,8 @@ fn warn_unimplemented_members(metadata: &ProviderMetadata) -> PyResult<()> {
 impl Provider {
     #[new]
     #[pyo3(signature = (metadata, signing_key, clients, codec, lifetimes = None,
-                        token_use_store = None, client_assertion_max_age = None))]
+                        token_use_store = None, client_assertion_max_age = None,
+                        authorization_response_iss = false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         metadata: &ProviderMetadata,
@@ -375,6 +382,7 @@ impl Provider {
         lifetimes: Option<&TokenLifetimes>,
         token_use_store: Option<&Bound<'_, PyAny>>,
         client_assertion_max_age: Option<u64>,
+        authorization_response_iss: bool,
     ) -> PyResult<Self> {
         let store = extract_client_store(clients)?;
         let (token_use_store, token_use_store_obj) = match token_use_store {
@@ -395,8 +403,11 @@ impl Provider {
         if let Some(secs) = client_assertion_max_age {
             p = p.with_client_assertion_max_age(secs);
         }
+        if authorization_response_iss {
+            p = p.with_authorization_response_iss();
+        }
         // Last, after every fallible step, so a failing constructor never warns.
-        warn_unimplemented_members(metadata)?;
+        warn_unimplemented_members(metadata, authorization_response_iss)?;
         Ok(Self {
             inner: Arc::new(p),
             clients_obj: clients.clone().unbind(),
@@ -474,7 +485,12 @@ impl Provider {
     ///
     /// On `OAuthError`, use fragment mode when `request.use_fragment()` is
     /// true; otherwise use query mode. This preserves the successful response's
-    /// delivery mode without exposing a token-bearing flow in the query.
+    /// delivery mode without exposing a token-bearing flow in the query. When
+    /// the Provider was built with `authorization_response_iss=True`, render
+    /// the error with `Provider.authorization_error_redirect` instead so it
+    /// carries `iss` too; `OAuthError.to_redirect` never adds it. With that
+    /// flag on, a query-mode response whose registered `redirect_uri` already
+    /// has an `iss` query parameter raises `OAuthError(server_error)`.
     #[pyo3(signature = (request, sub, external_claims = None, acr = None, extra_claims = None))]
     fn authorization_redirect(
         &self,
@@ -504,6 +520,38 @@ impl Provider {
         let result = crate::runtime::block_on(py, async move {
             p.authorization_redirect_with_claims(&request, sub, &external_claims, acr, &extra)
                 .await
+        })?;
+        result.map(Response::wrap).map_err(|e| oauth_err(py, &e))
+    }
+
+    /// Render an authorization error redirect for `request`, in its response
+    /// mode, with `state` taken from `error` (as `OAuthError.to_redirect`
+    /// does; pass `request.state` yourself). With
+    /// `authorization_response_iss=True` the redirect carries `iss` (RFC 9207);
+    /// without it no `iss` is added.
+    ///
+    /// The request is validated first (as in `validate_authorization_request`),
+    /// so a request rebuilt with `AuthorizationRequest.from_dict` can never
+    /// make this an open redirector: on failure the validation `OAuthError` is
+    /// raised and you render it with `.to_response()`. With the flag on it
+    /// also raises `OAuthError(server_error)` in query mode when the
+    /// registered `redirect_uri` already has an `iss` query parameter.
+    fn authorization_error_redirect(
+        &self,
+        py: Python<'_>,
+        request: &AuthorizationRequest,
+        error: &Bound<'_, PyAny>,
+    ) -> PyResult<Response> {
+        let code: String = error.getattr("code")?.extract()?;
+        let description: Option<String> = error.getattr("description")?.extract()?;
+        let state: Option<String> = error.getattr("state")?.extract()?;
+        let rs_error = build_oauth_error(&code, description, state)?;
+        let p = self.inner.clone();
+        let request = request.inner.clone();
+        let result = crate::runtime::block_on(py, async move {
+            // Fail closed: never build a redirect for an unvalidated redirect_uri.
+            p.validate_authorization_request(&request).await?;
+            p.authorization_error_redirect(&request, &rs_error)
         })?;
         result.map(Response::wrap).map_err(|e| oauth_err(py, &e))
     }

@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from .client import Client, ClientStoreProtocol, InMemoryClientStore
 from .dpop import DpopProof
+from .errors import OAuthError
 from .http import Response
 from .keys import SigningKey
 from .metadata import ProviderMetadata
@@ -110,6 +111,7 @@ class Provider:
         lifetimes: TokenLifetimes | None = ...,
         token_use_store: InMemoryTokenUseStore | RedisStore | TokenUseStoreProtocol = ...,
         client_assertion_max_age: int | None = ...,
+        authorization_response_iss: bool = ...,
     ) -> None: ...
     @property
     def clients(self) -> InMemoryClientStore | ClientStoreProtocol:
@@ -159,7 +161,22 @@ class Provider:
 
         The request is revalidated at this minting boundary. On ``OAuthError``,
         pass ``"fragment"`` to ``to_redirect`` when ``request.use_fragment()``
-        is true, otherwise pass ``"query"``.
+        is true, otherwise pass ``"query"``. With ``authorization_response_iss``
+        on, use ``authorization_error_redirect`` instead so the error carries
+        ``iss``; in query mode a registered ``redirect_uri`` that already has
+        an ``iss`` query parameter raises ``OAuthError(server_error)``.
+        """
+    def authorization_error_redirect(self, request: AuthorizationRequest, error: OAuthError) -> Response:
+        """Render an authorization error redirect for ``request`` in its
+        response mode, adding ``iss`` (RFC 9207) when the Provider was built
+        with ``authorization_response_iss=True`` and nothing otherwise.
+
+        ``state`` comes from ``error`` (pass ``request.state`` yourself). The
+        request is validated first, as in ``validate_authorization_request``;
+        on failure that ``OAuthError`` is raised and must be rendered with
+        ``.to_response()``. With the flag on, query mode also raises
+        ``OAuthError(server_error)`` when the registered ``redirect_uri``
+        already has an ``iss`` query parameter.
         """
     def handle_token_request(
         self,
