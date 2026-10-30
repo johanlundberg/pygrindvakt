@@ -149,7 +149,7 @@ def test_no_replay_store_fails_closed():
         dpop.NoReplayStore()
 
 
-def test_python_replay_store_and_failure(dpop_key):
+def test_python_replay_store_and_failure(dpop_key, unraisable):
     """A Python replay store is honoured; if it raises, validation fails closed
     with DpopServerError (not silently as a replay)."""
     seen = set()
@@ -174,6 +174,7 @@ def test_python_replay_store_and_failure(dpop_key):
 
     with pytest.raises(DpopServerError):
         dpop.validate_proof(Broken(), cfg, make_proof(dpop_key, "POST", TOKEN_URL), "POST", TOKEN_URL)
+    unraisable.expect(RuntimeError, "redis down", count=1, adapter=Broken)
 
     with pytest.raises(TypeError, match="record"):
         dpop.validate_proof(object(), cfg, proof, "POST", TOKEN_URL)

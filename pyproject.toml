@@ -56,6 +56,17 @@ markers = [
     "pkcs11: tests requiring a SoftHSM2 token (auto-skip if unavailable)",
     "redis: tests requiring a live Redis at REDIS_URL (auto-skip if unset)",
 ]
+# Warnings are errors, so a new unexpected one fails the run. Tests that provoke a
+# warning on purpose use pytest.warns; adapter failures reported through
+# sys.unraisablehook (ADR 0002) are captured by the `unraisable` fixture.
+# Later entries take precedence over earlier ones.
+filterwarnings = [
+    "error::pytest.PytestUnraisableExceptionWarning",
+    "error::UserWarning",
+    # Third party: fastapi.testclient imports starlette.testclient, which warns that
+    # httpx is deprecated in favour of httpx2 (a UserWarning subclass). Not ours to fix.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 120

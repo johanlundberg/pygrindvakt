@@ -1128,7 +1128,7 @@ def test_userinfo_get_keyword_only_and_var_keyword_named_headers_are_supported()
         assert h == [("authorization", "Bearer tok")]
 
 
-def test_userinfo_get_typeerror_inside_client_is_not_swallowed():
+def test_userinfo_get_typeerror_inside_client_is_not_swallowed(unraisable):
     class Boom:
         def get(self, url, headers=None):
             raise TypeError("inside client")
@@ -1139,6 +1139,7 @@ def test_userinfo_get_typeerror_inside_client_is_not_swallowed():
     with pytest.raises(InternalError) as e:
         ui(Boom(), method="GET")
     assert e.value.code == "transport"
+    unraisable.expect(TypeError, "inside client", count=1, adapter=Boom)
 
 
 def test_userinfo_invalid_method_and_trust_values():
@@ -1336,13 +1337,14 @@ def lprov():
 def test_provider_info_carries_end_session_endpoint_from_discovery(op, op_key):
     md = metadata.ProviderMetadata(ISSUER)
     md.end_session_endpoint = f"{ISSUER}/logout"
-    op2 = provider.Provider(
-        md,
-        op_key,
-        client.InMemoryClientStore([]),
-        tokens.TokenCodec("s"),
-        token_use_store=provider.InMemoryTokenUseStore(),
-    )
+    with pytest.warns(UserWarning, match="Provider does not implement end_session_endpoint"):
+        op2 = provider.Provider(
+            md,
+            op_key,
+            client.InMemoryClientStore([]),
+            tokens.TokenCodec("s"),
+            token_use_store=provider.InMemoryTokenUseStore(),
+        )
     discovered = rp.discover(ProviderHttpClient(op2, ISSUER), ISSUER)
     assert discovered.end_session_endpoint == f"{ISSUER}/logout"
     assert discovered.raw is not None and discovered.raw["end_session_endpoint"] == f"{ISSUER}/logout"
@@ -1397,7 +1399,8 @@ def test_from_metadata_drops_unsafe_end_session_endpoint():
                 raise AssertionError
 
         md = rp.discover(Http(), ISSUER)
-        info = rp.ProviderInfo.from_metadata(md)
+        with pytest.warns(UserWarning, match="end_session_endpoint .* is unsafe"):
+            info = rp.ProviderInfo.from_metadata(md)
         assert info.end_session_endpoint is None
         assert info.token_endpoint == f"{ISSUER}/token"
         with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata") as ei:
@@ -1448,7 +1451,9 @@ def test_end_session_same_origin_accepted(ep):
 def test_end_session_cross_origin_rejected_and_dropped(ep):
     with pytest.raises(GrindvaktError):
         _pi(ep)
-    info = rp.ProviderInfo.from_metadata(_raw_md(ep))
+    # the userinfo-in-URL case is rejected as unsafe before the origin check
+    with pytest.warns(UserWarning, match="is unsafe" if "@" in ep else "different origin than the issuer"):
+        info = rp.ProviderInfo.from_metadata(_raw_md(ep))
     assert info.end_session_endpoint is None
     with pytest.raises(ConfigError, match=r"rejected by ProviderInfo\.from_metadata"):
         rp.end_session_url(info, id_token_hint="tok")
@@ -1520,7 +1525,8 @@ def test_end_session_review_poc_now_config_error():
     md = metadata.ProviderMetadata.from_dict(
         metadata.ProviderMetadata(ISSUER).to_dict() | {"end_session_endpoint": "https://evil.example/logout"}
     )
-    info = rp.ProviderInfo.from_metadata(md)
+    with pytest.warns(UserWarning, match="different origin than the issuer"):
+        info = rp.ProviderInfo.from_metadata(md)
     with pytest.raises(ConfigError):
         rp.end_session_url(info, id_token_hint="secret-id-token")
 
@@ -1543,7 +1549,8 @@ def test_end_session_opt_in_still_validates_unsafe():
     ]:
         with pytest.raises(GrindvaktError):
             _pi(bad, allow_cross_origin_end_session=True)
-        info = rp.ProviderInfo.from_metadata(_raw_md(bad), allow_cross_origin_end_session=True)
+        with pytest.warns(UserWarning, match="end_session_endpoint .* is unsafe"):
+            info = rp.ProviderInfo.from_metadata(_raw_md(bad), allow_cross_origin_end_session=True)
         assert info.end_session_endpoint is None
 
 

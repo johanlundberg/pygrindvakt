@@ -330,7 +330,8 @@ class Http:
 
     def get(self, url):
         self.calls += 1
-        return 200, json.dumps(self.doc).encode(), "application/json", []
+        # non-empty headers: an empty list would trigger the "no response headers" warning
+        return 200, json.dumps(self.doc).encode(), "application/json", [("x-test", "1")]
 
     def post_form(self, url, form, headers):
         return 404, b"", "text/plain"

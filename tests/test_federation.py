@@ -1079,9 +1079,10 @@ def test_entity_statement_jwks_getter_drops_oct_keys_with_warning(fed):
 
 def test_resolved_entity_subject_jwks_drops_oct_keys_with_warning(fed):
     pub = fed.leaf_key.to_public_jwks()
-    leaf_ec = federation.build_entity_configuration(
-        fed.leaf_key, LEAF, {"keys": [*pub["keys"], HS_JWK]}, [TA], LEAF_METADATA, None, 3600
-    )
+    with pytest.warns(UserWarning, match="publishing a symmetric"):
+        leaf_ec = federation.build_entity_configuration(
+            fed.leaf_key, LEAF, {"keys": [*pub["keys"], HS_JWK]}, [TA], LEAF_METADATA, None, 3600
+        )
     sub = subordinate_statement(fed.ta_key, TA, LEAF, pub)
     resolved = resolve_response(fed.ta_key, TA, LEAF, LEAF_METADATA, [leaf_ec, sub, fed.ta_ec])
     http = FakeHttpClient(

@@ -546,14 +546,15 @@ def test_jwks_404_is_not_retryable():
     assert ei.value.retryable is False
 
 
-def test_transport_is_retryable():
+def test_transport_is_retryable(unraisable):
     with pytest.raises(InternalError) as ei:
         rp.fetch_jwks(RaisingClient(OSError("down")), "http://127.0.0.1:1/jwks", "http://127.0.0.1:1")
     assert ei.value.code == "transport"
     assert ei.value.retryable is True
+    unraisable.expect(OSError, "down", count=1, adapter=RaisingClient)
 
 
-def test_transport_error_is_typed_with_chained_cause():
+def test_transport_error_is_typed_with_chained_cause(unraisable):
     cause = OSError("down")
     with pytest.raises(InternalError) as ei:
         rp.exchange_code(RaisingClient(cause), PROV, RPC, "code", VERIFIER)
@@ -562,6 +563,7 @@ def test_transport_error_is_typed_with_chained_cause():
     assert ei.value.auth_failure is False
     assert ei.value.__cause__ is not None
     assert not getattr(ei.value, "__notes__", None)
+    unraisable.expect(OSError, "down", count=1, adapter=RaisingClient)
 
 
 @pytest.mark.parametrize("spoof", ["transport", "jwks_fetch_timeout", "discovery_backoff", "discovery_fetch_timeout"])
@@ -584,11 +586,12 @@ def test_upstream_error_string_with_5xx_is_retryable_by_status(spoof):
     assert ei.value.retryable is True
 
 
-def test_binding_raised_transport_in_exchange_code_is_retryable():
+def test_binding_raised_transport_in_exchange_code_is_retryable(unraisable):
     with pytest.raises(InternalError) as ei:
         rp.exchange_code(RaisingClient(OSError("down")), PROV, RPC, "code", VERIFIER)
     assert ei.value.code == "transport"
     assert ei.value.retryable is True
+    unraisable.expect(OSError, "down", count=1, adapter=RaisingClient)
 
 
 def test_userinfo_upstream_error_string_cannot_spoof_retryable():

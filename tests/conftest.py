@@ -12,7 +12,9 @@ import base64
 import os
 import shutil
 import subprocess
+import sys
 import textwrap
+import threading
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -43,6 +45,53 @@ def code_from_redirect(resp) -> str:
     assert resp.status == 302, resp
     loc = resp.header("location")
     return parse_qs(urlparse(loc).query)["code"][0]
+
+
+class UnraisableReports(list):
+    """The ``sys.unraisablehook`` reports captured by the ``unraisable`` fixture."""
+
+    def expect(self, exc_type, message=None, *, count=None, adapter=None):
+        """Assert every report is ``exc_type`` (whose text contains ``message``)
+        raised in ``adapter`` (a type), and that there are ``count`` of them
+        (at least one when ``count`` is ``None``). Returns the reports."""
+        assert self, "expected the adapter failure to be reported through sys.unraisablehook"
+        if count is not None:
+            assert len(self) == count, [repr(r.exc_value) for r in self]
+        for r in self:
+            assert r.exc_type is exc_type, repr(r.exc_value)
+            if message is not None:
+                assert message in str(r.exc_value), repr(r.exc_value)
+            if adapter is not None:
+                assert isinstance(r.object, adapter), repr(r.object)
+        return list(self)
+
+
+@pytest.fixture
+def unraisable():
+    """Record ``sys.unraisablehook`` reports raised while the test runs.
+
+    By design (ADR 0002) a Python protocol adapter that raises or returns a bad
+    shape fails closed, and the Rust side reports the original exception
+    through ``sys.unraisablehook``. Tests that provoke this on purpose request
+    this fixture and assert on the recorded ``UnraisableHookArgs`` (``exc_type``,
+    ``exc_value``, ``err_msg``, ``object``), so the report is part of the
+    expected behaviour instead of leaking a ``PytestUnraisableExceptionWarning``.
+    Opt-in only: an unexpected report in any other test stays visible.
+    """
+    reports = UnraisableReports()
+    lock = threading.Lock()
+
+    def hook(args):
+        with lock:
+            reports.append(args)
+
+    previous = sys.unraisablehook
+    sys.unraisablehook = hook
+    try:
+        yield reports
+    finally:
+        sys.unraisablehook = previous
+        reports.clear()
 
 
 @pytest.fixture(scope="session")
