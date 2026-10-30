@@ -161,6 +161,12 @@ Provider
       included) raises ``OAuthError(server_error)``; the value is not echoed.
       Fragment mode is unaffected.
 
+      .. versionchanged:: 0.4.0
+         A ``redirect_uri`` that fails :func:`pygrindvakt.rp.validate_redirect_uri_syntax`
+         (backslash, invisible or bidi characters, userinfo) raises
+         ``OAuthError(invalid_request)`` before anything is minted, even when
+         the client registered it; core alone accepted these.
+
    .. py:method:: authorization_error_redirect(request: AuthorizationRequest, error: OAuthError) -> Response
 
       Render an authorization error redirect for ``request`` in its response
@@ -175,7 +181,10 @@ Provider
       redirector. If validation fails that :class:`pygrindvakt.OAuthError` is
       raised; render it with ``.to_response()``, never as a redirect. With the
       flag on, query mode also raises ``OAuthError(server_error)`` when the
-      registered ``redirect_uri`` already has an ``iss`` query parameter.
+      registered ``redirect_uri`` already has an ``iss`` query parameter. A
+      ``redirect_uri`` with a backslash, invisible or bidi characters or
+      userinfo raises ``OAuthError(invalid_request)`` (the same rule as
+      :meth:`authorization_redirect`).
 
       .. versionadded:: 0.4.0
 

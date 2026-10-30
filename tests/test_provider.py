@@ -510,6 +510,43 @@ def test_authorization_redirect_refuses_crlf_redirect_uri_even_if_registered(op_
     assert ei.value.code == "invalid_request"
 
 
+@pytest.mark.parametrize("iss_flag", [False, True])
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        REDIRECT_URI + "\\@evil.example",
+        REDIRECT_URI + "\u200b",
+        REDIRECT_URI + "\u202e",
+        "https://good.example@evil.example/cb",
+    ],
+    ids=["backslash", "zero-width", "bidi", "userinfo"],
+)
+def test_registered_unsafe_redirect_uri_never_reaches_a_location_header(op_key, unsafe, iss_flag):
+    """Core accepts these registered URIs; the binding's redirect_uri rules must stop them
+    on both render paths, with and without the RFC 9207 flag."""
+    c = client.Client("unsafe", client_secret="s", redirect_uris=[unsafe])
+    unsafe_op = provider.Provider(
+        metadata.ProviderMetadata(ISSUER),
+        op_key,
+        client.InMemoryClientStore([c]),
+        tokens.TokenCodec("unsafe-secret"),
+        token_use_store=provider.InMemoryTokenUseStore(),
+        authorization_response_iss=iss_flag,
+    )
+    base = request.AuthorizationRequest.from_params(
+        [("client_id", "unsafe"), ("response_type", "code"), ("redirect_uri", REDIRECT_URI), ("scope", "openid")]
+    )
+    stored = base.to_dict()
+    stored["redirect_uri"] = unsafe
+    req = request.AuthorizationRequest.from_dict(stored)
+    with pytest.raises(OAuthError) as ei:
+        unsafe_op.authorization_redirect(req, "alice")
+    assert ei.value.code == "invalid_request" and "evil" not in str(ei.value)
+    with pytest.raises(OAuthError) as ei:
+        unsafe_op.authorization_error_redirect(req, OAuthError("access_denied", "no", "st"))
+    assert ei.value.code == "invalid_request" and "evil" not in str(ei.value)
+
+
 def test_token_bearing_query_mode_and_empty_subject_are_rejected(op):
     req = request.AuthorizationRequest.from_params(
         list(

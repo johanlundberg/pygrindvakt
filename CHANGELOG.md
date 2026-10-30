@@ -54,6 +54,11 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 - Python values converted to JSON (claims, metadata, request data) now raise
   `ValueError` on `NaN` and infinity instead of silently becoming `null`
   (previously `jwt.sign(key, {"exp": float("nan")})` signed `exp: null`).
+- `Provider.authorization_redirect` and `Provider.authorization_error_redirect`
+  now apply the binding's `redirect_uri` rules (no backslash, invisible or bidi
+  characters, userinfo) before anything is minted or rendered, and raise
+  `OAuthError(invalid_request)` otherwise, even when the client registered the
+  URI: core accepted such URIs and they reached the `Location` header.
 - `retryable` for upstream HTTP failures uses core's
   `UpstreamHttpError::is_retryable`, and OAuth error codes are parsed with
   core's `OAuthErrorCode::from_str`. Behaviour is unchanged.

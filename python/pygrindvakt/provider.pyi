@@ -176,7 +176,9 @@ class Provider:
         on failure that ``OAuthError`` is raised and must be rendered with
         ``.to_response()``. With the flag on, query mode also raises
         ``OAuthError(server_error)`` when the registered ``redirect_uri``
-        already has an ``iss`` query parameter.
+        already has an ``iss`` query parameter. A ``redirect_uri`` with a
+        backslash, invisible or bidi characters or userinfo raises
+        ``OAuthError(invalid_request)``, as in ``authorization_redirect``.
         """
     def handle_token_request(
         self,

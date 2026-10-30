@@ -367,6 +367,21 @@ fn warn_unimplemented_members(metadata: &ProviderMetadata, emits_iss: bool) -> P
     })
 }
 
+/// The binding's `redirect_uri` rules (the ones `OAuthError.to_redirect` and
+/// `RpClient` apply) before a registered URI is echoed into a `Location`
+/// header: core accepts a backslash, invisible formatting characters and
+/// userinfo that these reject. Fixed message; the URI is never echoed.
+fn check_redirect_target(py: Python<'_>, request: &AuthorizationRequest) -> PyResult<()> {
+    crate::rp::check_redirect_uri(&request.inner.redirect_uri).map_err(|_| match build_oauth_error(
+        "invalid_request",
+        Some("redirect_uri is not safe to redirect to".into()),
+        None,
+    ) {
+        Ok(e) => oauth_err(py, &e),
+        Err(e) => e,
+    })
+}
+
 #[pymethods]
 impl Provider {
     #[new]
@@ -501,6 +516,7 @@ impl Provider {
         acr: Option<String>,
         extra_claims: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Response> {
+        check_redirect_target(py, request)?;
         let extra: BTreeMap<String, serde_json::Value> = match extra_claims {
             Some(v) if !v.is_none() => from_py(v)?,
             _ => BTreeMap::new(),
@@ -542,6 +558,7 @@ impl Provider {
         request: &AuthorizationRequest,
         error: &Bound<'_, PyAny>,
     ) -> PyResult<Response> {
+        check_redirect_target(py, request)?;
         let code: String = error.getattr("code")?.extract()?;
         let description: Option<String> = error.getattr("description")?.extract()?;
         let state: Option<String> = error.getattr("state")?.extract()?;
