@@ -3,7 +3,7 @@
 
 use pyo3::exceptions::{PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyDict, PyFloat, PyList, PyModule, PyTuple};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -47,8 +47,40 @@ pub fn to_py<'py, T: Serialize + ?Sized>(
     pythonize::pythonize(py, &value).map_err(PyErr::from)
 }
 
+/// serde_json's own nesting limit; deeper input fails there anyway.
+const MAX_JSON_DEPTH: usize = 128;
+
+/// JSON has no NaN or infinity and `Value` would silently turn them into
+/// `null` (so `{"exp": nan}` would sign as `{"exp": null}`): refuse them.
+fn reject_non_finite(obj: &Bound<'_, PyAny>, depth: usize) -> PyResult<()> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(PyValueError::new_err("value is nested too deeply"));
+    }
+    if let Ok(f) = obj.cast::<PyFloat>() {
+        if !f.value().is_finite() {
+            return Err(PyValueError::new_err(
+                "non-finite number (NaN or infinity) is not valid JSON",
+            ));
+        }
+    } else if let Ok(d) = obj.cast::<PyDict>() {
+        for (_, v) in d.iter() {
+            reject_non_finite(&v, depth + 1)?;
+        }
+    } else if let Ok(l) = obj.cast::<PyList>() {
+        for v in l.iter() {
+            reject_non_finite(&v, depth + 1)?;
+        }
+    } else if let Ok(t) = obj.cast::<PyTuple>() {
+        for v in t.iter() {
+            reject_non_finite(&v, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
 /// Deserialize native Python objects into any `serde::Deserialize` type.
 pub fn from_py<T: DeserializeOwned>(obj: &Bound<'_, PyAny>) -> PyResult<T> {
+    reject_non_finite(obj, 0)?;
     // Via JSON text: jose-rs `NumericDate` deserializes from a `RawValue`,
     // which only serde_json's own deserializer can supply.
     let value: serde_json::Value = pythonize::depythonize(obj).map_err(PyErr::from)?;

@@ -46,9 +46,14 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
   registered `redirect_uri` containing CRLF (core already validates it; no
   behaviour change).
 - `rp.asymmetric_algorithms()` takes its names from core's `JWS_ALGORITHMS`
-  catalogue (minus `HS*` and `none`) instead of a hard-coded probe list. The
-  11 names are unchanged; the order now follows core (`ES512`, `EdDSA`,
-  `ES256K`).
+  catalogue (minus `HS*`), intersected with a fixed list of the 11 classical
+  asymmetric names, instead of probing that list through the parser. The 11
+  names are unchanged; the order now follows core (`ES512`, `EdDSA`,
+  `ES256K`). An algorithm core adds later is not listed until the binding
+  adds it.
+- Python values converted to JSON (claims, metadata, request data) now raise
+  `ValueError` on `NaN` and infinity instead of silently becoming `null`
+  (previously `jwt.sign(key, {"exp": float("nan")})` signed `exp: null`).
 - `retryable` for upstream HTTP failures uses core's
   `UpstreamHttpError::is_retryable`, and OAuth error codes are parsed with
   core's `OAuthErrorCode::from_str`. Behaviour is unchanged.

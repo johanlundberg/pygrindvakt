@@ -3038,8 +3038,9 @@ fn validate_service_endpoint(
 /// The classical asymmetric JWS algorithm names from core's catalogue
 /// (`grindvakt::JWS_ALGORITHMS`): `RS256/384/512`, `PS256/384/512`,
 /// `ES256/384/512`, `EdDSA` and `ES256K`, in core's order. `HS*` and `none`
-/// are never included. Post-quantum names (ML-DSA, feature-gated in jose-rs)
-/// are NOT included even if this build parses them.
+/// are never included. Only these names are ever listed, so a name core adds
+/// later (post-quantum ML-DSA, feature-gated in jose-rs) is NOT included until
+/// the binding adds it.
 ///
 /// It is a catalogue, not a recommended allowlist, not a list an OP
 /// advertises, and not what is appropriate for your deployment; pass an
@@ -3051,12 +3052,19 @@ fn validate_service_endpoint(
 /// allowlist.
 #[pyfunction]
 fn asymmetric_algorithms() -> Vec<&'static str> {
+    // Fixed names (RFC 7518 / RFC 8037 / RFC 8812), intersected with core's
+    // catalogue: a name core drops disappears, but one core adds is never
+    // listed without a decision here (a MAC-style addition cannot leak in).
+    const KNOWN_ASYMMETRIC: [&str; 11] = [
+        "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "ES256K",
+        "EdDSA",
+    ];
     grindvakt::JWS_ALGORITHMS
         .iter()
         .copied()
         .filter(|a| !grindvakt::is_symmetric_jws_algorithm(a))
         .map(JwsAlgorithm::as_str)
-        .filter(|n| *n != "none")
+        .filter(|n| KNOWN_ASYMMETRIC.contains(n))
         .collect()
 }
 

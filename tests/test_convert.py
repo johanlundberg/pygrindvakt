@@ -32,6 +32,18 @@ def test_nested_numbers_are_native(op_key):
     assert out["x"] == {"a": [1, 2.5, {"b": 3}]}
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("claims", [lambda b: {"x": b}, lambda b: {"exp": b}, lambda b: {"x": [1, {"y": b}]}])
+def test_non_finite_numbers_are_refused_not_nulled(op_key, bad, claims):
+    with pytest.raises(ValueError, match="non-finite"):
+        jwt.sign(op_key, claims(bad))
+
+
+def test_huge_ints_stay_exact(op_key):
+    for n in (2**64, 2**200, -(2**70)):
+        assert roundtrip(op_key, {"x": n})["x"] == n
+
+
 def test_wrong_shape_is_type_error():
     with pytest.raises(TypeError):
         federation.apply_policy(["not", "a", "dict"], {})
