@@ -65,7 +65,7 @@ filterwarnings = [
     "error::UserWarning",
     # Third party: fastapi.testclient imports starlette.testclient, which warns that
     # httpx is deprecated in favour of httpx2 (a UserWarning subclass). Not ours to fix.
-    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:UserWarning",
 ]
 
 [tool.ruff]
