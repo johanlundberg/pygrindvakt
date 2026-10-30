@@ -185,7 +185,8 @@ class Response:
         """Return a copy with an extra header appended.
 
         Raises ``BadRequestError`` if ``name`` is empty or not an RFC 9110
-        token, or ``value`` holds a C0 control (HTAB excepted), DEL or NUL.
+        token, or ``value`` holds a C0 control (HTAB excepted), DEL or NUL. A
+        ``location`` header must also pass the ``redirect`` check.
         """
     def with_body(self, body: bytes) -> Response:
         """Return a copy with the body replaced."""
@@ -194,8 +195,10 @@ class Response:
         """302 redirect to ``location``.
 
         Raises ``BadRequestError`` if ``location`` contains whitespace,
-        control, bidi or invisible formatting characters. No scheme or host
-        policy is applied; relative targets and fragments are allowed.
+        control, bidi or invisible formatting characters or a backslash. No
+        scheme or host policy is applied; relative targets and fragments are
+        allowed. A ``location`` header set through the constructor,
+        ``with_header`` or the ``headers`` setter gets the same check.
         """
     @staticmethod
     def html(body: str) -> Response:

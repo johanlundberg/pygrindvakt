@@ -384,11 +384,33 @@ def test_supports_get_with_headers(client, expected):
         "/a\u202eb",
         "/a\u200bb",
         "https://rp.example/cb\r\nSet-Cookie: x=1",
+        "/x\\@evil.example",
+        "https://evil.example\\@op.example.com/cb",
     ],
 )
 def test_response_redirect_rejects_unsafe_chars(location):
     with pytest.raises(BadRequestError):
         http.Response.redirect(location)
+
+
+@pytest.mark.parametrize(
+    "location", ["https://rp.example/cb\u202e\u200b", "a b\u200fc", "/x\\@evil.example", "/a\u200bb"]
+)
+@pytest.mark.parametrize("name", ["location", "Location", "LOCATION"])
+def test_location_gate_applies_to_generic_header_apis(name, location):
+    with pytest.raises(BadRequestError):
+        http.Response(302, [(name, location)])
+    with pytest.raises(BadRequestError):
+        http.Response(302).with_header(name, location)
+    r = http.Response(302, [("location", "/ok")])
+    with pytest.raises(BadRequestError):
+        r.headers = [(name, location)]
+    assert r.headers == [("location", "/ok")]
+
+
+def test_location_gate_does_not_touch_other_headers():
+    r = http.Response(200).with_header("x-note", "a b\u200f\\c")
+    assert r.header("x-note") == "a b\u200f\\c"
 
 
 @pytest.mark.parametrize("location", ["/login", "https://rp.example/cb?x=1#frag", "relative/path?q=1"])

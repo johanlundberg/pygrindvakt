@@ -294,6 +294,22 @@ fn check_response_header(name: &str, value: &str) -> PyResult<()> {
             "response header value must not contain control characters",
         ));
     }
+    if name.eq_ignore_ascii_case("location") {
+        check_location(value)?;
+    }
+    Ok(())
+}
+
+/// A `Location` value: no whitespace, control, bidi or invisible formatting
+/// character and no backslash (the `url` crate and browsers read `\` as `/`).
+/// Relative targets and fragments pass. Never echoed.
+fn check_location(location: &str) -> PyResult<()> {
+    if crate::rp::has_unsafe_uri_char(location) {
+        return Err(bad_request_err(
+            "redirect location must not contain whitespace, control, bidi or invisible formatting characters",
+        ));
+    }
+    crate::rp::reject_reinterpreted_url_chars("redirect location", location).map_err(err)?;
     Ok(())
 }
 
@@ -378,11 +394,7 @@ impl Response {
     /// scheme or host policy is applied.
     #[staticmethod]
     fn redirect(location: String) -> PyResult<Self> {
-        if crate::rp::has_unsafe_uri_char(&location) {
-            return Err(bad_request_err(
-                "redirect location must not contain whitespace, control, bidi or invisible formatting characters",
-            ));
-        }
+        check_location(&location)?;
         Ok(Self::wrap(gh::Response::redirect(location)))
     }
     /// A `text/html` response.

@@ -37,8 +37,10 @@ adopting a change made in `grindvakt` / `jose-rs` and surfacing it to Python.
 - `http.Response.redirect`, `Response.with_header`, the `Response.headers`
   setter and the `Response(...)` constructor now validate their input and raise `BadRequestError` (header-injection
   hardening). `redirect` rejects whitespace, control, bidi and invisible
-  formatting characters in the location (relative targets and fragments stay
-  valid; no scheme or host policy). Header names must be non-empty RFC 9110
+  formatting characters and backslashes in the location (relative targets and
+  fragments stay valid; no scheme or host policy); a `location` header set
+  through the other three paths gets the same check. Header names must be
+  non-empty RFC 9110
   tokens; values may not contain C0 controls (HTAB is allowed), DEL or NUL.
 - Added a regression test that `Provider.authorization_redirect` refuses a
   registered `redirect_uri` containing CRLF (core already validates it; no

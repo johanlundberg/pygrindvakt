@@ -206,7 +206,8 @@ Outbound response
       Return a copy with an extra header appended. Raises
       :class:`pygrindvakt.BadRequestError` if ``name`` is empty or not an
       RFC 9110 token, or ``value`` contains a C0 control character (a
-      horizontal tab is allowed), DEL or NUL.
+      horizontal tab is allowed), DEL or NUL. A ``location`` header (any
+      case) must also pass the :meth:`redirect` check on its value.
 
       .. versionchanged:: 0.4.0
          Validates ``name`` and ``value``.
@@ -219,9 +220,11 @@ Outbound response
 
       A ``302`` redirect to ``location``. Raises
       :class:`pygrindvakt.BadRequestError` if ``location`` contains
-      whitespace, control, bidi or invisible formatting characters. No scheme
-      or host policy is applied: relative targets (``/login``) and fragments
-      are accepted.
+      whitespace, control, bidi or invisible formatting characters or a
+      backslash (the ``url`` crate and browsers read ``\\`` as ``/``). No
+      scheme or host policy is applied: relative targets (``/login``) and
+      fragments are accepted. The same check applies to a ``location`` header
+      set through the constructor, ``with_header`` or the ``headers`` setter.
 
       .. versionchanged:: 0.4.0
          Rejects unsafe characters in ``location``.
